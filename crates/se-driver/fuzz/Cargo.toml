@@ -1,0 +1,26 @@
+[package]
+name = "se-driver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Detach from the firmware workspace: the fuzz crate is a standalone, nightly,
+# instrumented build and must not be a workspace member.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.se-driver]
+path = ".."
+features = ["_fuzz"]
+
+[[bin]]
+name = "parse_l2_response"
+path = "fuzz_targets/parse_l2_response.rs"
+test = false
+doc = false
+bench = false

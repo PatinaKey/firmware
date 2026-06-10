@@ -1,0 +1,18 @@
+[package]
+name = "se-driver"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "TROPIC01 secure element driver for patina_key (no_std)."
+
+[features]
+# Exposes the `fuzz` module (attacker-facing parsers) to libFuzzer harnesses.
+# Not for production. Enabled only by the fuzz crate.
+_fuzz = []
+
+[dependencies]
+embedded-hal = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

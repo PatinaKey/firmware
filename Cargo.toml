@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/se-driver"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["PatinaKey <contact@patinakey.fr>"]
+repository = "https://github.com/PatinaKey/firmware"
+license = "GPL-3.0-or-later"
+
+
+[workspace.dependencies]
+embedded-hal = "1.0"
+zeroize = { version = "1.8", default-features = false, features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "deny"
