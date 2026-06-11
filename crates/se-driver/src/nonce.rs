@@ -14,7 +14,8 @@ use crate::error::SeError;
 /// A non-wrapping 32-bit AES-GCM nonce counter.
 ///
 /// Not `Clone`, not `Copy`, not public. One owner per session direction.
-#[derive(Debug)]
+// No Debug: the counter lives inside the secret-bearing SessionKeys, and
+// nothing in that containment chain may be printable.
 pub(crate) struct NonceCounter(u32);
 
 impl NonceCounter
@@ -33,19 +34,24 @@ impl NonceCounter
         self.0 = 0;
     }
 
-    /// Builds the full 12-byte IV for the current counter then advances by one.
+    /// Builds a counter at a chosen value, to exercise exhaustion. Test-only.
+    #[cfg(test)]
+    pub(crate) fn from_value(v: u32) -> Self
+    {
+        NonceCounter(v)
+    }
+
+    /// Builds the 12-byte IV for the current counter WITHOUT advancing it.
     ///
-    /// The returned IV is `n` little-endian in bytes `[0..4]`, with bytes
-    /// `[4..12]` always zero. On success the counter is incremented. This owns
-    /// the whole IV layout, so the caller has no "pre-zero the tail" footgun.
+    /// The IV is `n` little-endian in bytes `[0..4]`, with bytes `[4..12]`
+    /// always zero, so the caller has no "pre-zero the tail" footgun.
     ///
     /// Returns `Err(SeError::NonceExhausted)` when the counter is already at
-    /// `u32::MAX`. In that case no IV is produced and the counter does not
-    /// advance, so no nonce is ever reused.
-    ///
-    /// Any failure between obtaining an IV and a committed transfer MUST poison
-    /// the session (enforced in increment 2).
-    pub(crate) fn next_iv(&mut self) -> Result<[u8; 12], SeError>
+    /// `u32::MAX` (the value the chip refuses): no IV is produced. Pair every
+    /// successful `peek_iv` with one `commit` AFTER the crypto operation that
+    /// used the IV succeeds, so a failed encrypt/decrypt never advances the
+    /// counter and the cmd/res counters cannot desync even without a poison.
+    pub(crate) fn peek_iv(&self) -> Result<[u8; 12], SeError>
     {
         if self.0 == u32::MAX
         {
@@ -57,8 +63,17 @@ impl NonceCounter
         iv[1] = le[1];
         iv[2] = le[2];
         iv[3] = le[3];
-        self.0 += 1;
         Ok(iv)
+    }
+
+    /// Advances the counter by one after a successful use of the peeked IV.
+    ///
+    /// Call only after `peek_iv` returned `Ok` and the crypto step committed.
+    /// Uses a saturating add so even a misuse (commit without a fresh peek)
+    /// pins at `u32::MAX` rather than wrapping back to a reusable nonce.
+    pub(crate) fn commit(&mut self)
+    {
+        self.0 = self.0.saturating_add(1);
     }
 }
 
@@ -68,22 +83,35 @@ mod tests
     use super::*;
 
     #[test]
-    fn starts_at_zero_and_counts_up()
+    fn starts_at_zero_and_counts_up_on_commit()
     {
         let mut n = NonceCounter::new();
         for expected in 0u32..5
         {
-            let iv = n.next_iv().unwrap();
+            let iv = n.peek_iv().unwrap();
             assert_eq!(u32::from_le_bytes([iv[0], iv[1], iv[2], iv[3]]), expected);
+            n.commit();
         }
+    }
+
+    #[test]
+    fn peek_without_commit_does_not_advance()
+    {
+        // The whole point of peek/commit: a peeked IV that is never committed
+        // (e.g. the crypto step failed) must not advance the counter.
+        let n = NonceCounter::new();
+        let a = n.peek_iv().unwrap();
+        let b = n.peek_iv().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(u32::from_le_bytes([a[0], a[1], a[2], a[3]]), 0);
     }
 
     #[test]
     fn builds_little_endian_in_first_four()
     {
         // 0x04030201 has four distinct bytes, so LE ordering is unambiguous.
-        let mut n = NonceCounter(0x04030201);
-        let iv = n.next_iv().unwrap();
+        let n = NonceCounter(0x04030201);
+        let iv = n.peek_iv().unwrap();
         assert_eq!(&iv[0..4], &[0x01, 0x02, 0x03, 0x04]);
         assert!(iv[4..12].iter().all(|&b| b == 0));
     }
@@ -93,19 +121,18 @@ mod tests
     {
         // The returned array owns its layout: the tail must always be zero,
         // regardless of the counter value.
-        let mut n = NonceCounter(0xDEADBEEF);
-        let iv = n.next_iv().unwrap();
+        let n = NonceCounter(0xDEADBEEF);
+        let iv = n.peek_iv().unwrap();
         assert!(iv[4..12].iter().all(|&b| b == 0));
     }
 
     #[test]
     fn exhaustion_at_u32_max_returns_error()
     {
-        let mut n = NonceCounter(u32::MAX);
-        let r = n.next_iv();
-        assert_eq!(r, Err(SeError::NonceExhausted));
+        let n = NonceCounter(u32::MAX);
+        assert_eq!(n.peek_iv(), Err(SeError::NonceExhausted));
         // Still exhausted on a second attempt (no wrap, no advance).
-        assert_eq!(n.next_iv(), Err(SeError::NonceExhausted));
+        assert_eq!(n.peek_iv(), Err(SeError::NonceExhausted));
     }
 
     #[test]
@@ -113,10 +140,20 @@ mod tests
     {
         let mut n = NonceCounter(u32::MAX - 1);
         // The penultimate value is usable.
-        let iv = n.next_iv().unwrap();
+        let iv = n.peek_iv().unwrap();
         assert_eq!(u32::from_le_bytes([iv[0], iv[1], iv[2], iv[3]]), u32::MAX - 1);
+        n.commit();
         // Now the counter is at MAX and must refuse.
-        assert_eq!(n.next_iv(), Err(SeError::NonceExhausted));
+        assert_eq!(n.peek_iv(), Err(SeError::NonceExhausted));
+    }
+
+    #[test]
+    fn commit_saturates_and_never_wraps()
+    {
+        // Defensive: a commit at MAX (misuse) pins at MAX, never wraps to 0.
+        let mut n = NonceCounter(u32::MAX);
+        n.commit();
+        assert_eq!(n.peek_iv(), Err(SeError::NonceExhausted));
     }
 
     #[test]
@@ -124,7 +161,7 @@ mod tests
     {
         let mut n = NonceCounter(0x1234);
         n.reset();
-        let iv = n.next_iv().unwrap();
+        let iv = n.peek_iv().unwrap();
         assert_eq!(u32::from_le_bytes([iv[0], iv[1], iv[2], iv[3]]), 0);
     }
 }

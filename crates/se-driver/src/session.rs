@@ -1,20 +1,25 @@
-//! Session key material for the L3 secure channel.
+//! Session key material and the L3 seal/open primitives.
 //!
-//! Increment 1 ships a minimal placeholder so the type-state compiles. The
-//! Noise KK1 handshake and the real key derivation arrive in a later increment.
-//! The type is already `ZeroizeOnDrop` and carries no `Debug`/`Clone`/`Copy`,
-//! so the type cannot leak or duplicate a secret.
+//! `SessionKeys` owns kCMD, kRES, and the two nonce counters. It seals
+//! outgoing commands and opens incoming results in place over the L3 buffer.
+//! The type is `ZeroizeOnDrop` and carries no `Debug`/`Clone`/`Copy`, so it
+//! cannot leak or duplicate a secret.
 
 use zeroize::Zeroize;
 use zeroize::ZeroizeOnDrop;
 
+use crate::crypto;
+use crate::error::L3Error;
+use crate::error::SeError;
 use crate::nonce::NonceCounter;
+use crate::parse::take_le_u16;
 
-/// Derived secure-channel keys plus the two lock-step nonce counters.
+/// Derived secure-channel keys plus the two nonce counters.
 ///
-/// Placeholder layout for increment 1: the AES-256 command and result keys
-/// are 32-byte arrays, zeroized on drop. The nonce counters start at 0 and
-/// advance one step per round-trip.
+/// The AES-256 command and result keys are 32-byte arrays, zeroized on drop.
+/// Both nonce counters start at 0. The command nonce advances at seal, the
+/// result nonce at verified open. A fault between the two MUST poison the
+/// session (the caller's teardown gate), so a desync is never observable.
 #[derive(ZeroizeOnDrop)]
 pub(crate) struct SessionKeys
 {
@@ -62,5 +67,105 @@ impl SessionKeys
         self.k_res.zeroize();
         self.cmd_nonce.reset();
         self.res_nonce.reset();
+    }
+
+    /// Seals an L3 command in place and returns the total wire length.
+    ///
+    /// On entry `l3[2..2 + plaintext_len]` holds `CMD_ID || CMD_DATA`. Writes
+    /// `CMD_SIZE` (little-endian) at `l3[0..2]`, encrypts the plaintext with
+    /// kCMD and the next command nonce, and appends the 16-byte tag. Returns
+    /// `2 + plaintext_len + 16`. Advances the command nonce.
+    ///
+    /// Errors with `NonceExhausted` on counter overflow (no encryption happens),
+    /// or `L3(Oversize)` if the wire frame would not fit `l3`.
+    pub(crate) fn seal_command
+    (
+        &mut self,
+        l3: &mut [u8],
+        plaintext_len: usize,
+    )
+    -> Result<usize, SeError>
+    {
+        let tag_len = crypto::GCM_TAG_LEN;
+        let total = plaintext_len
+            .checked_add(2 + tag_len)
+            .ok_or(SeError::L3(L3Error::Oversize))?;
+        if total > l3.len()
+        {
+            return Err(SeError::L3(L3Error::Oversize));
+        }
+        let size = u16::try_from(plaintext_len).map_err(|_| SeError::L3(L3Error::Oversize))?;
+        // Peek the IV (exhaustion returns before any I/O). The counter advances
+        // ONLY after the encryption below succeeds, so a failed seal never burns
+        // a nonce and the cmd/res counters cannot desync.
+        let iv = self.cmd_nonce.peek_iv()?;
+        l3[0..2].copy_from_slice(&size.to_le_bytes());
+        let tag = crypto::aes256gcm_seal(&self.k_cmd, &iv, &[], &mut l3[2..2 + plaintext_len])
+            .map_err(|_| SeError::L3(L3Error::Crypto))?;
+        l3[2 + plaintext_len..total].copy_from_slice(&tag);
+        self.cmd_nonce.commit();
+        Ok(total)
+    }
+
+    /// Opens an L3 result in place and returns the plaintext length.
+    ///
+    /// Reads `RES_SIZE` from `l3[0..2]`, decrypts `l3[2..2 + RES_SIZE]` with
+    /// kRES and the next result nonce, verifying the trailing 16-byte tag. On
+    /// success `l3[2..2 + len]` holds `RESULT || RES_DATA`. Advances the result
+    /// nonce.
+    ///
+    /// Errors with `L3(Oversize)` if the declared size disagrees with `wire_len`
+    /// or overruns `l3`, `L3(Tag)` on a tag-verification failure, or
+    /// `NonceExhausted` on overflow.
+    pub(crate) fn open_result
+    (
+        &mut self,
+        l3: &mut [u8],
+        wire_len: usize,
+    )
+    -> Result<usize, SeError>
+    {
+        let tag_len = crypto::GCM_TAG_LEN;
+        let head = l3.get(..2).ok_or(SeError::L3(L3Error::Oversize))?;
+        let (_, res_size) = take_le_u16(head).map_err(|e| SeError::L3(L3Error::Parse(e)))?;
+        let res_size = res_size as usize;
+        let need = res_size
+            .checked_add(2 + tag_len)
+            .ok_or(SeError::L3(L3Error::Oversize))?;
+        // The reassembled result must be EXACTLY `[RES_SIZE | ct | tag]`: a
+        // declared size that disagrees with the received length (trailing bytes
+        // or a short frame) is a malformed result, not a valid short read.
+        if need != wire_len || need > l3.len()
+        {
+            return Err(SeError::L3(L3Error::Oversize));
+        }
+        // Copy the tag out so the ciphertext slice can be borrowed mutably.
+        // Bounds: `need == wire_len <= l3.len()` proven above and
+        // `need == 2 + res_size + tag_len`, so both ranges are in bounds.
+        let mut tag = [0u8; crypto::GCM_TAG_LEN];
+        tag.copy_from_slice(&l3[2 + res_size..2 + res_size + tag_len]);
+        // Peek the IV. The result counter advances ONLY after the tag verifies,
+        // so a tag failure leaves the counter untouched (no desync, no reuse)
+        // even before the caller poisons the session.
+        let iv = self.res_nonce.peek_iv()?;
+        crypto::aes256gcm_open(&self.k_res, &iv, &[], &mut l3[2..2 + res_size], &tag)
+            .map_err(|_| SeError::L3(L3Error::Tag))?;
+        self.res_nonce.commit();
+        Ok(res_size)
+    }
+
+    /// Returns the raw `(kCMD, kRES)` for KAT assertions. Test-only.
+    #[cfg(test)]
+    pub(crate) fn keys_for_test(&self) -> ([u8; 32], [u8; 32])
+    {
+        (self.k_cmd, self.k_res)
+    }
+
+    /// Seeds both nonce counters to exercise exhaustion paths. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_nonces_for_test(&mut self, cmd: u32, res: u32)
+    {
+        self.cmd_nonce = NonceCounter::from_value(cmd);
+        self.res_nonce = NonceCounter::from_value(res);
     }
 }

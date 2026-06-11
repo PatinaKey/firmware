@@ -8,8 +8,7 @@
 //! The CRC covers REQ_ID/REQ_LEN/REQ_DATA (request) or STATUS/RSP_LEN/RSP_DATA
 //! (response), exactly as libtropic `add_crc()` and `lt_l2_frame_check()`.
 //!
-//! All parsing goes through the bounds-checked combinators in `parse`. There
-//! is no raw indexing on received bytes, no unwrap, and no panic path.
+//! All parsing goes through the bounds-checked combinators in `parse`.
 
 use crate::buf::L2_CHUNK_MAX_DATA;
 use crate::crc::crc16;
@@ -22,13 +21,14 @@ use crate::parse::take_u8;
 
 /// A parsed L2 response frame view.
 ///
-/// Borrows the data slice out of the caller's frame buffer. The status is
-/// always one of the OK variants (`RequestOk` / `ResultOk`). The parser maps
-/// any other status to `L2Error::Status` before building this struct.
+/// Borrows the data slice out of the caller's frame buffer. The status is one
+/// of the accepted framed-response variants (`RequestOk` / `ResultOk` /
+/// `RequestCont` / `ResultCont`). The `*Cont` variants signal that more chunks
+/// follow. The parser maps any error status to `L2Error::Status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct L2Response<'a>
 {
-    /// The accepted status byte (RequestOk or ResultOk).
+    /// The accepted status byte.
     pub(crate) status: L2Status,
     /// The RSP_DATA payload (0..=252 bytes).
     pub(crate) data: &'a [u8],
@@ -104,11 +104,16 @@ pub(crate) fn parse_response(frame: &[u8]) -> Result<L2Response<'_>, L2Error>
         Err(_) => return Err(L2Error::BadFrame),
     };
 
-    // Check the CRC only for the OK statuses, mirroring lt_l2_frame_check.
-    // Return non-OK statuses as-is so the caller can act on them.
+    // CRC-check the framed-response statuses, mirroring lt_l2_frame_check. The
+    // `*Cont` variants are valid data-bearing frames (more chunks follow), so
+    // they are accepted here and the reassembly loop decides continue-vs-done.
+    // Error statuses are returned as-is so the caller can act on them.
     match status
     {
-        L2Status::RequestOk | L2Status::ResultOk =>
+        L2Status::RequestOk
+        | L2Status::ResultOk
+        | L2Status::RequestCont
+        | L2Status::ResultCont =>
         {
             // CRC covers STATUS + RSP_LEN + RSP_DATA = the first `2 + len` bytes.
             // `get` keeps the bounds check on attacker-influenced input.

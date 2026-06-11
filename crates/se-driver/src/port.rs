@@ -2,11 +2,10 @@
 //!
 //! This is the only SE surface that CTAP2 / OpenPGP / PKCS#11 layers consume.
 //! No SPI, no session handle, and no transport error leak through it. A method
-//! returns a known-size output by value (`Copy`); a variable-size output uses
+//! returns a known-size output by value (`Copy`). A variable-size output uses
 //! the `_into(out: &mut [u8]) -> Result<usize, SeError>` convention.
 //!
-//! Increment 1 defines the signatures only. The implementations land on
-//! `Tropic01<SPI, W, ActiveSession>` in a later increment.
+//! `Tropic01<SPI, W, ActiveSession>` implements this trait.
 
 use crate::error::SeError;
 

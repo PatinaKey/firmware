@@ -24,3 +24,17 @@ path = "fuzz_targets/parse_l2_response.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decrypt_l3_result"
+path = "fuzz_targets/decrypt_l3_result.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_handshake_resp"
+path = "fuzz_targets/parse_handshake_resp.rs"
+test = false
+doc = false
+bench = false

@@ -3,7 +3,7 @@
 // Fuzz the L2 response parser against arbitrary, attacker-controlled bytes.
 // The contract under test: parse_response must NEVER panic on any input. It
 // returns either a parsed frame or a typed error. libFuzzer feeds mutated
-// byte slices; any panic/abort is a finding.
+// byte slices. Any panic/abort is a finding.
 
 use libfuzzer_sys::fuzz_target;
 

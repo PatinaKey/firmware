@@ -13,6 +13,10 @@ _fuzz = []
 [dependencies]
 embedded-hal = { workspace = true }
 zeroize = { workspace = true }
+x25519-dalek = { workspace = true }
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
 
 [lints]
 workspace = true

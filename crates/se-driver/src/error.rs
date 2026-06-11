@@ -69,12 +69,14 @@ pub enum HandshakeError
     L2(L2Error),
 }
 
-/// Bounds-checked parser errors. Raised when input is too short.
+/// Bounds-checked parser errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError
 {
     /// Not enough bytes remained to satisfy the request.
     UnexpectedEnd,
+    /// A parsed field held a value outside its recognized set.
+    InvalidValue,
 }
 
 /// The public, transport-agnostic driver error.

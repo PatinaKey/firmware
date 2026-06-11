@@ -16,8 +16,8 @@ pub(crate) const L2_CHUNK_MAX_DATA: usize = 252;
 
 /// Maximum L3 packet size in bytes.
 ///
-/// Layout: 2 size + 4112 ciphertext-max + 16 tag = 4130. Matches libtropic's
-/// `TR01_L3_PACKET_MAX_SIZE`.
+/// Layout: 2 size + 4112 ciphertext-max + 16 tag = 4130. 
+/// Matches libtropic's `TR01_L3_PACKET_MAX_SIZE`.
 pub(crate) const L3_FRAME_MAX: usize = 4130;
 
 /// A fixed L2 frame buffer.

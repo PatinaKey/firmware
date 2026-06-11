@@ -1,6 +1,7 @@
 //! Layer 2: request/response framing over the L1 SPI transport.
 //!
-//! Increment 1 implements frame build/parse and the CRC check. Chunking and
-//! reassembly of multi-frame L3 packets arrive in a later increment.
+//! `frame` builds/parses single frames and checks the CRC. `transport` drives
+//! L1 to send chunked L3 packets and reassemble multi-frame results.
 
 pub(crate) mod frame;
+pub(crate) mod transport;

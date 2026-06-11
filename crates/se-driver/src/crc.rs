@@ -68,7 +68,7 @@ mod tests
     #[test]
     fn check_string_123456789()
     {
-        // Canonical CRC-16/UMTS check is 0xFEE8 pre-swap; libtropic swaps it.
+        // Canonical CRC-16/UMTS check is 0xFEE8 pre-swap, then libtropic swaps it.
         assert_eq!(crc16(b"123456789"), 0xE8FE);
     }
 
