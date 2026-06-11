@@ -10,8 +10,37 @@
 use crate::error::SeError;
 
 /// An ECC key slot index (0..=31).
+///
+/// The private field encodes the valid range. `new` rejects an out-of-range
+/// value with `InvalidArgument`, so no command can send a bad slot to the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EccSlot(pub u8);
+pub struct EccSlot(u8);
+
+impl EccSlot
+{
+    /// Builds a slot index, rejecting any value above 31.
+    ///
+    /// Errors with `InvalidArgument` outside 0..=31.
+    pub const fn new(value: u8) -> Result<Self, SeError>
+    {
+        if value > 31
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        Ok(EccSlot(value))
+    }
+
+    /// Returns the wire index.
+    // The ECC commands that send this index are not wired yet, so the accessor
+    // is dead in the non-test build. The newtype tests use it, which fulfils an
+    // `#[expect]` in the test build and would fire `unfulfilled_lint_expectations`
+    // there, so `#[allow]` is required (same pattern as `ids::ObjectId`).
+    #[allow(dead_code)]
+    pub(crate) const fn get(self) -> u8
+    {
+        self.0
+    }
+}
 
 /// The curve selected for an ECC slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,16 +53,100 @@ pub enum EccCurve
 }
 
 /// An R-Memory user-data slot index (0..=511).
+///
+/// The private field encodes the valid range. `new` rejects an out-of-range
+/// value with `InvalidArgument`, so no command can send a bad slot to the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RMemSlot(pub u16);
+pub struct RMemSlot(u16);
+
+impl RMemSlot
+{
+    /// Builds a slot index, rejecting any value above 511.
+    ///
+    /// Errors with `InvalidArgument` outside 0..=511.
+    pub const fn new(value: u16) -> Result<Self, SeError>
+    {
+        if value > 511
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        Ok(RMemSlot(value))
+    }
+
+    /// Returns the wire index.
+    // The R-Memory commands that send this index are not wired yet (dead in the
+    // non-test build). The newtype tests use it, so `#[allow]` is required (same
+    // pattern as `ids::ObjectId`).
+    #[allow(dead_code)]
+    pub(crate) const fn get(self) -> u16
+    {
+        self.0
+    }
+}
 
 /// A monotonic counter index (0..=15).
+///
+/// The private field encodes the valid range. `new` rejects an out-of-range
+/// value with `InvalidArgument`, so no command can send a bad index to the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MCounterIdx(pub u8);
+pub struct MCounterIdx(u8);
+
+impl MCounterIdx
+{
+    /// Builds a counter index, rejecting any value above 15.
+    ///
+    /// Errors with `InvalidArgument` outside 0..=15.
+    pub const fn new(value: u8) -> Result<Self, SeError>
+    {
+        if value > 15
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        Ok(MCounterIdx(value))
+    }
+
+    /// Returns the wire index.
+    // `mcounter_get`'s only caller is the not-yet-wired `SeCommands` impl, so
+    // this accessor is dead in the non-test build. The tests use it, so
+    // `#[allow]` is required (same pattern as `ids::ObjectId`).
+    #[allow(dead_code)]
+    pub(crate) const fn get(self) -> u8
+    {
+        self.0
+    }
+}
 
 /// A MAC-and-Destroy PIN-attempt slot index (0..=127).
+///
+/// The private field encodes the valid range. `new` rejects an out-of-range
+/// value with `InvalidArgument`, so no command can send a bad slot to the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MacDestroySlot(pub u8);
+pub struct MacDestroySlot(u8);
+
+impl MacDestroySlot
+{
+    /// Builds a slot index, rejecting any value above 127.
+    ///
+    /// Errors with `InvalidArgument` outside 0..=127.
+    pub const fn new(value: u8) -> Result<Self, SeError>
+    {
+        if value > 127
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        Ok(MacDestroySlot(value))
+    }
+
+    /// Returns the wire index.
+    // The MAC-and-Destroy command that sends this index is not wired yet (dead
+    // in the non-test build). The newtype tests use it, so `#[allow]` is
+    // required (same pattern as `ids::ObjectId`).
+    #[allow(dead_code)]
+    pub(crate) const fn get(self) -> u8
+    {
+        self.0
+    }
+}
 
 /// A 64-byte ECC signature (R = 32 B, S = 32 B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +207,10 @@ pub trait SeCommands
 
     /// Fills `out` with TRNG bytes.
     ///
-    /// Returns the number of bytes written. Errors on a session fault.
+    /// Returns the number of bytes written, which equals `out.len()`. An empty
+    /// `out` returns `Ok(0)` with no chip traffic. Rejects `out.len() > 255`
+    /// with `InvalidArgument` (chunking is a caller concern). Errors on a
+    /// session fault.
     fn random_into
     (
         &mut self,
@@ -128,7 +244,9 @@ pub trait SeCommands
 
     /// Reads monotonic counter `idx`.
     ///
-    /// Returns the current 32-bit value. Errors on a disabled counter.
+    /// Returns the current 32-bit value. A disabled counter surfaces as a
+    /// recoverable `L3Error::Result(CounterInvalid)` that keeps the session
+    /// live. The index range (0..=15) is enforced by `MCounterIdx::new`.
     fn mcounter_get
     (
         &mut self,
@@ -146,4 +264,38 @@ pub trait SeCommands
         input: &[u8; 32],
     )
     -> Result<[u8; 32], SeError>;
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn ecc_slot_accepts_max_and_rejects_one_past()
+    {
+        assert_eq!(EccSlot::new(31).map(|s| s.get()), Ok(31));
+        assert_eq!(EccSlot::new(32), Err(SeError::InvalidArgument));
+    }
+
+    #[test]
+    fn rmem_slot_accepts_max_and_rejects_one_past()
+    {
+        assert_eq!(RMemSlot::new(511).map(|s| s.get()), Ok(511));
+        assert_eq!(RMemSlot::new(512), Err(SeError::InvalidArgument));
+    }
+
+    #[test]
+    fn mcounter_idx_accepts_max_and_rejects_one_past()
+    {
+        assert_eq!(MCounterIdx::new(15).map(|s| s.get()), Ok(15));
+        assert_eq!(MCounterIdx::new(16), Err(SeError::InvalidArgument));
+    }
+
+    #[test]
+    fn mac_destroy_slot_accepts_max_and_rejects_one_past()
+    {
+        assert_eq!(MacDestroySlot::new(127).map(|s| s.get()), Ok(127));
+        assert_eq!(MacDestroySlot::new(128), Err(SeError::InvalidArgument));
+    }
 }

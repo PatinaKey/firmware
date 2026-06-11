@@ -33,7 +33,9 @@ use crate::ids::L3Status;
 use crate::l1;
 use crate::l2::frame;
 use crate::l3;
+use crate::parse::take;
 use crate::parse::take_array;
+use crate::port::MCounterIdx;
 use crate::session::SessionKeys;
 use crate::wait::SeWait;
 
@@ -294,25 +296,159 @@ where
         }
     }
 
-    /// Sends a `Ping` and writes the echoed payload into `out`.
+    /// Runs one gated L3 command end to end and returns the parsed value.
     ///
-    /// A diagnostic round-trip (not part of `SeCommands`). Returns the echoed
-    /// byte count, which equals `payload.len()`.
+    /// On entry `l3[2..2 + cmd_plaintext_len]` holds `CMD_ID || CMD_DATA`. The
+    /// template owns every session duty so a command author cannot forget one:
     ///
-    /// Teardown gate: any fault between encrypt and verified decrypt (and a
-    /// wrong-size echo, mirroring libtropic's `lt_in__ping`) poisons the
-    /// session. A poisoned session fast-fails with `SessionLost` and touches
-    /// neither the keys nor the chip. A non-OK result status is a valid,
-    /// authenticated response: it returns an error but keeps the session live.
-    /// This method wipes the L3 buffer after every round-trip, success or not.
-    pub fn ping_into(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, SeError>
+    /// - A poisoned session fast-fails with `SessionLost`, no keys, no chip.
+    /// - Any fault in seal -> transport -> verified open poisons the session.
+    ///   The nonces may be out of step and the keys must not be reused.
+    /// - An authenticated but empty result has no RESULT byte. The peer is
+    ///   misusing the channel, so poison and fail closed.
+    /// - A known non-OK RESULT (FAIL, COUNTER_INVALID, ...) is a valid
+    ///   authenticated reply. It returns `L3Error::Result` and keeps the
+    ///   session live, mirroring `lt_l3_decrypt_response`.
+    /// - An unknown RESULT byte returns `L3Error::Parse(InvalidValue)` and
+    ///   keeps the session live, mirroring libtropic's `LT_L3_RESULT_UNKNOWN`.
+    /// - On an OK result, when `expected_res_data_len` is `Some(n)` and the
+    ///   RES_DATA length is not `n`, poison (a structural anomaly on an
+    ///   authenticated OK result, mirroring libtropic's RES_SIZE invalidate).
+    /// - `parse` consumes the RES_DATA slice `l3[3..2 + plain_len]`. When it
+    ///   returns `Err`, poison before returning. A failed or forgotten parse on
+    ///   an OK result thus tears the session down rather than continuing.
+    ///
+    /// The L3 plaintext buffer is zeroized on every return path. The wipe lives
+    /// here so no command author can leave plaintext behind.
+    fn run<T>
+    (
+        &mut self,
+        cmd_plaintext_len: usize,
+        expected_res_data_len: Option<usize>,
+        parse: impl FnOnce(&[u8]) -> Result<T, L3Error>,
+    )
+    -> Result<T, SeError>
+    {
+        let result = self.run_gated(cmd_plaintext_len, expected_res_data_len, parse);
+        // The L3 buffer held command and result plaintext. Wipe it on every
+        // path, success or failure, before handing control back.
+        self.l3.as_mut_slice().zeroize();
+        result
+    }
+
+    /// Non-generic gate body for `run`, less the L3 wipe.
+    ///
+    /// Outlined from `run` so the heavy session logic compiles once instead of
+    /// per `T`. `run` adds only the wipe, which keeps the monomorphized stub
+    /// tiny. See `run` for the per-step contract.
+    fn run_gated<T>
+    (
+        &mut self,
+        cmd_plaintext_len: usize,
+        expected_res_data_len: Option<usize>,
+        parse: impl FnOnce(&[u8]) -> Result<T, L3Error>,
+    )
+    -> Result<T, SeError>
     {
         if self.state.is_poisoned()
         {
             return Err(SeError::SessionLost);
         }
+        let plain_len = match l3::round_trip
+        (
+            &mut self.spi,
+            &mut self.wait,
+            &mut self.l2,
+            &mut self.l3,
+            &mut self.state.keys,
+            cmd_plaintext_len,
+        )
+        {
+            Ok(n) => n,
+            Err(e) =>
+            {
+                self.state.poison();
+                return Err(e);
+            }
+        };
+        if plain_len == 0
+        {
+            // An authenticated but empty result has no RESULT byte. This is
+            // STRICTER than libtropic on purpose: libtropic would read the
+            // first sealed byte as a tag and map it to LT_L3_RESULT_UNKNOWN,
+            // whereas a structurally impossible authenticated result here fails
+            // closed and poisons the session.
+            self.state.poison();
+            return Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)));
+        }
+        let result_byte = *self
+            .l3
+            .as_slice()
+            .get(2)
+            .ok_or(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))?;
+        let status = match L3Status::try_from(result_byte)
+        {
+            Ok(s) => s,
+            Err(_) =>
+            {
+                // Unknown RESULT byte: recoverable, session left live, mirroring
+                // libtropic's LT_L3_RESULT_UNKNOWN handling.
+                return Err(SeError::L3(L3Error::Parse(ParseError::InvalidValue)));
+            }
+        };
+        if status != L3Status::Ok
+        {
+            // A valid authenticated result (FAIL, COUNTER_INVALID, ...): the
+            // session stays live, mirroring lt_l3_decrypt_response.
+            return Err(SeError::L3(L3Error::Result(status)));
+        }
+        // RES_DATA = everything after the RESULT byte: l3[3..2 + plain_len].
+        let res_data = self
+            .l3
+            .as_slice()
+            .get(3..2 + plain_len)
+            .ok_or(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))?;
+        if let Some(expected) = expected_res_data_len
+            && res_data.len() != expected
+        {
+            // Structural anomaly on an authenticated OK result, mirroring
+            // libtropic's RES_SIZE invalidate. Read the length before the
+            // disjoint &mut-self poison call to satisfy the borrow checker.
+            self.state.poison();
+            return Err(SeError::L3(L3Error::Oversize));
+        }
+        match parse(res_data)
+        {
+            Ok(value) => Ok(value),
+            Err(e) =>
+            {
+                // Fail-closed: a parse failure on an OK result tears the session
+                // down. The res_data borrow ends with `parse`, so poisoning self
+                // here is a disjoint borrow.
+                self.state.poison();
+                Err(SeError::L3(e))
+            }
+        }
+    }
+
+    /// Sends a `Ping` and writes the echoed payload into `out`.
+    ///
+    /// A diagnostic round-trip (not part of `SeCommands`). Returns the echoed
+    /// byte count, which equals `payload.len()`.
+    ///
+    /// The shared `run` gate governs the session. The parse closure enforces
+    /// the ping RES_SIZE check: a wrong-size echo on an OK result returns
+    /// `L3Error::Oversize`, which `run` turns into a session poison, mirroring
+    /// libtropic's `lt_in__ping`.
+    pub fn ping_into(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, SeError>
+    {
         // Argument checks come first: no nonce, no crypto, no chip traffic, so
-        // a rejection here leaves the session untouched.
+        // a rejection here leaves the session untouched. Re-check poison up
+        // front so a poisoned session rejects before argument work.
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
         let plaintext_len = 1usize
             .checked_add(payload.len())
             .ok_or(SeError::InvalidArgument)?;
@@ -333,77 +469,101 @@ where
             l3[2] = CmdId::Ping as u8;
             l3[3..3 + payload.len()].copy_from_slice(payload);
         }
-        let result = self.ping_round_trip(plaintext_len, payload.len(), out);
-        // The L3 buffer held command and result plaintext: wipe it on every
-        // path, success included.
-        self.l3.as_mut_slice().zeroize();
-        result
+        let payload_len = payload.len();
+        // Echo length varies, so the size check lives in the closure: a
+        // wrong-size echo returns Oversize, which run poisons (lt_in__ping).
+        self.run
+        (
+            plaintext_len,
+            None,
+            |res_data|
+            {
+                if res_data.len() != payload_len
+                {
+                    return Err(L3Error::Oversize);
+                }
+                out[..payload_len].copy_from_slice(res_data);
+                Ok(payload_len)
+            },
+        )
     }
 
-    /// Runs the gated round-trip and interprets the authenticated result.
+    /// Fills `out` with TRNG bytes from the chip.
     ///
-    /// Phase 1 (seal -> transport -> verified open) poisons on ANY error: the
-    /// nonces may be out of step and the keys must not be reused. Phase 2 reads
-    /// the decrypted, authenticated plaintext. Its errors keep the session
-    /// live, except a wrong-size echo, which libtropic also treats as fatal.
-    fn ping_round_trip
-    (
-        &mut self,
-        plaintext_len: usize,
-        payload_len: usize,
-        out: &mut [u8],
-    )
-    -> Result<usize, SeError>
+    /// Inherent twin of `SeCommands::random_into`. Returns the number of bytes
+    /// written, which equals `out.len()`. An empty `out` returns `Ok(0)` with
+    /// no chip traffic. Rejects `out.len() > 255` with `InvalidArgument`
+    /// (chunking is a caller concern). A wrong-size authenticated result
+    /// poisons the session, mirroring libtropic's RES_SIZE check.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required
+    // (an `#[expect]` would fire `unfulfilled_lint_expectations` in the test
+    // build). Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn random_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
     {
-        let plain_len = match l3::round_trip
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        if out.is_empty()
+        {
+            return Ok(0);
+        }
+        let n_bytes = u8::try_from(out.len()).map_err(|_| SeError::InvalidArgument)?;
+        // CMD plaintext (2 bytes): CMD_ID || N_BYTES, laid out at l3[2..].
+        {
+            let l3 = self.l3.as_mut_slice();
+            l3[2] = CmdId::RandomValueGet as u8;
+            l3[3] = n_bytes;
+        }
+        let n = out.len();
+        // RES_DATA = PADDING(3) || RANDOM(N): skip the padding, copy the bytes.
+        self.run
         (
-            &mut self.spi,
-            &mut self.wait,
-            &mut self.l2,
-            &mut self.l3,
-            &mut self.state.keys,
-            plaintext_len,
-        )
-        {
-            Ok(n) => n,
-            Err(e) =>
+            2,
+            Some(3 + n),
+            |res_data|
             {
-                self.state.poison();
-                return Err(e);
-            }
-        };
-        // Result plaintext at l3[2..2 + plain_len] = RESULT(1) || RES_DATA. An
-        // authenticated but empty result has no RESULT byte: it is a structural
-        // protocol violation by the (authenticated) peer, so fail closed and
-        // poison rather than continue on a channel the chip is misusing.
-        if plain_len == 0
+                let (_padding, random) = take(res_data, 3)?;
+                out[..n].copy_from_slice(random);
+                Ok(n)
+            },
+        )
+    }
+
+    /// Reads monotonic counter `idx` and returns its 32-bit value.
+    ///
+    /// Inherent twin of `SeCommands::mcounter_get`. The index range is enforced
+    /// by `MCounterIdx`. A `CounterInvalid` result is recoverable: it surfaces
+    /// as `L3Error::Result` and keeps the session live. A wrong-size
+    /// authenticated result poisons the session.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn mcounter_get(&mut self, idx: MCounterIdx) -> Result<u32, SeError>
+    {
+        // CMD plaintext (3 bytes): CMD_ID || MCOUNTER_INDEX(u16 LE).
         {
-            self.state.poison();
-            return Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)));
+            let l3 = self.l3.as_mut_slice();
+            l3[2] = CmdId::McounterGet as u8;
+            let index = u16::from(idx.get()).to_le_bytes();
+            l3[3] = index[0];
+            l3[4] = index[1];
         }
-        let l3 = self.l3.as_slice();
-        let result_byte = *l3.get(2).ok_or(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))?;
-        let status = L3Status::try_from(result_byte)
-            .map_err(|_| SeError::L3(L3Error::Parse(ParseError::InvalidValue)))?;
-        if status != L3Status::Ok
-        {
-            // A valid authenticated result (FAIL, UNAUTHORIZED, ...): the
-            // session stays live, mirroring lt_l3_decrypt_response.
-            return Err(SeError::L3(L3Error::Result(status)));
-        }
-        let echo_len = plain_len - 1;
-        if echo_len != payload_len
-        {
-            // Authenticated but wrong-size echo. libtropic invalidates the
-            // session here (lt_in__ping RES_SIZE check), so do we.
-            self.state.poison();
-            return Err(SeError::L3(L3Error::Oversize));
-        }
-        let echo = l3
-            .get(3..3 + echo_len)
-            .ok_or(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))?;
-        out[..echo_len].copy_from_slice(echo);
-        Ok(echo_len)
+        // RES_DATA = PADDING(3) || VALUE(u32 LE).
+        self.run
+        (
+            3,
+            Some(7),
+            |res_data|
+            {
+                let (_padding, rest) = take(res_data, 3)?;
+                let (_tail, value) = take_array::<4>(rest)?;
+                Ok(u32::from_le_bytes(value))
+            },
+        )
     }
 }
 
@@ -414,6 +574,11 @@ impl<SPI, W, State> Tropic01<SPI, W, State>
     pub(crate) fn spi_ref(&self) -> &SPI
     {
         &self.spi
+    }
+
+    pub(crate) fn spi_mut(&mut self) -> &mut SPI
+    {
+        &mut self.spi
     }
 }
 
@@ -610,6 +775,142 @@ mod tests
             Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
         );
         assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn random_into_fills_buffer_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        let mut out = [0u8; 16];
+        let n = dev.random_into(&mut out).unwrap();
+        assert_eq!(n, 16);
+        // The chip fills RANDOM(N) with 0xA0 + i. Assert the bytes landed and
+        // the nonces advanced once in lockstep.
+        for (i, b) in out.iter().enumerate()
+        {
+            assert_eq!(*b, 0xA0u8.wrapping_add(i as u8));
+        }
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn random_into_empty_out_makes_no_traffic()
+    {
+        let mut dev = open(ChipFault::None);
+        let before = dev.spi_ref().transaction_count();
+        let mut out = [0u8; 0];
+        assert_eq!(dev.random_into(&mut out), Ok(0));
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+        assert_eq!(dev.spi_ref().nonces(), (0, 0));
+    }
+
+    #[test]
+    fn random_into_rejects_oversize_request_before_traffic()
+    {
+        let mut dev = open(ChipFault::None);
+        let before = dev.spi_ref().transaction_count();
+        let mut out = [0u8; 256];
+        assert_eq!(dev.random_into(&mut out), Err(SeError::InvalidArgument));
+        // Rejected up front: no nonce burned, no SPI traffic, session intact.
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+        let mut ok_out = [0u8; 8];
+        assert_eq!(dev.random_into(&mut ok_out), Ok(8));
+    }
+
+    #[test]
+    fn random_into_wrong_size_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::ResultWrongSize);
+        let mut out = [0u8; 16];
+        assert_eq!(dev.random_into(&mut out), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    /// Builds a counter index, panicking only in test code on a bad constant.
+    fn mc(value: u8) -> MCounterIdx
+    {
+        MCounterIdx::new(value).expect("test mcounter index out of range")
+    }
+
+    #[test]
+    fn mcounter_get_returns_little_endian_value()
+    {
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_mcounter_val(0x01020304);
+        assert_eq!(dev.mcounter_get(mc(3)), Ok(0x01020304));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn mcounter_get_counter_invalid_is_recoverable()
+    {
+        // A CounterInvalid result is a valid authenticated response: the error
+        // surfaces but the session stays live and the nonces stay in step.
+        let mut dev = open(ChipFault::CounterInvalid);
+        assert_eq!
+        (
+            dev.mcounter_get(mc(0)),
+            Err(SeError::L3(L3Error::Result(L3Status::CounterInvalid)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.mcounter_get(mc(0));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::CounterInvalid))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn mcounter_get_wrong_size_result_poisons_session()
+    {
+        // An authenticated OK result whose RES_DATA is one byte short is a
+        // structural anomaly: run poisons via the expected_res_data_len check.
+        let mut dev = open(ChipFault::ResultWrongSize);
+        assert_eq!(dev.mcounter_get(mc(0)), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn unknown_result_status_is_recoverable()
+    {
+        // The chip seals an OK-tag result whose RESULT byte is unrecognized.
+        // run surfaces Parse(InvalidValue) and leaves the session live, so the
+        // next command reaches the chip and the nonces advance.
+        let mut dev = open(ChipFault::UnknownResultStatus);
+        let mut out = [0u8; 16];
+        assert_eq!
+        (
+            dev.ping_into(b"hi", &mut out),
+            Err(SeError::L3(L3Error::Parse(ParseError::InvalidValue)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ping_into(b"hi", &mut out);
+        assert_eq!(r, Err(SeError::L3(L3Error::Parse(ParseError::InvalidValue))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn random_l3_buffer_is_wiped_after_success()
+    {
+        let mut dev = open(ChipFault::None);
+        let mut out = [0u8; 16];
+        dev.random_into(&mut out).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "plaintext residue");
+    }
+
+    #[test]
+    fn mixed_command_sequence_keeps_nonces_in_lockstep()
+    {
+        // A ping, a random, and an mcounter_get each advance both nonces once.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_mcounter_val(0xDEADBEEF);
+        let mut buf = [0u8; 16];
+        dev.ping_into(b"x", &mut buf).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        dev.random_into(&mut buf).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        assert_eq!(dev.mcounter_get(mc(0)), Ok(0xDEADBEEF));
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
     }
 
     #[test]

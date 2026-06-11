@@ -252,6 +252,18 @@ pub(crate) enum ChipFault
     ShortEcho,
     /// Seal an authenticated but empty result (no RESULT byte, RES_SIZE = 0).
     EmptyResult,
+    /// Seal a valid OK result whose RES_DATA is one byte short (size mismatch).
+    ///
+    /// Command-agnostic counterpart of `ShortEcho`. It drops the last RES_DATA
+    /// byte after the RESULT byte, so any command's structural size check fires.
+    ResultWrongSize,
+    /// Seal a valid result whose RESULT status is CounterInvalid (recoverable).
+    CounterInvalid,
+    /// Seal a valid (OK-tag) result whose RESULT byte is an unrecognized value.
+    ///
+    /// The GCM tag verifies, but the status byte (0x55) maps to no `L3Status`.
+    /// The host must surface a recoverable parse error and keep the session.
+    UnknownResultStatus,
 }
 
 /// One queued chip output: a full L2 frame, or an alarm signal on the read.
@@ -314,6 +326,7 @@ pub(crate) struct ChipMockSpi
     pending: VecDeque<Pending>,
     fault: ChipFault,
     transactions: usize,
+    mcounter_val: u32,
 }
 
 impl ChipMockSpi
@@ -342,7 +355,14 @@ impl ChipMockSpi
             pending: VecDeque::new(),
             fault,
             transactions: 0,
+            mcounter_val: 0,
         }
+    }
+
+    /// Sets the value the mock returns for a McounterGet command.
+    pub(crate) fn set_mcounter_val(&mut self, value: u32)
+    {
+        self.mcounter_val = value;
     }
 
     /// Returns how many SPI transactions the host has issued.
@@ -418,25 +438,17 @@ impl ChipMockSpi
     {
         let pt = open(&self.kcmd, self.cmd_nonce, &self.accum[2..2 + cmd_size + 16]);
         self.cmd_nonce += 1;
-        // pt = CMD_ID || payload. Echo the payload as a Ping result.
-        let mut payload = &pt[1..];
-        let status = match self.fault
+        let mut res_pt = self.build_result_pt(&pt);
+        if self.fault == ChipFault::ResultWrongSize && res_pt.len() > 1
         {
-            ChipFault::ResultFail => crate::ids::L3Status::Fail,
-            _ => crate::ids::L3Status::Ok,
-        };
-        if self.fault == ChipFault::ShortEcho && !payload.is_empty()
-        {
-            // Authenticated but one byte short: a RES_SIZE mismatch.
-            payload = &payload[..payload.len() - 1];
+            // Authenticated but one RES_DATA byte short: a RES_SIZE mismatch.
+            res_pt.truncate(res_pt.len() - 1);
         }
-        let mut res_pt = Vec::with_capacity(1 + payload.len());
-        if self.fault != ChipFault::EmptyResult
+        if self.fault == ChipFault::EmptyResult
         {
             // EmptyResult seals a zero-length plaintext: authenticated, but with
             // no RESULT byte (a structural protocol violation).
-            res_pt.push(status as u8);
-            res_pt.extend_from_slice(payload);
+            res_pt.clear();
         }
         let mut sealed = seal(&self.kres, self.res_nonce, &res_pt);
         self.res_nonce += 1;
@@ -463,7 +475,10 @@ impl ChipMockSpi
             | ChipFault::L2CrcErr
             | ChipFault::ResultFail
             | ChipFault::ShortEcho
-            | ChipFault::EmptyResult =>
+            | ChipFault::EmptyResult
+            | ChipFault::ResultWrongSize
+            | ChipFault::CounterInvalid
+            | ChipFault::UnknownResultStatus =>
             {}
         }
 
@@ -478,6 +493,58 @@ impl ChipMockSpi
             f[last] ^= 0xFF;
         }
         self.pending.push_back(Pending::Frame(f));
+    }
+
+    /// Builds the result plaintext `RESULT || RES_DATA` for a command.
+    ///
+    /// `pt` is the decrypted command plaintext `CMD_ID || CMD_DATA`. Dispatches
+    /// on CMD_ID to shape RES_DATA: Ping echoes the payload, RandomValueGet
+    /// returns padding plus deterministic bytes, McounterGet returns padding
+    /// plus the configured value. The `ResultFail`/`CounterInvalid` faults
+    /// override the RESULT status.
+    fn build_result_pt(&self, pt: &[u8]) -> Vec<u8>
+    {
+        use crate::ids::CmdId;
+        use crate::ids::L3Status;
+
+        let status_byte = match self.fault
+        {
+            ChipFault::ResultFail => L3Status::Fail as u8,
+            ChipFault::CounterInvalid => L3Status::CounterInvalid as u8,
+            // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
+            ChipFault::UnknownResultStatus => 0x55,
+            _ => L3Status::Ok as u8,
+        };
+        let cmd_id = pt.first().copied().unwrap_or(0);
+        let mut res_pt = Vec::new();
+        res_pt.push(status_byte);
+        if cmd_id == CmdId::Ping as u8
+        {
+            let mut payload = &pt[1..];
+            if self.fault == ChipFault::ShortEcho && !payload.is_empty()
+            {
+                // Authenticated but one byte short: a RES_SIZE mismatch.
+                payload = &payload[..payload.len() - 1];
+            }
+            res_pt.extend_from_slice(payload);
+        }
+        else if cmd_id == CmdId::RandomValueGet as u8
+        {
+            // CMD_DATA[0] = N_BYTES. RES_DATA = PADDING(3) || RANDOM(N).
+            let n = pt.get(1).copied().unwrap_or(0) as usize;
+            res_pt.extend_from_slice(&[0u8; 3]);
+            for i in 0..n
+            {
+                res_pt.push(0xA0u8.wrapping_add(i as u8));
+            }
+        }
+        else if cmd_id == CmdId::McounterGet as u8
+        {
+            // RES_DATA = PADDING(3) || VALUE(u32 LE).
+            res_pt.extend_from_slice(&[0u8; 3]);
+            res_pt.extend_from_slice(&self.mcounter_val.to_le_bytes());
+        }
+        res_pt
     }
 
     /// Handles a GET_RESPONSE read: sets CHIP_STATUS and fills the frame.

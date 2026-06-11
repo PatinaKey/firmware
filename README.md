@@ -26,14 +26,15 @@ The project is under active development. Only the secure-element driver (`crates
 
 - Noise KK1 handshake: authenticated key agreement with the TROPIC01
 - AES-256-GCM command/response codec with advance-after-verify nonces
-- Session teardown (key zeroization) on any crypto fault
-- `ping` command as an end-to-end smoke test
-- 85 host tests, three libFuzzer targets on parser entry points
+- Fail-closed command gate: a crypto, structural, or parse fault on any command tears the session down and zeroizes the keys
+- Commands: `ping`, `random` (TRNG), and monotonic-counter read
+- Range-checked slot types: an out-of-range key/counter index cannot be constructed
+- 99 host tests, three libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Remaining SE commands: random bytes, ECC keygen, ECDSA/EdDSA sign, R-memory read/write, MAC-and-Destroy, monotonic counters
+- Remaining SE commands: ECC keygen, ECDSA/EdDSA sign, R-memory read/write, MAC-and-Destroy, monotonic counter init/update
 - SE firmware-update path
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
 
