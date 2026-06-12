@@ -51,6 +51,7 @@ pub use crate::ids::UnknownId;
 pub use crate::port::EccCurve;
 pub use crate::port::EccSlot;
 pub use crate::port::MCounterIdx;
+pub use crate::port::MacAndDestroyOutput;
 pub use crate::port::MacDestroySlot;
 pub use crate::port::RMemSlot;
 pub use crate::port::SeCommands;

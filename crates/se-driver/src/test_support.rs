@@ -618,7 +618,8 @@ impl ChipMockSpi
     /// on CMD_ID to shape RES_DATA: Ping echoes the payload, RandomValueGet
     /// returns padding plus deterministic bytes, McounterGet returns padding
     /// plus the configured value, RMemDataRead returns padding plus the slot
-    /// content, RMemDataWrite stores the payload and returns no RES_DATA. The
+    /// content, RMemDataWrite stores the payload and returns no RES_DATA,
+    /// MacAndDestroy returns padding plus a deterministic DATA_OUT. The
     /// `ResultFail`/`CounterInvalid`/`SlotNotEmpty` faults override the status.
     fn build_result_pt(&mut self, pt: &[u8]) -> Vec<u8>
     {
@@ -712,6 +713,20 @@ impl ChipMockSpi
             // signature fills R || S so a test can assert the exact bytes.
             res_pt.extend_from_slice(&[0u8; 15]);
             res_pt.extend_from_slice(&self.sign_signature);
+        }
+        else if cmd_id == CmdId::MacAndDestroy as u8
+        {
+            // CMD_DATA = SLOT(u16 LE) || PADDING(1) || DATA_IN(32). RES_DATA =
+            // PADDING(3) || DATA_OUT(32). DATA_OUT is a deterministic function of
+            // the slot low byte and DATA_IN, so a test can predict it without
+            // modelling the chip's real KDF.
+            let slot_lo = pt.get(1).copied().unwrap_or(0);
+            res_pt.extend_from_slice(&[0u8; 3]);
+            for i in 0..32usize
+            {
+                let din = pt.get(4 + i).copied().unwrap_or(0);
+                res_pt.push(din ^ slot_lo ^ (i as u8));
+            }
         }
         if self.fault == ChipFault::ExtraResultByte && status_ok
         {

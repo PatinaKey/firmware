@@ -20,23 +20,25 @@ The MCU and the TROPIC01 communicate over SPI. All long-term private keys live i
 
 ## Status
 
-The project is under active development. Only the secure-element driver (`crates/se-driver`) exists today. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started.
+The project is under active development. Only the secure-element driver (`crates/se-driver`) exists today. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started. See [`crates/se-driver/README.md`](crates/se-driver/README.md) for the driver's detailed status and command-coverage roadmap.
 
 **Secure-element driver - working today**
 
 - Noise KK1 handshake: authenticated key agreement with the TROPIC01
 - AES-256-GCM command/response codec with advance-after-verify nonces
 - Fail-closed command gate: a crypto, structural, or parse fault on any command tears the session down and zeroizes the keys
-- Commands: `ping`, `random` (TRNG), monotonic-counter read, R-memory read/write, ECC key generation, ECC public-key read, and ECDSA / EdDSA signing
+- The full `SeCommands` trait is assembled over nine commands: `random` (TRNG), monotonic-counter read, R-memory read/write, ECC key generation, ECC public-key read, ECDSA / EdDSA signing, and MAC-and-Destroy (PIN primitive), plus a `ping` diagnostic
 - ECC public-key read returns the chip's attested curve, so an upper layer cannot pick the wrong signing algorithm
-- Range-checked slot types: an out-of-range key/counter/memory index cannot be constructed
-- 161 host tests, three libFuzzer targets on parser entry points
+- The MAC-and-Destroy output is returned in a zeroize-on-drop secret type
+- Range-checked slot types: an out-of-range key/counter/memory/PIN index cannot be constructed
+- 171 host tests, three libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Remaining SE commands: MAC-and-Destroy (PIN) and monotonic-counter init/update. The commands above exist as tested driver methods. They are assembled into the public `SeCommands` trait once MAC-and-Destroy lands
-- SE firmware-update path
+- Roughly half of the TROPIC01 command surface: key import/erase, R-memory erase, monotonic-counter init/update, chip-info/attestation, pairing-key and config-object provisioning, and power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
+- SE firmware-update path (bootloader 0xB0/0xB1)
+- Validation against the `tropic01_model` emulator and silicon (today: in-repo chip mock plus a libtropic-derived handshake KAT)
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
 
 ## Building

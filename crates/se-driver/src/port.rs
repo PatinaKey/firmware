@@ -7,6 +7,8 @@
 //!
 //! `Tropic01<SPI, W, ActiveSession>` implements this trait.
 
+use zeroize::ZeroizeOnDrop;
+
 use crate::error::SeError;
 
 /// An ECC key slot index (0..=31).
@@ -31,11 +33,6 @@ impl EccSlot
     }
 
     /// Returns the wire index.
-    // The ECC commands that send this index are not wired yet, so the accessor
-    // is dead in the non-test build. The newtype tests use it, which fulfils an
-    // `#[expect]` in the test build and would fire `unfulfilled_lint_expectations`
-    // there, so `#[allow]` is required (same pattern as `ids::ObjectId`).
-    #[allow(dead_code)]
     pub(crate) const fn get(self) -> u8
     {
         self.0
@@ -57,11 +54,6 @@ impl EccCurve
     /// Returns the chip CURVE wire byte (P-256 = 0x01, Ed25519 = 0x02).
     ///
     /// Source: libtropic `lt_ecc_curve_type_t` (`L3_ECC_KEY_GENERATE`).
-    // The ECC commands that send this byte are not wired through the public
-    // trait yet, so the helper is dead in the non-test build. The device and
-    // newtype tests use it, so `#[allow]` is required (same pattern as
-    // `ids::ObjectId`).
-    #[allow(dead_code)]
     pub(crate) const fn wire_byte(self) -> u8
     {
         match self
@@ -86,7 +78,6 @@ impl EccCurve
     /// Maps a chip CURVE wire byte back to a curve.
     ///
     /// Returns `None` for any byte other than 0x01 (P-256) or 0x02 (Ed25519).
-    #[allow(dead_code)]
     pub(crate) const fn from_wire_byte(byte: u8) -> Option<Self>
     {
         match byte
@@ -120,10 +111,6 @@ impl RMemSlot
     }
 
     /// Returns the wire index.
-    // The R-Memory commands that send this index are not wired yet (dead in the
-    // non-test build). The newtype tests use it, so `#[allow]` is required (same
-    // pattern as `ids::ObjectId`).
-    #[allow(dead_code)]
     pub(crate) const fn get(self) -> u16
     {
         self.0
@@ -152,10 +139,6 @@ impl MCounterIdx
     }
 
     /// Returns the wire index.
-    // `mcounter_get`'s only caller is the not-yet-wired `SeCommands` impl, so
-    // this accessor is dead in the non-test build. The tests use it, so
-    // `#[allow]` is required (same pattern as `ids::ObjectId`).
-    #[allow(dead_code)]
     pub(crate) const fn get(self) -> u8
     {
         self.0
@@ -184,10 +167,6 @@ impl MacDestroySlot
     }
 
     /// Returns the wire index.
-    // The MAC-and-Destroy command that sends this index is not wired yet (dead
-    // in the non-test build). The newtype tests use it, so `#[allow]` is
-    // required (same pattern as `ids::ObjectId`).
-    #[allow(dead_code)]
     pub(crate) const fn get(self) -> u8
     {
         self.0
@@ -240,6 +219,44 @@ impl EccPublicKey
     pub fn bytes(&self) -> &[u8]
     {
         &self.bytes[..self.curve.pubkey_len()]
+    }
+}
+
+/// The 32-byte MAC-and-Destroy output, a secret.
+///
+/// The chip derives this from the pre-overwrite slot value, and it feeds the
+/// PIN key-derivation step. The byte field stays private and the type carries
+/// no `Debug`/`Clone`/`Copy`, so it cannot leak or duplicate. `ZeroizeOnDrop`
+/// wipes the bytes when the value falls out of scope. The caller reads them
+/// once via `expose`, derives, then drops.
+#[derive(ZeroizeOnDrop)]
+pub struct MacAndDestroyOutput
+{
+    bytes: [u8; 32],
+}
+
+impl MacAndDestroyOutput
+{
+    /// Wraps the 32 output bytes.
+    ///
+    /// `pub(crate)`: only the driver, having parsed the result, builds one.
+    pub(crate) const fn new(bytes: [u8; 32]) -> Self
+    {
+        MacAndDestroyOutput
+        {
+            bytes,
+        }
+    }
+
+    /// Borrows the secret output bytes.
+    ///
+    /// The caller must consume them immediately into a derivation step. The
+    /// borrow keeps the secret tied to the owning value's lifetime, so it is
+    /// wiped on drop. Zeroization covers only this value: any copy the caller
+    /// makes of the exposed bytes is the caller's own to wipe.
+    pub fn expose(&self) -> &[u8; 32]
+    {
+        &self.bytes
     }
 }
 
@@ -347,14 +364,16 @@ pub trait SeCommands
 
     /// Runs MAC-and-Destroy on `slot` with `input`.
     ///
-    /// Returns the 32-byte output derived from the pre-overwrite slot value.
+    /// Returns the secret 32-byte output derived from the pre-overwrite slot
+    /// value, wrapped so it zeroizes on drop. A non-OK RESULT keeps the session
+    /// live and surfaces as a recoverable `SeError`.
     fn mac_and_destroy
     (
         &mut self,
         slot: MacDestroySlot,
         input: &[u8; 32],
     )
-    -> Result<[u8; 32], SeError>;
+    -> Result<MacAndDestroyOutput, SeError>;
 }
 
 #[cfg(test)]

@@ -40,7 +40,10 @@ use crate::port::EccCurve;
 use crate::port::EccPublicKey;
 use crate::port::EccSlot;
 use crate::port::MCounterIdx;
+use crate::port::MacAndDestroyOutput;
+use crate::port::MacDestroySlot;
 use crate::port::RMemSlot;
+use crate::port::SeCommands;
 use crate::port::Signature;
 use crate::session::SessionKeys;
 use crate::wait::SeWait;
@@ -511,11 +514,6 @@ where
     /// no chip traffic. Rejects `out.len() > 255` with `InvalidArgument`
     /// (chunking is a caller concern). A wrong-size authenticated result
     /// poisons the session, mirroring libtropic's RES_SIZE check.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required
-    // (an `#[expect]` would fire `unfulfilled_lint_expectations` in the test
-    // build). Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn random_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
     {
         if self.state.is_poisoned()
@@ -554,10 +552,6 @@ where
     /// by `MCounterIdx`. A `CounterInvalid` result is recoverable: it surfaces
     /// as `L3Error::Result` and keeps the session live. A wrong-size
     /// authenticated result poisons the session.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn mcounter_get(&mut self, idx: MCounterIdx) -> Result<u32, SeError>
     {
         if self.state.is_poisoned()
@@ -599,10 +593,6 @@ where
     /// OK result: the parse closure returns `Err`, which poisons the session via
     /// `run`. An empty slot reads back RESULT=OK with no DATA and returns
     /// `Ok(0)`, keeping the session live.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn rmem_read_into
     (
         &mut self,
@@ -665,10 +655,6 @@ where
     /// A non-OK RESULT (SLOT_NOT_EMPTY, HARDWARE_FAIL, FAIL, ...) is a valid
     /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
     /// session live, mirroring libtropic.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn rmem_write(&mut self, slot: RMemSlot, data: &[u8]) -> Result<(), SeError>
     {
         // Argument checks come first: no nonce, no crypto, no chip traffic, so a
@@ -718,10 +704,6 @@ where
     /// RESULT (SlotNotEmpty, Fail, ...) is a valid authenticated reply: it
     /// surfaces as `L3Error::Result` and keeps the session live, mirroring
     /// libtropic. A bad tag, CRC, alarm, or empty result poisons the session.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn ecc_key_generate
     (
         &mut self,
@@ -760,10 +742,6 @@ where
     /// anomaly on an authenticated OK result. The closure returns `Err`, which
     /// poisons the session via `run`. An empty or corrupt slot reads back the
     /// recoverable `L3Error::Result(InvalidKey)`, keeping the session live.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn ecc_public_key
     (
         &mut self,
@@ -823,10 +801,6 @@ where
     /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
     /// session live, mirroring libtropic. A bad tag, CRC, alarm, empty result,
     /// or wrong-size result poisons the session.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn ecdsa_sign
     (
         &mut self,
@@ -865,10 +839,6 @@ where
     /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
     /// session live. A bad tag, CRC, alarm, empty result, or wrong-size result
     /// poisons the session.
-    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
-    // the non-test build. The device tests call it, so `#[allow]` is required.
-    // Same pattern as `ids::ObjectId`.
-    #[allow(dead_code)]
     pub(crate) fn eddsa_sign
     (
         &mut self,
@@ -916,6 +886,155 @@ where
         // RES_DATA = PADDING(15) || R(32) || S(32) = 79 bytes (fixed).
         self.run(plaintext_len, Some(SIGN_RES_DATA_LEN), parse_signature)
     }
+
+    /// Runs MAC-and-Destroy on `slot` with `input`, returning the output.
+    ///
+    /// Inherent twin of `SeCommands::mac_and_destroy`. One L3 round-trip: the
+    /// chip mixes `input` with the pre-overwrite slot value, returns a 32-byte
+    /// output, and destroys the slot. The output is secret (it feeds the PIN
+    /// KDF), so it returns wrapped in `MacAndDestroyOutput`, zeroized on drop.
+    ///
+    /// The slot range is enforced by `MacDestroySlot::new` and the input length
+    /// by the `&[u8; 32]` type, so no runtime argument check is needed. A non-OK
+    /// RESULT (Fail, Unauthorized, InvalidCmd) is a valid authenticated reply:
+    /// it surfaces as `L3Error::Result` and keeps the session live, mirroring
+    /// libtropic. A consumed slot still replies OK with a changed output;
+    /// destruction is observed host-side, so Fail never means "slot consumed".
+    /// A bad tag, CRC, alarm, empty result, or wrong-size result poisons the
+    /// session.
+    pub(crate) fn mac_and_destroy
+    (
+        &mut self,
+        slot: MacDestroySlot,
+        input: &[u8; 32],
+    )
+    -> Result<MacAndDestroyOutput, SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (36 bytes): CMD_ID || SLOT(u16 LE) || PADDING(1, 0) ||
+        // DATA_IN(32).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::MacAndDestroy as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3] = 0;
+            cmd[MAC_DESTROY_CMD_HEADER..MAC_DESTROY_CMD_LEN].copy_from_slice(input);
+        }
+        // RES_DATA = PADDING(3) || DATA_OUT(32) = 35 bytes (fixed).
+        self.run(MAC_DESTROY_CMD_LEN, Some(MAC_DESTROY_RES_DATA_LEN), parse_mac_destroy)
+    }
+}
+
+/// The high-level command port over an active session.
+///
+/// Each method delegates to the inherent twin, which carries the gate, the
+/// teardown duties, and the byte layout. The trait keeps transport and crypto
+/// detail out of the CTAP2 / OpenPGP / PKCS#11 layers above.
+impl<SPI, W> SeCommands for Tropic01<SPI, W, ActiveSession>
+where
+    SPI: SpiDevice,
+    W: SeWait,
+{
+    fn ecc_key_generate
+    (
+        &mut self,
+        slot: EccSlot,
+        curve: EccCurve,
+    )
+    -> Result<(), SeError>
+    {
+        self.ecc_key_generate(slot, curve)
+    }
+
+    fn ecc_public_key
+    (
+        &mut self,
+        slot: EccSlot,
+    )
+    -> Result<EccPublicKey, SeError>
+    {
+        self.ecc_public_key(slot)
+    }
+
+    fn ecdsa_sign
+    (
+        &mut self,
+        slot: EccSlot,
+        digest: &[u8; 32],
+    )
+    -> Result<Signature, SeError>
+    {
+        self.ecdsa_sign(slot, digest)
+    }
+
+    fn eddsa_sign
+    (
+        &mut self,
+        slot: EccSlot,
+        message: &[u8],
+    )
+    -> Result<Signature, SeError>
+    {
+        self.eddsa_sign(slot, message)
+    }
+
+    fn random_into
+    (
+        &mut self,
+        out: &mut [u8],
+    )
+    -> Result<usize, SeError>
+    {
+        self.random_into(out)
+    }
+
+    fn rmem_read_into
+    (
+        &mut self,
+        slot: RMemSlot,
+        out: &mut [u8],
+    )
+    -> Result<usize, SeError>
+    {
+        self.rmem_read_into(slot, out)
+    }
+
+    fn rmem_write
+    (
+        &mut self,
+        slot: RMemSlot,
+        data: &[u8],
+    )
+    -> Result<(), SeError>
+    {
+        self.rmem_write(slot, data)
+    }
+
+    fn mcounter_get
+    (
+        &mut self,
+        idx: MCounterIdx,
+    )
+    -> Result<u32, SeError>
+    {
+        self.mcounter_get(idx)
+    }
+
+    fn mac_and_destroy
+    (
+        &mut self,
+        slot: MacDestroySlot,
+        input: &[u8; 32],
+    )
+    -> Result<MacAndDestroyOutput, SeError>
+    {
+        self.mac_and_destroy(slot, input)
+    }
 }
 
 /// Parses a sign result `PADDING(15) || R(32) || S(32)` into a `Signature`.
@@ -934,6 +1053,24 @@ fn parse_signature(res_data: &[u8]) -> Result<Signature, L3Error>
         return Err(L3Error::Oversize);
     }
     Ok(Signature(bytes))
+}
+
+/// Parses a MAC-and-Destroy result `PADDING(3) || DATA_OUT(32)`.
+///
+/// `run` proves `res_data.len() == MAC_DESTROY_RES_DATA_LEN` via
+/// `expected_res_data_len` before calling this, so the `take` bounds hold
+/// structurally. Skips the 3 padding bytes, then copies DATA_OUT into the
+/// secret output value. Rejects any trailing byte so a caller passing `None`
+/// cannot silently accept an oversize result: fail closed.
+fn parse_mac_destroy(res_data: &[u8]) -> Result<MacAndDestroyOutput, L3Error>
+{
+    let (_padding, rest) = take(res_data, MAC_DESTROY_RES_PADDING)?;
+    let (tail, data_out) = take_array::<32>(rest)?;
+    if !tail.is_empty()
+    {
+        return Err(L3Error::Oversize);
+    }
+    Ok(MacAndDestroyOutput::new(data_out))
 }
 
 /// Maximum R-Memory user-data DATA length in bytes (target firmware >= 2.0.0).
@@ -983,6 +1120,23 @@ const SIGN_RES_DATA_LEN: usize = SIGN_RES_PADDING + 64;
 /// Source: libtropic `TR01_L3_EDDSA_SIGN_CMD_MSG_LEN_MAX`. A 4096-byte message
 /// yields a 4112-byte plaintext, which fills the L3 buffer to capacity.
 const EDDSA_MSG_MAX: usize = 4096;
+
+/// MAC-and-Destroy command header length: CMD_ID(1) || SLOT(2) || PADDING(1).
+///
+/// Source: libtropic `struct lt_l3_mac_and_destroy_cmd_t` (`slot` u16, then
+/// `padding` before `data_in`). DATA_IN(32) follows this header.
+const MAC_DESTROY_CMD_HEADER: usize = 4;
+
+/// MAC-and-Destroy command plaintext length: header(4) || DATA_IN(32).
+const MAC_DESTROY_CMD_LEN: usize = MAC_DESTROY_CMD_HEADER + 32;
+
+/// Padding bytes before DATA_OUT in a MAC-and-Destroy result.
+///
+/// Source: libtropic `struct lt_l3_mac_and_destroy_res_t` (`padding[3]`).
+const MAC_DESTROY_RES_PADDING: usize = 3;
+
+/// MAC-and-Destroy result RES_DATA length: PADDING(3) || DATA_OUT(32).
+const MAC_DESTROY_RES_DATA_LEN: usize = MAC_DESTROY_RES_PADDING + 32;
 
 // Compile-time invariant: the maximum EdDSA wire packet fills the L3 buffer
 // exactly. The packet is 2 (L3 CMD_SIZE prefix) || SIGN_CMD_HEADER ||
@@ -2156,6 +2310,173 @@ mod tests
         let pk = dev.ecc_public_key(eslot(2)).unwrap();
         assert_eq!(pk.curve(), EccCurve::Ed25519);
         assert_eq!(dev.spi_ref().nonces(), (3, 3));
+    }
+
+    /// Builds a MAC-and-Destroy slot index, panicking only in test code on a
+    /// bad constant.
+    fn mdslot(value: u8) -> MacDestroySlot
+    {
+        MacDestroySlot::new(value).expect("test mac-destroy slot out of range")
+    }
+
+    /// Recomputes the chip mock's deterministic DATA_OUT for a (slot, input).
+    fn expected_mac_out(slot: u8, input: &[u8; 32]) -> [u8; 32]
+    {
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate()
+        {
+            *b = input[i] ^ slot ^ (i as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn mac_and_destroy_round_trips_known_output()
+    {
+        let mut dev = open(ChipFault::None);
+        let mut input = [0u8; 32];
+        for (i, b) in input.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(11).wrapping_add(3);
+        }
+        let out = dev.mac_and_destroy(mdslot(5), &input).unwrap();
+        assert_eq!(out.expose(), &expected_mac_out(5, &input));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn mac_and_destroy_fail_is_recoverable()
+    {
+        // FAIL (0x3C) is a valid authenticated reply: the session stays live
+        // and the nonces stay in step. A consumed slot replies OK (not FAIL),
+        // so FAIL is not a slot-exhaustion signal here.
+        let mut dev = open(ChipFault::ResultFail);
+        let input = [0x11u8; 32];
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &input).map(|o| *o.expose()),
+            Err(SeError::L3(L3Error::Result(L3Status::Fail)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.mac_and_destroy(mdslot(0), &input).map(|o| *o.expose());
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Fail))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn mac_and_destroy_wrong_size_result_poisons_session()
+    {
+        // An authenticated OK result one byte short of the fixed 35-byte RES_DATA
+        // trips run's expected_res_data_len check and poisons.
+        let mut dev = open(ChipFault::ResultWrongSize);
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose()),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mac_and_destroy_extra_result_byte_poisons_session()
+    {
+        // One byte past the fixed 35-byte RES_DATA trips the expected-length
+        // check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose()),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mac_and_destroy_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose()),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mac_and_destroy_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose()),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mac_and_destroy_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose()),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mac_and_destroy_poisoned_session_fast_fails()
+    {
+        // A prior poison makes the next call fast-fail with SessionLost before
+        // any chip traffic.
+        let mut dev = open(ChipFault::BadResultTag);
+        let _ = dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose());
+        let before = dev.spi_ref().transaction_count();
+        assert_eq!
+        (
+            dev.mac_and_destroy(mdslot(0), &[0u8; 32]).map(|o| *o.expose()),
+            Err(SeError::SessionLost)
+        );
+        assert_eq!(dev.spi_ref().transaction_count(), before, "no chip traffic after poison");
+    }
+
+    #[test]
+    fn mac_and_destroy_l3_buffer_is_wiped_after_success()
+    {
+        let mut dev = open(ChipFault::None);
+        let _ = dev.mac_and_destroy(mdslot(3), &[0xAB; 32]).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "plaintext residue");
+    }
+
+    #[test]
+    fn se_commands_trait_dispatch_round_trips()
+    {
+        // Drive several commands through the SeCommands trait, not the inherent
+        // methods, to prove the trait dispatch compiles and runs. A generic
+        // helper bounds the call to the trait surface alone.
+        fn exercise<T: SeCommands>
+        (
+            se: &mut T,
+            slot: MacDestroySlot,
+            input: &[u8; 32],
+        )
+        -> Result<MacAndDestroyOutput, SeError>
+        {
+            let mut out = [0u8; 8];
+            se.random_into(&mut out)?;
+            se.mac_and_destroy(slot, input)
+        }
+
+        let mut dev = open(ChipFault::None);
+        let input = [0x42u8; 32];
+        let out = exercise(&mut dev, mdslot(9), &input).unwrap();
+        assert_eq!(out.expose(), &expected_mac_out(9, &input));
+        // random_into then mac_and_destroy each advance both nonces once.
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
     }
 
     #[test]
