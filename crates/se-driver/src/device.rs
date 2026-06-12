@@ -35,7 +35,13 @@ use crate::l2::frame;
 use crate::l3;
 use crate::parse::take;
 use crate::parse::take_array;
+use crate::parse::take_u8;
+use crate::port::EccCurve;
+use crate::port::EccPublicKey;
+use crate::port::EccSlot;
 use crate::port::MCounterIdx;
+use crate::port::RMemSlot;
+use crate::port::Signature;
 use crate::session::SessionKeys;
 use crate::wait::SeWait;
 
@@ -296,6 +302,16 @@ where
         }
     }
 
+    /// Returns the CMD plaintext region, indexed from 0 like the spec tables.
+    ///
+    /// The L3 buffer reserves bytes `l3[0..2]` for the CMD_SIZE prefix. A
+    /// command writes its plaintext (`CMD_ID` at offset 0) into this view, so
+    /// the byte layout matches the datasheet and libtropic tables directly.
+    fn cmd_plaintext(&mut self) -> &mut [u8]
+    {
+        &mut self.l3.as_mut_slice()[2..]
+    }
+
     /// Runs one gated L3 command end to end and returns the parsed value.
     ///
     /// On entry `l3[2..2 + cmd_plaintext_len]` holds `CMD_ID || CMD_DATA`. The
@@ -544,13 +560,17 @@ where
     #[allow(dead_code)]
     pub(crate) fn mcounter_get(&mut self, idx: MCounterIdx) -> Result<u32, SeError>
     {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
         // CMD plaintext (3 bytes): CMD_ID || MCOUNTER_INDEX(u16 LE).
         {
-            let l3 = self.l3.as_mut_slice();
-            l3[2] = CmdId::McounterGet as u8;
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::McounterGet as u8;
             let index = u16::from(idx.get()).to_le_bytes();
-            l3[3] = index[0];
-            l3[4] = index[1];
+            cmd[1] = index[0];
+            cmd[2] = index[1];
         }
         // RES_DATA = PADDING(3) || VALUE(u32 LE).
         self.run
@@ -565,7 +585,417 @@ where
             },
         )
     }
+
+    /// Reads R-Memory user-data `slot` into `out`.
+    ///
+    /// Inherent twin of `SeCommands::rmem_read_into`. Returns the DATA byte
+    /// count, which is 0 for an empty slot. A read returns up to
+    /// `R_MEM_DATA_MAX` DATA bytes, so `out` must be at least that long. A
+    /// shorter `out` is rejected with `BufferTooSmall` up front, before any
+    /// nonce, crypto, or chip traffic, leaving the session untouched.
+    ///
+    /// A RES_DATA too short to hold the 3 padding bytes, or an implied DATA
+    /// length past `R_MEM_DATA_MAX`, is a structural anomaly on an authenticated
+    /// OK result: the parse closure returns `Err`, which poisons the session via
+    /// `run`. An empty slot reads back RESULT=OK with no DATA and returns
+    /// `Ok(0)`, keeping the session live.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn rmem_read_into
+    (
+        &mut self,
+        slot: RMemSlot,
+        out: &mut [u8],
+    )
+    -> Result<usize, SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // A read returns up to R_MEM_DATA_MAX DATA bytes. Require out to hold the
+        // maximum up front, before any nonce or chip traffic, so a too-small
+        // buffer is rejected with the session untouched (matching libtropic's
+        // LT_PARAM_ERR, which does not invalidate the session). This makes the
+        // in-closure DATA-vs-out check below unreachable.
+        if out.len() < R_MEM_DATA_MAX
+        {
+            return Err(SeError::BufferTooSmall);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || UDATA_SLOT(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::RMemDataRead as u8;
+            let slot_bytes = slot.get().to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+        }
+        // RES_DATA = PADDING(3) || DATA(0..=R_MEM_DATA_MAX). The length is
+        // variable, so pass None and enforce the structural bounds here.
+        self.run
+        (
+            3,
+            None,
+            |res_data|
+            {
+                let (_padding, data) = take(res_data, 3)?;
+                if data.len() > R_MEM_DATA_MAX
+                {
+                    // A DATA length past the target-firmware cap is a structural
+                    // anomaly on an authenticated result. Fail closed.
+                    return Err(L3Error::Oversize);
+                }
+                out[..data.len()].copy_from_slice(data);
+                Ok(data.len())
+            },
+        )
+    }
+
+    /// Writes `data` to R-Memory user-data `slot`.
+    ///
+    /// Inherent twin of `SeCommands::rmem_write`. The slot must be erased first.
+    /// Returns `Ok(())` on a stored write.
+    ///
+    /// Validates `data.len()` in `1..=R_MEM_DATA_MAX` up front, before any
+    /// nonce, crypto, or chip traffic, so a rejection leaves the session
+    /// untouched. An empty or oversize payload returns `InvalidArgument`.
+    ///
+    /// A non-OK RESULT (SLOT_NOT_EMPTY, HARDWARE_FAIL, FAIL, ...) is a valid
+    /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
+    /// session live, mirroring libtropic.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn rmem_write(&mut self, slot: RMemSlot, data: &[u8]) -> Result<(), SeError>
+    {
+        // Argument checks come first: no nonce, no crypto, no chip traffic, so a
+        // rejection here leaves the session untouched. Re-check poison up front
+        // so a poisoned session rejects before argument work.
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        if data.is_empty() || data.len() > R_MEM_DATA_MAX
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        // CMD plaintext (4 + data.len() bytes): CMD_ID || UDATA_SLOT(u16 LE) ||
+        // PADDING(1, 0) || DATA.
+        let plaintext_len = 4usize
+            .checked_add(data.len())
+            .ok_or(SeError::InvalidArgument)?;
+        // Bound the wire footprint against the L3 buffer before the DATA copy,
+        // mirroring ping_into. Plaintext, the 2-byte CMD_SIZE prefix, and the
+        // GCM tag must all fit. Explicit and local, so the cmd[4..] copy stays
+        // in bounds even if R_MEM_DATA_MAX later grows.
+        let needed = plaintext_len
+            .checked_add(2 + crypto::GCM_TAG_LEN)
+            .ok_or(SeError::InvalidArgument)?;
+        if needed > self.l3.as_slice().len()
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::RMemDataWrite as u8;
+            let slot_bytes = slot.get().to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3] = 0;
+            cmd[4..4 + data.len()].copy_from_slice(data);
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(plaintext_len, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Generates an ECC key pair on the chip in `slot` for `curve`.
+    ///
+    /// Inherent twin of `SeCommands::ecc_key_generate`. The private key never
+    /// leaves the chip. The slot range is enforced by `EccSlot::new`. A non-OK
+    /// RESULT (SlotNotEmpty, Fail, ...) is a valid authenticated reply: it
+    /// surfaces as `L3Error::Result` and keeps the session live, mirroring
+    /// libtropic. A bad tag, CRC, alarm, or empty result poisons the session.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn ecc_key_generate
+    (
+        &mut self,
+        slot: EccSlot,
+        curve: EccCurve,
+    )
+    -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (4 bytes): CMD_ID || SLOT(u16 LE) || CURVE(1).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::EccKeyGenerate as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3] = curve.wire_byte();
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(4, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Reads the public key for `slot`.
+    ///
+    /// Inherent twin of `SeCommands::ecc_public_key`. Returns the key by value,
+    /// carrying its curve: 32 bytes for Ed25519, 64 for P-256 (raw X || Y, no
+    /// 0x04 prefix). The slot range is enforced by `EccSlot::new`.
+    ///
+    /// RES_DATA = CURVE(1) || ORIGIN(1) || PADDING(13) || PUBKEY. The length is
+    /// variable per curve, so `run` gets `None` and the parse closure validates
+    /// the structure: an unknown CURVE byte, a RES_DATA shorter than the 15-byte
+    /// header, or a PUBKEY length that does not match the curve is a structural
+    /// anomaly on an authenticated OK result. The closure returns `Err`, which
+    /// poisons the session via `run`. An empty or corrupt slot reads back the
+    /// recoverable `L3Error::Result(InvalidKey)`, keeping the session live.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn ecc_public_key
+    (
+        &mut self,
+        slot: EccSlot,
+    )
+    -> Result<EccPublicKey, SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || SLOT(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::EccKeyRead as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+        }
+        // RES_DATA = CURVE(1) || ORIGIN(1) || PADDING(13) || PUBKEY. The PUBKEY
+        // length is variable per curve, so pass None and enforce the structural
+        // bounds here.
+        self.run
+        (
+            3,
+            None,
+            |res_data|
+            {
+                let (rest, curve_byte) = take_u8(res_data)?;
+                let (rest, _origin) = take_u8(rest)?;
+                let (_padding, pubkey) = take(rest, ECC_READ_PADDING)?;
+                let curve = EccCurve::from_wire_byte(curve_byte)
+                    .ok_or(L3Error::Parse(ParseError::InvalidValue))?;
+                if pubkey.len() != curve.pubkey_len()
+                {
+                    // A PUBKEY length that does not match the curve is a
+                    // structural anomaly on an authenticated OK result. Fail
+                    // closed.
+                    return Err(L3Error::Oversize);
+                }
+                // Copy the curve-length prefix into a zeroed 64-byte store. The
+                // tail stays zero and EccPublicKey::bytes trims it off.
+                let mut bytes = [0u8; ECC_PUBKEY_MAX];
+                bytes[..pubkey.len()].copy_from_slice(pubkey);
+                Ok(EccPublicKey::new(curve, bytes))
+            },
+        )
+    }
+
+    /// Signs a 32-byte SHA-256 digest with the P-256 key in `slot` (ECDSA).
+    ///
+    /// Inherent twin of `SeCommands::ecdsa_sign`. The host pre-hashes the
+    /// message: the chip has no hash engine. The digest length is fixed by the
+    /// `&[u8; 32]` type, so no length check is needed. The slot range is
+    /// enforced by `EccSlot::new`. A non-OK RESULT (InvalidKey on a missing or
+    /// wrong-curve slot, Fail, Unauthorized, HardwareFail) is a valid
+    /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
+    /// session live, mirroring libtropic. A bad tag, CRC, alarm, empty result,
+    /// or wrong-size result poisons the session.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn ecdsa_sign
+    (
+        &mut self,
+        slot: EccSlot,
+        digest: &[u8; 32],
+    )
+    -> Result<Signature, SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (48 bytes): CMD_ID || SLOT(u16 LE) || PADDING(13, 0) ||
+        // MSG_HASH(32).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::EcdsaSign as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3..SIGN_CMD_HEADER].fill(0);
+            cmd[SIGN_CMD_HEADER..ECDSA_CMD_LEN].copy_from_slice(digest);
+        }
+        // RES_DATA = PADDING(15) || R(32) || S(32) = 79 bytes (fixed).
+        self.run(ECDSA_CMD_LEN, Some(SIGN_RES_DATA_LEN), parse_signature)
+    }
+
+    /// Signs `msg` with the Ed25519 key in `slot` (EdDSA).
+    ///
+    /// Inherent twin of `SeCommands::eddsa_sign`. The chip hashes the message
+    /// internally (RFC 8032), so an empty message is valid. Validates
+    /// `msg.len() <= EDDSA_MSG_MAX` up front, before any nonce, crypto, or chip
+    /// traffic, so an oversize message returns `InvalidArgument` with the
+    /// session untouched. The slot range is enforced by `EccSlot::new`. A non-OK
+    /// RESULT (InvalidKey, Fail, Unauthorized, HardwareFail) is a valid
+    /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
+    /// session live. A bad tag, CRC, alarm, empty result, or wrong-size result
+    /// poisons the session.
+    // The `SeCommands` impl that exposes this is not wired yet, so it is dead in
+    // the non-test build. The device tests call it, so `#[allow]` is required.
+    // Same pattern as `ids::ObjectId`.
+    #[allow(dead_code)]
+    pub(crate) fn eddsa_sign
+    (
+        &mut self,
+        slot: EccSlot,
+        msg: &[u8],
+    )
+    -> Result<Signature, SeError>
+    {
+        // Argument checks come first: no nonce, no crypto, no chip traffic, so a
+        // rejection here leaves the session untouched. Re-check poison up front
+        // so a poisoned session rejects before argument work.
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        if msg.len() > EDDSA_MSG_MAX
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        // CMD plaintext (16 + msg.len() bytes): CMD_ID || SLOT(u16 LE) ||
+        // PADDING(13, 0) || MSG.
+        let plaintext_len = SIGN_CMD_HEADER
+            .checked_add(msg.len())
+            .ok_or(SeError::InvalidArgument)?;
+        // Bound the wire footprint against the L3 buffer before the MSG copy,
+        // mirroring rmem_write. Plaintext, the 2-byte CMD_SIZE prefix, and the
+        // GCM tag must all fit. A 4096-byte message hits this bound exactly, so
+        // the cmd[16..] copy stays in bounds.
+        let needed = plaintext_len
+            .checked_add(2 + crypto::GCM_TAG_LEN)
+            .ok_or(SeError::InvalidArgument)?;
+        if needed > self.l3.as_slice().len()
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::EddsaSign as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3..SIGN_CMD_HEADER].fill(0);
+            cmd[SIGN_CMD_HEADER..SIGN_CMD_HEADER + msg.len()].copy_from_slice(msg);
+        }
+        // RES_DATA = PADDING(15) || R(32) || S(32) = 79 bytes (fixed).
+        self.run(plaintext_len, Some(SIGN_RES_DATA_LEN), parse_signature)
+    }
 }
+
+/// Parses a sign result `PADDING(15) || R(32) || S(32)` into a `Signature`.
+///
+/// `run` proves `res_data.len() == SIGN_RES_DATA_LEN` via `expected_res_data_len`
+/// before calling this, so the `take` bounds hold structurally. Skips the 15
+/// padding bytes, then copies R || S into the 64-byte signature. Rejects any
+/// trailing byte so a caller passing `None` cannot silently accept an oversize
+/// result: a too-long result is a structural anomaly, so fail closed.
+fn parse_signature(res_data: &[u8]) -> Result<Signature, L3Error>
+{
+    let (_padding, sig) = take(res_data, SIGN_RES_PADDING)?;
+    let (tail, bytes) = take_array::<64>(sig)?;
+    if !tail.is_empty()
+    {
+        return Err(L3Error::Oversize);
+    }
+    Ok(Signature(bytes))
+}
+
+/// Maximum R-Memory user-data DATA length in bytes (target firmware >= 2.0.0).
+///
+/// Source: libtropic `R_MEM_DATA_SIZE_MAX`.
+const R_MEM_DATA_MAX: usize = 475;
+
+/// Maximum ECC public-key length in bytes (P-256, raw X || Y).
+///
+/// Ed25519 returns 32 bytes. `EccPublicKey` backs every key with this many
+/// bytes and trims to the curve length on read.
+const ECC_PUBKEY_MAX: usize = 64;
+
+/// Padding bytes between the ORIGIN field and the PUBKEY in an EccKeyRead
+/// result (CURVE(1) || ORIGIN(1) || PADDING(13) || PUBKEY).
+///
+/// Source: libtropic `struct lt_l3_ecc_key_read_res_t` (`padding[13]`).
+const ECC_READ_PADDING: usize = 13;
+
+/// Padding bytes between the SLOT field and the message in a sign command
+/// (CMD_ID(1) || SLOT(2) || PADDING(13) || MSG...).
+///
+/// Source: libtropic `struct lt_l3_ecdsa_sign_cmd_t` / `lt_l3_eddsa_sign_cmd_t`
+/// (`padding[13]`).
+const SIGN_CMD_PADDING: usize = 13;
+
+/// Sign-command header length in bytes: CMD_ID(1) || SLOT(2) || PADDING(13).
+///
+/// The message (ECDSA digest or EdDSA payload) follows this header.
+const SIGN_CMD_HEADER: usize = 3 + SIGN_CMD_PADDING;
+
+/// ECDSA sign command plaintext length: header(16) || MSG_HASH(32).
+const ECDSA_CMD_LEN: usize = SIGN_CMD_HEADER + 32;
+
+/// Padding bytes before R in a sign result (PADDING(15) || R(32) || S(32)).
+///
+/// Source: libtropic `struct lt_l3_ecdsa_sign_res_t` and
+/// `struct lt_l3_eddsa_sign_res_t` (`padding[15]`). The two result structs are
+/// byte-identical, which is what justifies the shared `parse_signature`.
+const SIGN_RES_PADDING: usize = 15;
+
+/// Sign-result RES_DATA length in bytes: PADDING(15) || R(32) || S(32).
+const SIGN_RES_DATA_LEN: usize = SIGN_RES_PADDING + 64;
+
+/// Maximum EdDSA message length in bytes.
+///
+/// Source: libtropic `TR01_L3_EDDSA_SIGN_CMD_MSG_LEN_MAX`. A 4096-byte message
+/// yields a 4112-byte plaintext, which fills the L3 buffer to capacity.
+const EDDSA_MSG_MAX: usize = 4096;
+
+// Compile-time invariant: the maximum EdDSA wire packet fills the L3 buffer
+// exactly. The packet is 2 (L3 CMD_SIZE prefix) || SIGN_CMD_HEADER ||
+// EDDSA_MSG_MAX || GCM_TAG_LEN. If any term drifts, the build fails here
+// instead of silently overflowing the eddsa_sign cmd[16..] copy. The runtime
+// bound in eddsa_sign mirrors this for the local copy.
+const _: () =
+{
+    assert!(
+        2 + SIGN_CMD_HEADER + EDDSA_MSG_MAX + crypto::GCM_TAG_LEN
+            == crate::buf::L3_FRAME_MAX
+    );
+};
 
 /// Test-only accessor to the SPI port, for inspecting the chip mock.
 #[cfg(test)]
@@ -910,6 +1340,821 @@ mod tests
         dev.random_into(&mut buf).unwrap();
         assert_eq!(dev.spi_ref().nonces(), (2, 2));
         assert_eq!(dev.mcounter_get(mc(0)), Ok(0xDEADBEEF));
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
+    }
+
+    /// Builds an R-Memory slot index, panicking only in test code on a bad
+    /// constant.
+    fn rslot(value: u16) -> RMemSlot
+    {
+        RMemSlot::new(value).expect("test rmem slot out of range")
+    }
+
+    #[test]
+    fn rmem_read_round_trips_known_bytes()
+    {
+        let mut dev = open(ChipFault::None);
+        let stored = b"patina rmem payload";
+        dev.spi_mut().set_rmem_slot(7, stored);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        let n = dev.rmem_read_into(rslot(7), &mut out).unwrap();
+        assert_eq!(n, stored.len());
+        assert_eq!(&out[..n], stored);
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn rmem_read_handles_a_near_max_length_payload()
+    {
+        // A 475-byte read forces the result across multiple L2 chunks. The
+        // driver must reassemble it and copy every byte.
+        let mut dev = open(ChipFault::None);
+        let mut stored = [0u8; R_MEM_DATA_MAX];
+        for (i, b) in stored.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(3).wrapping_add(1);
+        }
+        dev.spi_mut().set_rmem_slot(0, &stored);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        let n = dev.rmem_read_into(rslot(0), &mut out).unwrap();
+        assert_eq!(n, R_MEM_DATA_MAX);
+        assert_eq!(out, stored);
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn rmem_read_empty_slot_returns_zero()
+    {
+        // An unset slot reads back RESULT=OK with no DATA. The driver reports
+        // Ok(0) and keeps the session live.
+        let mut dev = open(ChipFault::None);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        let n = dev.rmem_read_into(rslot(3), &mut out).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        // The session stays live: a follow-up read still reaches the chip.
+        let before = dev.spi_ref().transaction_count();
+        assert_eq!(dev.rmem_read_into(rslot(3), &mut out), Ok(0));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+    }
+
+    #[test]
+    fn rmem_read_too_small_out_is_rejected_before_any_traffic()
+    {
+        // A read can return up to R_MEM_DATA_MAX DATA bytes, so out must hold at
+        // least that many. A shorter out is rejected up front, before any nonce
+        // or chip traffic, leaving the session live (matching libtropic's
+        // LT_PARAM_ERR, which does not invalidate the session).
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_rmem_slot(5, b"twelve bytes");
+        let before = dev.spi_ref().transaction_count();
+        let mut out = [0u8; R_MEM_DATA_MAX - 1];
+        assert_eq!(dev.rmem_read_into(rslot(5), &mut out), Err(SeError::BufferTooSmall));
+        // Rejected up front: no nonce burned, no SPI traffic, session intact.
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+        assert_eq!(dev.spi_ref().nonces(), (0, 0), "nonce did not move");
+        // The session is still usable: a full-size buffer reads the slot back.
+        let mut ok_out = [0u8; R_MEM_DATA_MAX];
+        let n = dev.rmem_read_into(rslot(5), &mut ok_out).unwrap();
+        assert_eq!(&ok_out[..n], b"twelve bytes");
+    }
+
+    #[test]
+    fn rmem_read_wrong_size_result_poisons_session()
+    {
+        // An authenticated OK result whose RES_DATA is one byte short truncates
+        // below the 3 padding bytes only at the boundary. Here the generic
+        // ResultWrongSize fault drops the last byte, leaving DATA one short of
+        // the stored content but still structurally valid. To exercise the
+        // padding-too-short anomaly, store nothing so RES_DATA = PADDING(3),
+        // then drop a byte: PADDING(2) fails the take(3) bound and poisons.
+        let mut dev = open(ChipFault::ResultWrongSize);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        assert_eq!
+        (
+            dev.rmem_read_into(rslot(0), &mut out),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_read_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        assert_eq!(dev.rmem_read_into(rslot(0), &mut out), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_read_l2_tag_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2TagErr);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        let r = dev.rmem_read_into(rslot(0), &mut out);
+        assert!(matches!(r, Err(SeError::L2(_))), "got {r:?}");
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_read_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        assert_eq!(dev.rmem_read_into(rslot(0), &mut out), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_read_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        assert_eq!
+        (
+            dev.rmem_read_into(rslot(0), &mut out),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_read_empty_authenticated_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        assert_eq!
+        (
+            dev.rmem_read_into(rslot(0), &mut out),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_write_round_trips_and_stores_payload()
+    {
+        let mut dev = open(ChipFault::None);
+        let data = b"stored via write";
+        assert_eq!(dev.rmem_write(rslot(9), data), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        assert_eq!(dev.spi_ref().rmem_slot(9), Some(&data[..]));
+    }
+
+    #[test]
+    fn rmem_write_near_max_payload_round_trips()
+    {
+        // A 475-byte write forces the command across multiple L2 chunks on the
+        // send path and stores the full payload.
+        let mut dev = open(ChipFault::None);
+        let mut data = [0u8; R_MEM_DATA_MAX];
+        for (i, b) in data.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(2);
+        }
+        assert_eq!(dev.rmem_write(rslot(1), &data), Ok(()));
+        assert_eq!(dev.spi_ref().rmem_slot(1), Some(&data[..]));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn rmem_write_rejects_empty_payload_before_any_traffic()
+    {
+        let mut dev = open(ChipFault::None);
+        let before = dev.spi_ref().transaction_count();
+        assert_eq!(dev.rmem_write(rslot(0), &[]), Err(SeError::InvalidArgument));
+        // Rejected up front: no nonce burned, no SPI traffic, session intact.
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+        assert_eq!(dev.spi_ref().nonces(), (0, 0), "nonce did not move");
+        // The session is still usable.
+        assert_eq!(dev.rmem_write(rslot(0), b"ok"), Ok(()));
+    }
+
+    #[test]
+    fn rmem_write_rejects_oversize_payload_before_any_traffic()
+    {
+        let mut dev = open(ChipFault::None);
+        let before = dev.spi_ref().transaction_count();
+        let data = [0u8; R_MEM_DATA_MAX + 1];
+        assert_eq!(dev.rmem_write(rslot(0), &data), Err(SeError::InvalidArgument));
+        // Rejected up front: no nonce burned, no SPI traffic, session intact.
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+        assert_eq!(dev.spi_ref().nonces(), (0, 0), "nonce did not move");
+    }
+
+    #[test]
+    fn rmem_write_slot_not_empty_is_recoverable()
+    {
+        // SlotNotEmpty (0x10) is a known L3Status: run maps it to a recoverable
+        // L3Error::Result and keeps the session live, so the caller can erase
+        // and retry. No poison, nonces stay in lockstep.
+        let mut dev = open(ChipFault::SlotNotEmpty);
+        assert_eq!
+        (
+            dev.rmem_write(rslot(2), b"payload"),
+            Err(SeError::L3(L3Error::Result(L3Status::SlotNotEmpty)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.rmem_write(rslot(2), b"payload");
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::SlotNotEmpty))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn rmem_write_extra_result_byte_poisons_session()
+    {
+        // rmem_write is a Some(0) command: it expects no RES_DATA. One
+        // unexpected byte trips the expected-length check and poisons. This
+        // guards against a regression to None with a trivial closure.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!
+        (
+            dev.rmem_write(rslot(0), b"x"),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_write_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.rmem_write(rslot(0), b"x"), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_write_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.rmem_write(rslot(0), b"x"), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_write_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.rmem_write(rslot(0), b"x"),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_l3_buffer_is_wiped_after_a_successful_read()
+    {
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_rmem_slot(4, b"wipe me");
+        let mut out = [0u8; R_MEM_DATA_MAX];
+        dev.rmem_read_into(rslot(4), &mut out).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "plaintext residue");
+    }
+
+    #[test]
+    fn mixed_read_write_sequence_keeps_nonces_in_lockstep()
+    {
+        // A write, then a ping, then a read of the written slot each advance
+        // both nonces once. The read returns exactly what the write stored,
+        // proving the round-trips stayed in step across the mixed sequence.
+        let mut dev = open(ChipFault::None);
+        let payload = b"mixed sequence";
+        let mut buf = [0u8; R_MEM_DATA_MAX];
+        assert_eq!(dev.rmem_write(rslot(6), payload), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        dev.ping_into(b"between", &mut buf).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        let n = dev.rmem_read_into(rslot(6), &mut buf).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
+        assert_eq!(&buf[..n], payload);
+    }
+
+    /// Builds an ECC slot index, panicking only in test code on a bad constant.
+    fn eslot(value: u8) -> EccSlot
+    {
+        EccSlot::new(value).expect("test ecc slot out of range")
+    }
+
+    #[test]
+    fn ecc_key_generate_round_trips_both_curves()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.ecc_key_generate(eslot(0), EccCurve::P256), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        assert_eq!(dev.ecc_key_generate(eslot(31), EccCurve::Ed25519), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+    }
+
+    #[test]
+    fn ecc_key_generate_slot_not_empty_is_recoverable()
+    {
+        // SlotNotEmpty is a known L3Status: run maps it to a recoverable
+        // L3Error::Result and keeps the session live. No poison.
+        let mut dev = open(ChipFault::SlotNotEmpty);
+        assert_eq!
+        (
+            dev.ecc_key_generate(eslot(2), EccCurve::P256),
+            Err(SeError::L3(L3Error::Result(L3Status::SlotNotEmpty)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ecc_key_generate(eslot(2), EccCurve::P256);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::SlotNotEmpty))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn ecc_key_generate_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.ecc_key_generate(eslot(0), EccCurve::P256),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_generate_extra_result_byte_poisons_session()
+    {
+        // ecc_key_generate is a Some(0) command: it expects no RES_DATA. One
+        // unexpected byte trips the expected-length check and poisons. This
+        // guards against a regression to None with a trivial closure.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!
+        (
+            dev.ecc_key_generate(eslot(0), EccCurve::P256),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_generate_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.ecc_key_generate(eslot(0), EccCurve::P256),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_generate_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!
+        (
+            dev.ecc_key_generate(eslot(0), EccCurve::P256),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_generate_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.ecc_key_generate(eslot(0), EccCurve::P256),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_public_key_reads_p256_64_bytes()
+    {
+        let mut dev = open(ChipFault::None);
+        let mut pubkey = [0u8; 64];
+        for (i, b) in pubkey.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(5).wrapping_add(1);
+        }
+        dev.spi_mut().set_ecc_pubkey(0x01, &pubkey);
+        let pk = dev.ecc_public_key(eslot(4)).unwrap();
+        assert_eq!(pk.curve(), EccCurve::P256);
+        assert_eq!(pk.bytes().len(), 64);
+        assert_eq!(pk.bytes(), &pubkey);
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn ecc_public_key_reads_ed25519_32_bytes()
+    {
+        let mut dev = open(ChipFault::None);
+        let mut pubkey = [0u8; 32];
+        for (i, b) in pubkey.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(9).wrapping_add(7);
+        }
+        dev.spi_mut().set_ecc_pubkey(0x02, &pubkey);
+        let pk = dev.ecc_public_key(eslot(10)).unwrap();
+        assert_eq!(pk.curve(), EccCurve::Ed25519);
+        assert_eq!(pk.bytes().len(), 32);
+        assert_eq!(pk.bytes(), &pubkey);
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn ecc_public_key_invalid_key_is_recoverable()
+    {
+        // InvalidKey (0x12) = empty or corrupt slot: a valid authenticated
+        // reply. The session stays live and the nonces stay in step.
+        let mut dev = open(ChipFault::InvalidKey);
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L3(L3Error::Result(L3Status::InvalidKey)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ecc_public_key(eslot(0));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::InvalidKey))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn ecc_public_key_unknown_curve_byte_poisons_session()
+    {
+        // An unknown CURVE byte on an authenticated OK result is a structural
+        // anomaly. The parse closure returns Err, which poisons the session.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_ecc_pubkey(0x07, &[0u8; 32]);
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::InvalidValue)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_public_key_length_mismatch_poisons_session()
+    {
+        // CURVE says Ed25519 (expects 32) but the PUBKEY is 33 bytes: a
+        // structural anomaly. The closure returns Oversize, which poisons.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_ecc_pubkey(0x02, &[0u8; 33]);
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_public_key_truncated_header_poisons_session()
+    {
+        // A RES_DATA shorter than the 15-byte CURVE||ORIGIN||PADDING(13) header
+        // fails the take bound in the closure, which poisons the session.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_ecc_pubkey(0x02, &[]);
+        dev.spi_mut().set_ecc_read_pad(11); // header = 1 + 1 + 11 = 13 < 15
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_public_key_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_public_key_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_public_key_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.ecc_public_key(eslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_l3_buffer_is_wiped_after_a_successful_read()
+    {
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_ecc_pubkey(0x02, &[0xAB; 32]);
+        dev.ecc_public_key(eslot(0)).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "plaintext residue");
+    }
+
+    #[test]
+    fn mixed_ecc_sequence_keeps_nonces_in_lockstep()
+    {
+        // A keygen, a public-key read, then a ping each advance both nonces
+        // once across the mixed sequence.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_ecc_pubkey(0x01, &[0x11; 64]);
+        let mut buf = [0u8; 64];
+        assert_eq!(dev.ecc_key_generate(eslot(0), EccCurve::P256), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        let pk = dev.ecc_public_key(eslot(0)).unwrap();
+        assert_eq!(pk.curve(), EccCurve::P256);
+        assert_eq!(pk.bytes().len(), 64);
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        dev.ping_into(b"between", &mut buf).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
+    }
+
+    /// Builds a deterministic 64-byte R || S signature for the sign tests.
+    fn sample_sig() -> [u8; 64]
+    {
+        let mut sig = [0u8; 64];
+        for (i, b) in sig.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(5);
+        }
+        sig
+    }
+
+    #[test]
+    fn ecdsa_sign_round_trips_known_signature()
+    {
+        let mut dev = open(ChipFault::None);
+        let sig = sample_sig();
+        dev.spi_mut().set_signature(sig);
+        let digest = [0x42u8; 32];
+        let out = dev.ecdsa_sign(eslot(0), &digest).unwrap();
+        // The 15 padding bytes are skipped and R || S land verbatim.
+        assert_eq!(out, Signature(sig));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn ecdsa_sign_invalid_key_is_recoverable()
+    {
+        // InvalidKey (0x12) = missing or wrong-curve slot: a valid authenticated
+        // reply. The session stays live and the nonces stay in step.
+        let mut dev = open(ChipFault::InvalidKey);
+        let digest = [0u8; 32];
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &digest),
+            Err(SeError::L3(L3Error::Result(L3Status::InvalidKey)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ecdsa_sign(eslot(0), &digest);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::InvalidKey))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn ecdsa_sign_wrong_size_result_poisons_session()
+    {
+        // An authenticated OK result one byte short of the fixed 79-byte RES_DATA
+        // trips run's expected_res_data_len check and poisons.
+        let mut dev = open(ChipFault::ResultWrongSize);
+        dev.spi_mut().set_signature(sample_sig());
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &[0u8; 32]),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecdsa_sign_extra_result_byte_poisons_session()
+    {
+        // One byte past the fixed 79-byte RES_DATA trips the expected-length
+        // check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        dev.spi_mut().set_signature(sample_sig());
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &[0u8; 32]),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecdsa_sign_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &[0u8; 32]),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecdsa_sign_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &[0u8; 32]),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecdsa_sign_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &[0u8; 32]),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecdsa_sign_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.ecdsa_sign(eslot(0), &[0u8; 32]),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecdsa_l3_buffer_is_wiped_after_a_successful_sign()
+    {
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_signature(sample_sig());
+        dev.ecdsa_sign(eslot(0), &[0xAB; 32]).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "plaintext residue");
+    }
+
+    #[test]
+    fn eddsa_sign_empty_message_round_trips()
+    {
+        // An empty message is valid: the chip hashes internally (RFC 8032).
+        let mut dev = open(ChipFault::None);
+        let sig = sample_sig();
+        dev.spi_mut().set_signature(sig);
+        let out = dev.eddsa_sign(eslot(0), &[]).unwrap();
+        assert_eq!(out, Signature(sig));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn eddsa_sign_small_message_round_trips()
+    {
+        let mut dev = open(ChipFault::None);
+        let sig = sample_sig();
+        dev.spi_mut().set_signature(sig);
+        let out = dev.eddsa_sign(eslot(7), b"patina eddsa").unwrap();
+        assert_eq!(out, Signature(sig));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn eddsa_sign_max_message_round_trips()
+    {
+        // A 4096-byte message yields a 4112-byte plaintext that fills the L3
+        // buffer to capacity and forces a multi-chunk L2 send. The driver must
+        // chunk it, the mock reassemble it, and the round-trip still succeed.
+        let mut dev = open(ChipFault::None);
+        let sig = sample_sig();
+        dev.spi_mut().set_signature(sig);
+        let msg = [0x5Au8; EDDSA_MSG_MAX];
+        let out = dev.eddsa_sign(eslot(0), &msg).unwrap();
+        assert_eq!(out, Signature(sig));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn eddsa_sign_rejects_oversize_message_before_any_traffic()
+    {
+        // One byte past EDDSA_MSG_MAX is rejected up front: no nonce, no SPI
+        // traffic, session intact.
+        let mut dev = open(ChipFault::None);
+        let before = dev.spi_ref().transaction_count();
+        let msg = [0u8; EDDSA_MSG_MAX + 1];
+        assert_eq!(dev.eddsa_sign(eslot(0), &msg), Err(SeError::InvalidArgument));
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+        assert_eq!(dev.spi_ref().nonces(), (0, 0), "nonce did not move");
+        // The session is still usable: a max-size message still signs.
+        dev.spi_mut().set_signature(sample_sig());
+        let ok = [0u8; EDDSA_MSG_MAX];
+        assert_eq!(dev.eddsa_sign(eslot(0), &ok), Ok(Signature(sample_sig())));
+    }
+
+    #[test]
+    fn eddsa_sign_invalid_key_is_recoverable()
+    {
+        let mut dev = open(ChipFault::InvalidKey);
+        assert_eq!
+        (
+            dev.eddsa_sign(eslot(0), b"msg"),
+            Err(SeError::L3(L3Error::Result(L3Status::InvalidKey)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.eddsa_sign(eslot(0), b"msg");
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::InvalidKey))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn eddsa_sign_wrong_size_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::ResultWrongSize);
+        dev.spi_mut().set_signature(sample_sig());
+        assert_eq!
+        (
+            dev.eddsa_sign(eslot(0), b"msg"),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn eddsa_sign_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.eddsa_sign(eslot(0), b"msg"),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn eddsa_sign_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.eddsa_sign(eslot(0), b"msg"),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn eddsa_sign_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.eddsa_sign(eslot(0), b"msg"),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mixed_sign_sequence_keeps_nonces_in_lockstep()
+    {
+        // An ecdsa_sign, an eddsa_sign, and a public-key read each advance both
+        // nonces once across the mixed sequence.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_signature(sample_sig());
+        dev.spi_mut().set_ecc_pubkey(0x02, &[0x33; 32]);
+        dev.ecdsa_sign(eslot(0), &[0x11; 32]).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        dev.eddsa_sign(eslot(1), b"sign me").unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        let pk = dev.ecc_public_key(eslot(2)).unwrap();
+        assert_eq!(pk.curve(), EccCurve::Ed25519);
         assert_eq!(dev.spi_ref().nonces(), (3, 3));
     }
 

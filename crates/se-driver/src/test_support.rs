@@ -8,6 +8,7 @@
 
 extern crate std;
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::vec::Vec;
 
@@ -257,8 +258,24 @@ pub(crate) enum ChipFault
     /// Command-agnostic counterpart of `ShortEcho`. It drops the last RES_DATA
     /// byte after the RESULT byte, so any command's structural size check fires.
     ResultWrongSize,
+    /// Seal a valid OK result with one extra RES_DATA byte appended.
+    ///
+    /// Guards `Some(0)` commands (ecc_key_generate, rmem_write): a regression to
+    /// `None` with a trivial closure would silently accept the extra byte. With
+    /// this fault, the unexpected byte trips run_gated's expected-length check.
+    ExtraResultByte,
     /// Seal a valid result whose RESULT status is CounterInvalid (recoverable).
     CounterInvalid,
+    /// Seal a valid result whose RESULT status is SlotNotEmpty (recoverable).
+    ///
+    /// A write to an un-erased R-Memory slot. The session stays live so the
+    /// caller can erase and retry.
+    SlotNotEmpty,
+    /// Seal a valid result whose RESULT status is InvalidKey (recoverable).
+    ///
+    /// An EccKeyRead of an empty or corrupt slot. The session stays live so the
+    /// caller can generate a key and retry.
+    InvalidKey,
     /// Seal a valid (OK-tag) result whose RESULT byte is an unrecognized value.
     ///
     /// The GCM tag verifies, but the status byte (0x55) maps to no `L3Status`.
@@ -327,6 +344,11 @@ pub(crate) struct ChipMockSpi
     fault: ChipFault,
     transactions: usize,
     mcounter_val: u32,
+    rmem_slots: BTreeMap<u16, Vec<u8>>,
+    ecc_read_curve: u8,
+    ecc_read_pubkey: Vec<u8>,
+    ecc_read_pad: usize,
+    sign_signature: [u8; 64],
 }
 
 impl ChipMockSpi
@@ -356,13 +378,60 @@ impl ChipMockSpi
             fault,
             transactions: 0,
             mcounter_val: 0,
+            rmem_slots: BTreeMap::new(),
+            ecc_read_curve: 0x02,
+            ecc_read_pubkey: Vec::new(),
+            ecc_read_pad: 13,
+            sign_signature: [0u8; 64],
         }
+    }
+
+    /// Sets the 64-byte R || S signature the mock returns for a sign command.
+    pub(crate) fn set_signature(&mut self, sig: [u8; 64])
+    {
+        self.sign_signature = sig;
+    }
+
+    /// Configures the EccKeyRead response: CURVE byte and raw PUBKEY bytes.
+    ///
+    /// The mock returns CURVE || ORIGIN(0) || PADDING(13) || PUBKEY for an
+    /// EccKeyRead. A test sets a curve byte and a matching-length pubkey.
+    pub(crate) fn set_ecc_pubkey(&mut self, curve_byte: u8, pubkey: &[u8])
+    {
+        self.ecc_read_curve = curve_byte;
+        self.ecc_read_pubkey = pubkey.to_vec();
+    }
+
+    /// Overrides the EccKeyRead padding length, to forge a truncated header.
+    ///
+    /// A value below 13 leaves the result one or more bytes short of the
+    /// CURVE || ORIGIN || PADDING(13) header, exercising the parser's
+    /// structural-bound check.
+    pub(crate) fn set_ecc_read_pad(&mut self, pad: usize)
+    {
+        self.ecc_read_pad = pad;
     }
 
     /// Sets the value the mock returns for a McounterGet command.
     pub(crate) fn set_mcounter_val(&mut self, value: u32)
     {
         self.mcounter_val = value;
+    }
+
+    /// Pre-loads R-Memory `slot` with `data` for an RMemDataRead round-trip.
+    ///
+    /// A slot left unset reads back as empty (DATA length 0).
+    pub(crate) fn set_rmem_slot(&mut self, slot: u16, data: &[u8])
+    {
+        self.rmem_slots.insert(slot, data.to_vec());
+    }
+
+    /// Returns the stored content of R-Memory `slot`, if any.
+    ///
+    /// Lets a write test confirm the chip recorded the payload.
+    pub(crate) fn rmem_slot(&self, slot: u16) -> Option<&[u8]>
+    {
+        self.rmem_slots.get(&slot).map(Vec::as_slice)
     }
 
     /// Returns how many SPI transactions the host has issued.
@@ -409,6 +478,18 @@ impl ChipMockSpi
         }
         else if id == L2ReqId::EncryptedCmd as u8
         {
+            // The real chip caps each request chunk at L2_CHUNK_MAX_DATA. A
+            // driver that sent an over-large chunk would split the wire packet
+            // wrong, so reject it here and fail the round-trip. This makes the
+            // multi-chunk send path prove chunk-cap compliance, not just byte
+            // reassembly.
+            if len > crate::buf::L2_CHUNK_MAX_DATA
+            {
+                self.pending
+                    .push_back(Pending::Frame(Self::frame(L2Status::GenErr as u8, &[])));
+                self.accum.clear();
+                return;
+            }
             self.accum.extend_from_slice(data);
             // Need the 2-byte CMD_SIZE before completeness can be judged.
             if self.accum.len() < 2
@@ -477,7 +558,10 @@ impl ChipMockSpi
             | ChipFault::ShortEcho
             | ChipFault::EmptyResult
             | ChipFault::ResultWrongSize
+            | ChipFault::ExtraResultByte
             | ChipFault::CounterInvalid
+            | ChipFault::SlotNotEmpty
+            | ChipFault::InvalidKey
             | ChipFault::UnknownResultStatus =>
             {}
         }
@@ -486,13 +570,46 @@ impl ChipMockSpi
         let mut wire = Vec::with_capacity(2 + sealed.len());
         wire.extend_from_slice(&(res_size as u16).to_le_bytes());
         wire.extend_from_slice(&sealed);
-        let mut f = Self::frame(L2Status::ResultOk as u8, &wire);
-        if self.fault == ChipFault::L2CrcErr
+        self.push_result_frames(&wire);
+    }
+
+    /// Chunks `wire` into L2 result frames and queues them for the read path.
+    ///
+    /// Splits the result into 252-byte chunks. Each non-final chunk is a
+    /// `ResultCont` frame, the last is `ResultOk`, mirroring the chip. A
+    /// single-chunk result is one `ResultOk` frame. The `L2CrcErr` fault
+    /// corrupts the CRC of the final frame.
+    fn push_result_frames(&mut self, wire: &[u8])
+    {
+        let chunk_max = crate::buf::L2_CHUNK_MAX_DATA;
+        let mut offset = 0usize;
+        loop
         {
-            let last = f.len() - 1;
-            f[last] ^= 0xFF;
+            let remaining = wire.len() - offset;
+            let chunk_len = remaining.min(chunk_max);
+            let chunk = &wire[offset..offset + chunk_len];
+            offset += chunk_len;
+            let last = offset >= wire.len();
+            let status = if last
+            {
+                L2Status::ResultOk as u8
+            }
+            else
+            {
+                L2Status::ResultCont as u8
+            };
+            let mut f = Self::frame(status, chunk);
+            if last && self.fault == ChipFault::L2CrcErr
+            {
+                let idx = f.len() - 1;
+                f[idx] ^= 0xFF;
+            }
+            self.pending.push_back(Pending::Frame(f));
+            if last
+            {
+                break;
+            }
         }
-        self.pending.push_back(Pending::Frame(f));
     }
 
     /// Builds the result plaintext `RESULT || RES_DATA` for a command.
@@ -500,9 +617,10 @@ impl ChipMockSpi
     /// `pt` is the decrypted command plaintext `CMD_ID || CMD_DATA`. Dispatches
     /// on CMD_ID to shape RES_DATA: Ping echoes the payload, RandomValueGet
     /// returns padding plus deterministic bytes, McounterGet returns padding
-    /// plus the configured value. The `ResultFail`/`CounterInvalid` faults
-    /// override the RESULT status.
-    fn build_result_pt(&self, pt: &[u8]) -> Vec<u8>
+    /// plus the configured value, RMemDataRead returns padding plus the slot
+    /// content, RMemDataWrite stores the payload and returns no RES_DATA. The
+    /// `ResultFail`/`CounterInvalid`/`SlotNotEmpty` faults override the status.
+    fn build_result_pt(&mut self, pt: &[u8]) -> Vec<u8>
     {
         use crate::ids::CmdId;
         use crate::ids::L3Status;
@@ -511,10 +629,13 @@ impl ChipMockSpi
         {
             ChipFault::ResultFail => L3Status::Fail as u8,
             ChipFault::CounterInvalid => L3Status::CounterInvalid as u8,
+            ChipFault::SlotNotEmpty => L3Status::SlotNotEmpty as u8,
+            ChipFault::InvalidKey => L3Status::InvalidKey as u8,
             // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
             ChipFault::UnknownResultStatus => 0x55,
             _ => L3Status::Ok as u8,
         };
+        let status_ok = status_byte == L3Status::Ok as u8;
         let cmd_id = pt.first().copied().unwrap_or(0);
         let mut res_pt = Vec::new();
         res_pt.push(status_byte);
@@ -543,6 +664,60 @@ impl ChipMockSpi
             // RES_DATA = PADDING(3) || VALUE(u32 LE).
             res_pt.extend_from_slice(&[0u8; 3]);
             res_pt.extend_from_slice(&self.mcounter_val.to_le_bytes());
+        }
+        else if cmd_id == CmdId::RMemDataRead as u8
+        {
+            // CMD_DATA = UDATA_SLOT(u16 LE). RES_DATA = PADDING(3) || DATA.
+            let slot = u16::from_le_bytes([
+                pt.get(1).copied().unwrap_or(0),
+                pt.get(2).copied().unwrap_or(0),
+            ]);
+            res_pt.extend_from_slice(&[0u8; 3]);
+            if let Some(data) = self.rmem_slots.get(&slot)
+            {
+                res_pt.extend_from_slice(data);
+            }
+        }
+        else if cmd_id == CmdId::RMemDataWrite as u8
+        {
+            // CMD_DATA = UDATA_SLOT(u16 LE) || PADDING(1) || DATA. RES_DATA is
+            // empty. Store the payload only on an OK status.
+            if status_ok
+            {
+                let slot = u16::from_le_bytes([
+                    pt.get(1).copied().unwrap_or(0),
+                    pt.get(2).copied().unwrap_or(0),
+                ]);
+                let data = pt.get(4..).unwrap_or(&[]).to_vec();
+                self.rmem_slots.insert(slot, data);
+            }
+        }
+        else if cmd_id == CmdId::EccKeyGenerate as u8
+        {
+            // CMD_DATA = SLOT(u16 LE) || CURVE(1). RES_DATA is empty.
+        }
+        else if cmd_id == CmdId::EccKeyRead as u8
+        {
+            // RES_DATA = CURVE(1) || ORIGIN(1) || PADDING(13) || PUBKEY. The
+            // padding length is configurable so a test can forge a truncated
+            // header.
+            res_pt.push(self.ecc_read_curve);
+            res_pt.push(0); // ORIGIN
+            res_pt.extend(core::iter::repeat_n(0u8, self.ecc_read_pad));
+            res_pt.extend_from_slice(&self.ecc_read_pubkey);
+        }
+        else if cmd_id == CmdId::EcdsaSign as u8 || cmd_id == CmdId::EddsaSign as u8
+        {
+            // RES_DATA = PADDING(15) || R(32) || S(32). The configured 64-byte
+            // signature fills R || S so a test can assert the exact bytes.
+            res_pt.extend_from_slice(&[0u8; 15]);
+            res_pt.extend_from_slice(&self.sign_signature);
+        }
+        if self.fault == ChipFault::ExtraResultByte && status_ok
+        {
+            // One unexpected RES_DATA byte on an OK result. A Some(0) command
+            // (no RES_DATA expected) then sees 1 byte and must fail closed.
+            res_pt.push(0xEE);
         }
         res_pt
     }

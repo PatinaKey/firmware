@@ -47,7 +47,8 @@ pub enum L3Error
     Crypto,
     /// The chip returned a non-OK L3 result status.
     Result(L3Status),
-    /// An L3 packet exceeded the maximum allowed size.
+    /// An L3 packet or RES_DATA length violated a structural size bound (too
+    /// long, too short, or not the expected size).
     Oversize,
     /// Bounds-checked parsing of an L3 payload failed.
     Parse(ParseError),

@@ -52,6 +52,52 @@ pub enum EccCurve
     Ed25519,
 }
 
+impl EccCurve
+{
+    /// Returns the chip CURVE wire byte (P-256 = 0x01, Ed25519 = 0x02).
+    ///
+    /// Source: libtropic `lt_ecc_curve_type_t` (`L3_ECC_KEY_GENERATE`).
+    // The ECC commands that send this byte are not wired through the public
+    // trait yet, so the helper is dead in the non-test build. The device and
+    // newtype tests use it, so `#[allow]` is required (same pattern as
+    // `ids::ObjectId`).
+    #[allow(dead_code)]
+    pub(crate) const fn wire_byte(self) -> u8
+    {
+        match self
+        {
+            EccCurve::P256 => 0x01,
+            EccCurve::Ed25519 => 0x02,
+        }
+    }
+
+    /// Returns the raw public-key length in bytes for this curve.
+    ///
+    /// P-256 returns 64 (raw X || Y, no 0x04 prefix). Ed25519 returns 32.
+    pub(crate) const fn pubkey_len(self) -> usize
+    {
+        match self
+        {
+            EccCurve::P256 => 64,
+            EccCurve::Ed25519 => 32,
+        }
+    }
+
+    /// Maps a chip CURVE wire byte back to a curve.
+    ///
+    /// Returns `None` for any byte other than 0x01 (P-256) or 0x02 (Ed25519).
+    #[allow(dead_code)]
+    pub(crate) const fn from_wire_byte(byte: u8) -> Option<Self>
+    {
+        match byte
+        {
+            0x01 => Some(EccCurve::P256),
+            0x02 => Some(EccCurve::Ed25519),
+            _ => None,
+        }
+    }
+}
+
 /// An R-Memory user-data slot index (0..=511).
 ///
 /// The private field encodes the valid range. `new` rejects an out-of-range
@@ -152,6 +198,51 @@ impl MacDestroySlot
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signature(pub [u8; 64]);
 
+/// An ECC public key returned by the chip, carrying its curve.
+///
+/// The private fields tie the byte count to the curve: a key holds 64 raw
+/// bytes, of which the curve picks the meaningful prefix (32 for Ed25519, 64
+/// for P-256). Only the driver builds one, so the curve/length invariant holds
+/// by construction. A public key is not secret, so `Copy` is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EccPublicKey
+{
+    curve: EccCurve,
+    bytes: [u8; 64],
+}
+
+impl EccPublicKey
+{
+    /// Builds a public key from a curve and its raw 64-byte backing store.
+    ///
+    /// `pub(crate)`: only the driver, having validated the curve and length,
+    /// constructs one. The caller copies the key bytes into `bytes` and leaves
+    /// the tail zero for a 32-byte curve.
+    pub(crate) const fn new(curve: EccCurve, bytes: [u8; 64]) -> Self
+    {
+        EccPublicKey
+        {
+            curve,
+            bytes,
+        }
+    }
+
+    /// Returns the curve this key belongs to.
+    pub const fn curve(&self) -> EccCurve
+    {
+        self.curve
+    }
+
+    /// Returns the raw key bytes, trimmed to the curve length.
+    ///
+    /// A P-256 key exposes 64 bytes (raw X || Y), an Ed25519 key 32 bytes. The
+    /// zero tail stays hidden.
+    pub fn bytes(&self) -> &[u8]
+    {
+        &self.bytes[..self.curve.pubkey_len()]
+    }
+}
+
 /// The high-level secure-element command port.
 ///
 /// Implemented by an active session handle. Every method returns `SeError` on
@@ -170,17 +261,16 @@ pub trait SeCommands
     )
     -> Result<(), SeError>;
 
-    /// Reads the public key for `slot` into `out`.
+    /// Reads the public key for `slot`.
     ///
-    /// Returns the number of bytes written. Errors with `BufferTooSmall` when
-    /// `out` is too short, or `SeError` on a session fault.
-    fn ecc_public_key_into
+    /// Returns the key by value, carrying its curve. Errors with `SeError` on a
+    /// session fault.
+    fn ecc_public_key
     (
         &mut self,
         slot: EccSlot,
-        out: &mut [u8],
     )
-    -> Result<usize, SeError>;
+    -> Result<EccPublicKey, SeError>;
 
     /// Signs a 32-byte digest with the P-256 key in `slot` (ECDSA).
     ///
@@ -220,8 +310,9 @@ pub trait SeCommands
 
     /// Reads R-Memory `slot` into `out`.
     ///
-    /// Returns the number of bytes written. Errors with `BufferTooSmall` when
-    /// `out` is too short.
+    /// Returns the number of bytes written. 0 means empty: a stored slot is
+    /// never zero-length (write enforces a 1-byte minimum). Errors with
+    /// `BufferTooSmall` when `out` is too short.
     fn rmem_read_into
     (
         &mut self,
@@ -297,5 +388,39 @@ mod tests
     {
         assert_eq!(MacDestroySlot::new(127).map(|s| s.get()), Ok(127));
         assert_eq!(MacDestroySlot::new(128), Err(SeError::InvalidArgument));
+    }
+
+    #[test]
+    fn ecc_curve_wire_bytes_match_libtropic()
+    {
+        assert_eq!(EccCurve::P256.wire_byte(), 0x01);
+        assert_eq!(EccCurve::Ed25519.wire_byte(), 0x02);
+    }
+
+    #[test]
+    fn ecc_curve_pubkey_lengths()
+    {
+        assert_eq!(EccCurve::P256.pubkey_len(), 64);
+        assert_eq!(EccCurve::Ed25519.pubkey_len(), 32);
+    }
+
+    #[test]
+    fn ecc_curve_wire_byte_round_trips_every_variant()
+    {
+        // Drift guard: every variant survives a wire_byte -> from_wire_byte trip.
+        for c in [EccCurve::P256, EccCurve::Ed25519]
+        {
+            assert_eq!(EccCurve::from_wire_byte(c.wire_byte()), Some(c));
+        }
+    }
+
+    #[test]
+    fn ecc_curve_from_wire_byte_round_trips_and_rejects()
+    {
+        assert_eq!(EccCurve::from_wire_byte(0x01), Some(EccCurve::P256));
+        assert_eq!(EccCurve::from_wire_byte(0x02), Some(EccCurve::Ed25519));
+        assert_eq!(EccCurve::from_wire_byte(0x00), None);
+        assert_eq!(EccCurve::from_wire_byte(0x03), None);
+        assert_eq!(EccCurve::from_wire_byte(0xFF), None);
     }
 }

@@ -27,14 +27,15 @@ The project is under active development. Only the secure-element driver (`crates
 - Noise KK1 handshake: authenticated key agreement with the TROPIC01
 - AES-256-GCM command/response codec with advance-after-verify nonces
 - Fail-closed command gate: a crypto, structural, or parse fault on any command tears the session down and zeroizes the keys
-- Commands: `ping`, `random` (TRNG), and monotonic-counter read
-- Range-checked slot types: an out-of-range key/counter index cannot be constructed
-- 99 host tests, three libFuzzer targets on parser entry points
+- Commands: `ping`, `random` (TRNG), monotonic-counter read, R-memory read/write, ECC key generation, ECC public-key read, and ECDSA / EdDSA signing
+- ECC public-key read returns the chip's attested curve, so an upper layer cannot pick the wrong signing algorithm
+- Range-checked slot types: an out-of-range key/counter/memory index cannot be constructed
+- 161 host tests, three libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Remaining SE commands: ECC keygen, ECDSA/EdDSA sign, R-memory read/write, MAC-and-Destroy, monotonic counter init/update
+- Remaining SE commands: MAC-and-Destroy (PIN) and monotonic-counter init/update. The commands above exist as tested driver methods. They are assembled into the public `SeCommands` trait once MAC-and-Destroy lands
 - SE firmware-update path
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
 
