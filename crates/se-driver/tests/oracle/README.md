@@ -52,3 +52,60 @@ CRITICAL key-schedule subtlety (do not "fix"): the FIRST HKDF call uses the
 32-byte `protocol_name` as the chaining key (`ck_len = 32`). Every subsequent
 call uses the 33-byte `output_1` buffer (`ck_len = 33`, last byte always zero).
 HMAC over a 32- vs 33-byte key gives different results, so this must be exact.
+
+## L2 SEND multi-chunk KAT (`l2_frame_capture.c`)
+
+Captures REAL libtropic L2 frames on the wire and pins them as golden vectors
+for the Rust L2 SEND chunker. This breaks the chip-mock circularity for the
+SEND path: the residual unverified-vs-silicon surface was the L2 frame length
+encoding and the 252-byte chunk constant. The golden frames come from an
+independent implementation (libtropic C plus the official TROPIC01 model), so a
+wrong chunk boundary, REQ_LEN byte, or CRC fails the comparison.
+
+The capture runs a full session against the official TROPIC01 model
+(`ts-tvl`, Tropic Square's software emulator: TCP `127.0.0.1:28992`, no
+hardware) and dumps every L1 SPI frame via libtropic's `LT_PRINT_SPI_DATA`. The
+sequence is a 600-byte Ping (whose 619-byte L3 packet spans 252 + 252 + 115
+byte chunks) plus a 16-byte Random_Get (one 20-byte chunk).
+
+### Capture procedure (Linux)
+
+`LT` is a checkout of the official libtropic C SDK (pinned to the conformance
+tag). It is an external, read-only reference and is NOT part of this repository.
+
+```
+# 1. Install the model (downloads the ts-tvl wheel into a venv).
+LT=/path/to/libtropic
+"$LT/scripts/tropic01_model/install_linux.sh"
+
+# 2. Drop l2_frame_capture.c into a model example and build with SPI printing.
+mkdir -p "$LT/examples/model/kat_capture"
+cp l2_frame_capture.c "$LT/examples/model/kat_capture/main.c"
+cp "$LT/examples/model/hello_world/CMakeLists.txt" \
+   "$LT/examples/model/kat_capture/CMakeLists.txt"   # then s/hello_world/kat_capture/
+cmake -S "$LT/examples/model/kat_capture" -B build -G Ninja -DLT_PRINT_SPI_DATA=ON
+cmake --build build
+
+# 3. Run the model with the pinned config, then the capture binary.
+"$LT/scripts/tropic01_model/.venv/bin/model_server" tcp \
+   -c "$LT/scripts/tropic01_model/model_cfg.yml" &
+./build/libtropic_kat_capture            # dumps "SPI >> TX" / "<< RX" hex lines
+```
+
+The `>> TX` frames between the `KAT-MARK ping-begin`/`ping-end` markers are the
+3 multi-chunk SEND frames. The one between `random-begin`/`random-end` is the
+single-chunk SEND frame. Each frame is `[REQ_ID(0x04) | REQ_LEN | REQ_DATA |
+CRC(2)]`. The frames are pinned as `PING_FRAME_0..2` and `RANDOM_FRAME` in
+`src/l2/transport.rs`. The Rust test reconstructs the contiguous L3 packet from
+the chunk data fields, runs the chunker, and asserts byte-identical frames.
+
+NOTE: this validates PROTOCOL byte-exactness only. The session keys are NOT
+pinned (libtropic's host ephemeral comes from its PSA RNG), so the ciphertext
+bytes differ run-to-run. The FRAMING (boundaries, lengths, CRC) is what is
+asserted and is deterministic from the L3 packet length. A full reproducible
+end-to-end transcript (asserting ciphertext too) would additionally require
+pinning libtropic's host ephemeral via its crypto backend. Regenerate the frames
+only on a libtropic tag bump. The chunk math is stable across captures.
+
+This is a HOST test tool. It does NOT validate physical security (timing, the
+real TRNG, the real MAC-and-Destroy KDF, or DPA resistance).

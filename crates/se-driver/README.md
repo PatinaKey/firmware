@@ -4,16 +4,20 @@ A `no_std`, heap-free, `unsafe-free` Rust driver for the **TROPIC01** secure
 element (Tropic Square, part `TR01-C2P-T301`), spoken over SPI through an
 authenticated, encrypted **Noise KK1** session.
 
-It is the secure-element layer of the [PatinaKey](../../README.md) hardware
-security key, written as a clean-room rewrite with the official C SDK
+It is the secure-element layer of the
+[PatinaKey](https://github.com/PatinaKey/firmware) hardware security key, written
+as a clean-room rewrite with the official C SDK
 [`libtropic`](https://github.com/tropicsquare/libtropic) used as a differential
 **test oracle** (never linked : no C, no mbedTLS in the trusted computing base).
 
 > **Status: under active development.** The secure channel and the cryptographic
-> hot-path commands work and are tested host-side against an in-repo chip mock and
-> a libtropic-derived handshake KAT. Roughly half of the chip's command surface is
-> still unwired (see [Roadmap](#roadmap)), and the driver has **not** yet been
-> validated against the `tropic01_model` emulator or real silicon. Not production-grade yet.
+> hot-path commands work. They are tested host-side three ways: an in-repo chip
+> mock (incl. fault injection), a libtropic-derived handshake KAT, and a **live
+> end-to-end suite against the official `tropic01_model` emulator** (real
+> handshake + real AES-GCM, see [Validation](#validation-against-real-libtropic)).
+> Roughly half of the chip's command surface is still unwired (see
+> [Roadmap](#roadmap)) and it has not yet run on real silicon. Not
+> production-grade yet.
 
 ## What it does
 
@@ -39,6 +43,7 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 |------|------------|
 | Transport | L1 SPI, L2 framing + multi-chunk reassembly |
 | Secure channel | Noise KK1 handshake, `open_session` / `close_session`, session teardown gate |
+| Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW) |
 | Diagnostics | `ping` round-trip |
 | TRNG | `random_into` (RandomValueGet, 0x50) |
 | ECC keys | `ecc_key_generate` (0x60), `ecc_public_key` (0x62, returns the chip-attested curve) |
@@ -49,6 +54,35 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 
 These nine commands are exposed through the public `SeCommands` trait, the only
 surface the FIDO2 / OpenPGP / PKCS#11 layers consume.
+
+## Validation against real libtropic
+
+The driver is exercised end-to-end against the official **TROPIC01 model**
+(Tropic Square `ts-tvl`) over a TCP shim, running its real Noise KK1 handshake and
+real AES-GCM L3 codec against an independent implementation of the chip. No keys
+are pinned and nothing is mocked: a wrong protocol or crypto byte breaks the
+handshake or a GCM tag. The table below tracks what each operation is validated
+against the model for (`scripts/model-itest.sh`, behind the `model-itest`
+feature). Injected faults (corrupt tag/CRC/alarm/truncation) stay in the in-repo
+mock - the model does not misbehave on command. Model = conformance, mock = fault
+robustness.
+
+| Operation | Validated against the model |
+|-----------|:---:|
+| `reboot` (Startup_Req) | Yes - byte-exact frame KAT + live Start-up -> Application FW |
+| `open_session` (handshake) | Yes - real Noise KK1, every live test depends on it |
+| `ping` | Yes - small + a 600-byte payload (live 3-chunk L2 SEND) |
+| `random_into` | Yes - fills the requested buffer |
+| `rmem_write` / `rmem_read_into` | Yes - round-trips data. Re-write surfaces `SlotNotEmpty` (recoverable) |
+| `mcounter_get` | Yes - uninitialized counter surfaces `CounterInvalid` (recoverable) |
+| `ecc_key_generate` / `ecc_public_key` | Yes - P-256 (64 B) and Ed25519 (32 B). Empty slot surfaces `InvalidKey` (recoverable) |
+| `ecdsa_sign` / `eddsa_sign` | Yes - returns a 64-byte signature |
+| `mac_and_destroy` | Yes - returns the 32-byte secret output |
+
+The L2 multi-chunk SEND path additionally has a **byte-exact golden KAT**: real
+libtropic frames captured from the model are asserted byte-for-byte against the
+driver's chunker (frame length encoding + the 252-byte chunk constant + CRC).
+This runs in the normal hermetic test suite.
 
 ## Roadmap
 
@@ -65,12 +99,13 @@ requires (almost everything). The rest matters for a general-purpose driver.
 | Provisioning - pairing | `PairingKeyWrite/Read/Invalidate` 0x10-0x12 | Provision host pairing keys into the chip's 4 slots | Factory / setup |
 | Provisioning - config | `R-Config` 0x20-0x22, `I-Config` 0x30-0x31 | Reversible / irreversible config objects, access privileges (CFG_UAP) | Factory / setup |
 | Firmware update | bootloader 0xB0 / 0xB1 | Update the chip's application / SPECT firmware | Yes (planned) |
-| Power / mode | reboot, sleep, get-mode | Low-power, bootloader vs application mode | Later |
+| Power / mode | sleep, get-mode (`reboot` done) | Low-power, bootloader vs application mode | Later |
 
-Non-command work toward a publishable crate: validate against the `tropic01_model`
-emulator (then silicon), crate-level docs / examples on docs.rs, and an optional
-`embedded-hal`-based port so external users can plug their own HAL (today the ports
-are the crate's own `SpiDevice` / `SeWait` traits).
+Non-command work toward a publishable crate: validate against silicon (the
+`tropic01_model` emulator is already wired, see
+[Validation](#validation-against-real-libtropic)), crate-level docs / examples on
+docs.rs, and an optional `embedded-hal`-based port so external users can plug
+their own HAL (today the ports are the crate's own `SpiDevice` / `SeWait` traits).
 
 ## Design principles
 
@@ -88,10 +123,11 @@ are the crate's own `SpiDevice` / `SeWait` traits).
 
 ## Testing
 
-Host tests drive the driver through mock SPI / wait ports and an in-repo chip mock.
-The Noise KK1 key schedule is checked against a golden KAT generated from real
-libtropic. Three libFuzzer targets cover the attacker-facing parsers (behind the
-`_fuzz` feature). The build is proven `no_std` on `thumbv8m.main-none-eabihf`.
+Host tests drive the driver through mock SPI / wait ports and an in-repo chip mock
+(with fault injection). The Noise KK1 key schedule and the L2 multi-chunk SEND
+frames are checked against golden KATs generated from real libtropic. Three
+libFuzzer targets cover the attacker-facing parsers (behind the `_fuzz` feature).
+The build is proven `no_std` on `thumbv8m.main-none-eabihf`.
 
 ```sh
 cargo test -p se-driver
@@ -99,11 +135,14 @@ cargo clippy -p se-driver --all-targets -- -D warnings
 cargo clippy -p se-driver --target thumbv8m.main-none-eabihf -- -D warnings
 ```
 
-The current open validation gap: the multi-chunk L2 send path is exercised only
-against the in-repo mock. A libtropic L2-frame golden transcript captured from the
-`tropic01_model` emulator is the exit criterion before on-silicon bring-up.
+These run with no external dependencies. A separate **live** suite drives the
+driver against the official `tropic01_model` emulator (see
+[Validation](#validation-against-real-libtropic)). It is behind the `model-itest`
+feature and started by `scripts/model-itest.sh`, so the normal test run stays
+hermetic.
 
 ## License
 
 GNU General Public License v3.0 or later (`GPL-3.0-or-later`). See the
-[project README](../../README.md) for commercial-licensing contact.
+[project README](https://github.com/PatinaKey/firmware) for commercial-licensing
+contact.

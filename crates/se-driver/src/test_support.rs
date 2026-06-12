@@ -612,6 +612,26 @@ impl ChipMockSpi
         }
     }
 
+    /// Maps the active `ChipFault` to the L3 RESULT status byte.
+    ///
+    /// Returns the fault-forced status, or `Ok` when no status-overriding fault
+    /// is set. `0x55` is a deliberately unknown RESULT byte.
+    fn fault_status_byte(&self) -> u8
+    {
+        use crate::ids::L3Status;
+
+        match self.fault
+        {
+            ChipFault::ResultFail => L3Status::Fail as u8,
+            ChipFault::CounterInvalid => L3Status::CounterInvalid as u8,
+            ChipFault::SlotNotEmpty => L3Status::SlotNotEmpty as u8,
+            ChipFault::InvalidKey => L3Status::InvalidKey as u8,
+            // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
+            ChipFault::UnknownResultStatus => 0x55,
+            _ => L3Status::Ok as u8,
+        }
+    }
+
     /// Builds the result plaintext `RESULT || RES_DATA` for a command.
     ///
     /// `pt` is the decrypted command plaintext `CMD_ID || CMD_DATA`. Dispatches
@@ -626,64 +646,56 @@ impl ChipMockSpi
         use crate::ids::CmdId;
         use crate::ids::L3Status;
 
-        let status_byte = match self.fault
-        {
-            ChipFault::ResultFail => L3Status::Fail as u8,
-            ChipFault::CounterInvalid => L3Status::CounterInvalid as u8,
-            ChipFault::SlotNotEmpty => L3Status::SlotNotEmpty as u8,
-            ChipFault::InvalidKey => L3Status::InvalidKey as u8,
-            // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
-            ChipFault::UnknownResultStatus => 0x55,
-            _ => L3Status::Ok as u8,
-        };
+        let status_byte = self.fault_status_byte();
         let status_ok = status_byte == L3Status::Ok as u8;
         let cmd_id = pt.first().copied().unwrap_or(0);
         let mut res_pt = Vec::new();
         res_pt.push(status_byte);
-        if cmd_id == CmdId::Ping as u8
+        // Dispatch on the decoded CMD_ID. An unknown id yields no RES_DATA.
+        match CmdId::try_from(cmd_id)
         {
-            let mut payload = &pt[1..];
-            if self.fault == ChipFault::ShortEcho && !payload.is_empty()
+            Ok(CmdId::Ping) =>
             {
-                // Authenticated but one byte short: a RES_SIZE mismatch.
-                payload = &payload[..payload.len() - 1];
+                let mut payload = &pt[1..];
+                if self.fault == ChipFault::ShortEcho && !payload.is_empty()
+                {
+                    // Authenticated but one byte short: a RES_SIZE mismatch.
+                    payload = &payload[..payload.len() - 1];
+                }
+                res_pt.extend_from_slice(payload);
             }
-            res_pt.extend_from_slice(payload);
-        }
-        else if cmd_id == CmdId::RandomValueGet as u8
-        {
-            // CMD_DATA[0] = N_BYTES. RES_DATA = PADDING(3) || RANDOM(N).
-            let n = pt.get(1).copied().unwrap_or(0) as usize;
-            res_pt.extend_from_slice(&[0u8; 3]);
-            for i in 0..n
+            Ok(CmdId::RandomValueGet) =>
             {
-                res_pt.push(0xA0u8.wrapping_add(i as u8));
+                // CMD_DATA[0] = N_BYTES. RES_DATA = PADDING(3) || RANDOM(N).
+                let n = pt.get(1).copied().unwrap_or(0) as usize;
+                res_pt.extend_from_slice(&[0u8; 3]);
+                for i in 0..n
+                {
+                    res_pt.push(0xA0u8.wrapping_add(i as u8));
+                }
             }
-        }
-        else if cmd_id == CmdId::McounterGet as u8
-        {
-            // RES_DATA = PADDING(3) || VALUE(u32 LE).
-            res_pt.extend_from_slice(&[0u8; 3]);
-            res_pt.extend_from_slice(&self.mcounter_val.to_le_bytes());
-        }
-        else if cmd_id == CmdId::RMemDataRead as u8
-        {
-            // CMD_DATA = UDATA_SLOT(u16 LE). RES_DATA = PADDING(3) || DATA.
-            let slot = u16::from_le_bytes([
-                pt.get(1).copied().unwrap_or(0),
-                pt.get(2).copied().unwrap_or(0),
-            ]);
-            res_pt.extend_from_slice(&[0u8; 3]);
-            if let Some(data) = self.rmem_slots.get(&slot)
+            Ok(CmdId::McounterGet) =>
             {
-                res_pt.extend_from_slice(data);
+                // RES_DATA = PADDING(3) || VALUE(u32 LE).
+                res_pt.extend_from_slice(&[0u8; 3]);
+                res_pt.extend_from_slice(&self.mcounter_val.to_le_bytes());
             }
-        }
-        else if cmd_id == CmdId::RMemDataWrite as u8
-        {
+            Ok(CmdId::RMemDataRead) =>
+            {
+                // CMD_DATA = UDATA_SLOT(u16 LE). RES_DATA = PADDING(3) || DATA.
+                let slot = u16::from_le_bytes([
+                    pt.get(1).copied().unwrap_or(0),
+                    pt.get(2).copied().unwrap_or(0),
+                ]);
+                res_pt.extend_from_slice(&[0u8; 3]);
+                if let Some(data) = self.rmem_slots.get(&slot)
+                {
+                    res_pt.extend_from_slice(data);
+                }
+            }
             // CMD_DATA = UDATA_SLOT(u16 LE) || PADDING(1) || DATA. RES_DATA is
             // empty. Store the payload only on an OK status.
-            if status_ok
+            Ok(CmdId::RMemDataWrite) if status_ok =>
             {
                 let slot = u16::from_le_bytes([
                     pt.get(1).copied().unwrap_or(0),
@@ -692,41 +704,43 @@ impl ChipMockSpi
                 let data = pt.get(4..).unwrap_or(&[]).to_vec();
                 self.rmem_slots.insert(slot, data);
             }
-        }
-        else if cmd_id == CmdId::EccKeyGenerate as u8
-        {
-            // CMD_DATA = SLOT(u16 LE) || CURVE(1). RES_DATA is empty.
-        }
-        else if cmd_id == CmdId::EccKeyRead as u8
-        {
-            // RES_DATA = CURVE(1) || ORIGIN(1) || PADDING(13) || PUBKEY. The
-            // padding length is configurable so a test can forge a truncated
-            // header.
-            res_pt.push(self.ecc_read_curve);
-            res_pt.push(0); // ORIGIN
-            res_pt.extend(core::iter::repeat_n(0u8, self.ecc_read_pad));
-            res_pt.extend_from_slice(&self.ecc_read_pubkey);
-        }
-        else if cmd_id == CmdId::EcdsaSign as u8 || cmd_id == CmdId::EddsaSign as u8
-        {
-            // RES_DATA = PADDING(15) || R(32) || S(32). The configured 64-byte
-            // signature fills R || S so a test can assert the exact bytes.
-            res_pt.extend_from_slice(&[0u8; 15]);
-            res_pt.extend_from_slice(&self.sign_signature);
-        }
-        else if cmd_id == CmdId::MacAndDestroy as u8
-        {
-            // CMD_DATA = SLOT(u16 LE) || PADDING(1) || DATA_IN(32). RES_DATA =
-            // PADDING(3) || DATA_OUT(32). DATA_OUT is a deterministic function of
-            // the slot low byte and DATA_IN, so a test can predict it without
-            // modelling the chip's real KDF.
-            let slot_lo = pt.get(1).copied().unwrap_or(0);
-            res_pt.extend_from_slice(&[0u8; 3]);
-            for i in 0..32usize
+            Ok(CmdId::EccKeyGenerate) =>
             {
-                let din = pt.get(4 + i).copied().unwrap_or(0);
-                res_pt.push(din ^ slot_lo ^ (i as u8));
+                // CMD_DATA = SLOT(u16 LE) || CURVE(1). RES_DATA is empty.
             }
+            Ok(CmdId::EccKeyRead) =>
+            {
+                // RES_DATA = CURVE(1) || ORIGIN(1) || PADDING(13) || PUBKEY. The
+                // padding length is configurable so a test can forge a truncated
+                // header.
+                res_pt.push(self.ecc_read_curve);
+                res_pt.push(0); // ORIGIN
+                res_pt.extend(core::iter::repeat_n(0u8, self.ecc_read_pad));
+                res_pt.extend_from_slice(&self.ecc_read_pubkey);
+            }
+            Ok(CmdId::EcdsaSign | CmdId::EddsaSign) =>
+            {
+                // RES_DATA = PADDING(15) || R(32) || S(32). The configured 64-byte
+                // signature fills R || S so a test can assert the exact bytes.
+                res_pt.extend_from_slice(&[0u8; 15]);
+                res_pt.extend_from_slice(&self.sign_signature);
+            }
+            Ok(CmdId::MacAndDestroy) =>
+            {
+                // CMD_DATA = SLOT(u16 LE) || PADDING(1) || DATA_IN(32). RES_DATA =
+                // PADDING(3) || DATA_OUT(32). DATA_OUT is a deterministic function of
+                // the slot low byte and DATA_IN, so a test can predict it without
+                // modelling the chip's real KDF.
+                let slot_lo = pt.get(1).copied().unwrap_or(0);
+                res_pt.extend_from_slice(&[0u8; 3]);
+                for i in 0..32usize
+                {
+                    let din = pt.get(4 + i).copied().unwrap_or(0);
+                    res_pt.push(din ^ slot_lo ^ (i as u8));
+                }
+            }
+            _ =>
+            {}
         }
         if self.fault == ChipFault::ExtraResultByte && status_ok
         {
@@ -846,6 +860,80 @@ impl SpiDevice for ScriptedSpi
         {
             [Operation::Write(_)] =>
             {}
+            [Operation::TransferInPlace(status), Operation::Read(out)] =>
+            {
+                match self.frames.pop_front()
+                {
+                    Some(f) =>
+                    {
+                        status[0] = 0x01; // READY
+                        out[..f.len()].copy_from_slice(&f);
+                    }
+                    None =>
+                    {
+                        // Nothing left: report READY with RSP_LEN = 0xFF.
+                        status[0] = 0x01;
+                        out[1] = 0xFF;
+                    }
+                }
+            }
+            _ =>
+            {}
+        }
+        Ok(())
+    }
+}
+
+/// A `SpiDevice` that records every written frame and replays scripted reads.
+///
+/// Like `ScriptedSpi`, but it captures each MOSI `Write` so a test can assert
+/// the exact on-wire frames the driver emitted. Used by the L2 SEND golden KAT
+/// to compare the chunked frames byte-for-byte against real libtropic.
+pub(crate) struct RecordingSpi
+{
+    writes: Vec<Vec<u8>>,
+    frames: VecDeque<Vec<u8>>,
+}
+
+impl RecordingSpi
+{
+    /// Builds a recorder whose reads replay `frames` in order.
+    pub(crate) fn new(frames: Vec<Vec<u8>>) -> Self
+    {
+        RecordingSpi
+        {
+            writes: Vec::new(),
+            frames: frames.into_iter().collect(),
+        }
+    }
+
+    /// The full frames written by the driver, in send order.
+    pub(crate) fn writes(&self) -> &[Vec<u8>]
+    {
+        &self.writes
+    }
+}
+
+impl ErrorType for RecordingSpi
+{
+    type Error = MockSpiError;
+}
+
+impl SpiDevice for RecordingSpi
+{
+    fn transaction
+    (
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    )
+    -> Result<(), Self::Error>
+    {
+        match operations
+        {
+            [Operation::Write(frame)] =>
+            {
+                self.writes.push(frame.to_vec());
+            }
             [Operation::TransferInPlace(status), Operation::Read(out)] =>
             {
                 match self.frames.pop_front()

@@ -98,6 +98,32 @@ impl ActiveSession
 #[derive(Debug, Clone, Copy)]
 pub struct Bootloader;
 
+/// Which mode the chip reboots into for a `Startup_Req`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupId
+{
+    /// Restart and initialize as after a power cycle (loads Application FW).
+    Reboot,
+    /// Restart but stay in Start-up (Maintenance) Mode; do not load Application FW.
+    MaintenanceReboot,
+}
+
+impl StartupId
+{
+    /// Returns the `Startup_Req` `startup_id` wire byte (0x01 / 0x03).
+    ///
+    /// Source: libtropic `lt_startup_id_t` (`TR01_REBOOT`,
+    /// `TR01_MAINTENANCE_REBOOT`).
+    const fn wire_byte(self) -> u8
+    {
+        match self
+        {
+            StartupId::Reboot => 0x01,
+            StartupId::MaintenanceReboot => 0x03,
+        }
+    }
+}
+
 /// The TROPIC01 device handle.
 ///
 /// Generic over the SPI device port and the wait provider, with a type-state
@@ -130,6 +156,30 @@ where
             l3: L3Buf::new(),
             state: NoSession,
         }
+    }
+
+    /// Reboots the chip into the mode selected by `startup_id`.
+    ///
+    /// Sends a `Startup_Req` (L2 0xB3). The chip boots into Start-up Mode after a
+    /// power cycle; `StartupId::Reboot` loads the Application FW (required before
+    /// `open_session`, since the secure channel and L3 commands live there).
+    /// Returns `Ok(())` on the empty success ack. Errors on a bus fault or an
+    /// unexpected acknowledgement. Mirrors libtropic `lt_reboot`.
+    pub fn reboot(&mut self, startup_id: StartupId) -> Result<(), SeError>
+    {
+        // Startup_Req body = STARTUP_ID(1). REQ_LEN = 1, RSP carries no data.
+        let body = [startup_id.wire_byte()];
+        let n = frame::build_request(L2ReqId::Startup as u8, &body, &mut self.l2)?;
+        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
+        let frame_len =
+            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
+        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        // A successful Startup_Req is acknowledged with an empty RequestOk frame.
+        if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        Ok(())
     }
 }
 
@@ -1181,11 +1231,51 @@ mod tests
 {
     use super::*;
     use crate::error::L1Error;
+    use crate::test_support::l2_frame;
     use crate::test_support::vectors;
     use crate::test_support::ChipFault;
     use crate::test_support::ChipMockSpi;
     use crate::test_support::MockSpi;
     use crate::test_support::MockWait;
+    use crate::test_support::RecordingSpi;
+
+    #[test]
+    fn reboot_request_frame_matches_libtropic_golden()
+    {
+        // Byte-exact Startup_Req for TR01_REBOOT, captured from real libtropic:
+        // REQ_ID 0xB3, REQ_LEN 1, STARTUP_ID 0x01, CRC 0xF98F.
+        let mut buf = [0u8; L2_FRAME_MAX];
+        let n = frame::build_request(L2ReqId::Startup as u8, &[StartupId::Reboot.wire_byte()], &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], &[0xB3, 0x01, 0x01, 0xF9, 0x8F]);
+        assert_eq!(StartupId::MaintenanceReboot.wire_byte(), 0x03);
+    }
+
+    #[test]
+    fn reboot_succeeds_on_empty_request_ok_ack()
+    {
+        let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+        let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+        assert!(dev.reboot(StartupId::Reboot).is_ok());
+    }
+
+    #[test]
+    fn reboot_rejects_a_nonempty_ack()
+    {
+        // A Startup ack must carry no data; a non-empty one is a malformed reply.
+        let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[0xAA])];
+        let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+        assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::BadFrame)));
+    }
+
+    #[test]
+    fn reboot_rejects_a_continuation_status()
+    {
+        // Only RequestOk acknowledges a Startup_Req; a *Cont status is anomalous.
+        let acks = std::vec![l2_frame(L2Status::RequestCont as u8, &[])];
+        let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+        assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::BadFrame)));
+    }
 
     /// Opens a session over a chip mock configured with `fault`.
     fn open(fault: ChipFault) -> Tropic01<ChipMockSpi, MockWait, ActiveSession>

@@ -38,6 +38,7 @@ pub use crate::device::ActiveSession;
 pub use crate::device::Bootloader;
 pub use crate::device::NoSession;
 pub use crate::device::SessionConfig;
+pub use crate::device::StartupId;
 pub use crate::device::Tropic01;
 pub use crate::error::HandshakeError;
 pub use crate::error::L1Error;

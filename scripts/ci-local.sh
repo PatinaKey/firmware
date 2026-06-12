@@ -163,6 +163,17 @@ then
     else
         skip "fuzz" "cargo install cargo-fuzz (and a nightly toolchain)"
     fi
+
+    # Live se-driver integration against the official TROPIC01 model. Local-only
+    # (needs Python + the model wheel + a TCP service), never in the GitHub CI.
+    # Skipped unless LIBTROPIC points at a checkout with the model installed.
+    if [ -n "${LIBTROPIC:-}" ] && [ -x "${LIBTROPIC}/scripts/tropic01_model/.venv/bin/model_server" ]
+    then
+        run "model integration (live)" crates/se-driver/scripts/model-itest.sh
+    else
+        skip "model integration (live)" \
+            "export LIBTROPIC=<libtropic checkout> and run scripts/tropic01_model/install_linux.sh"
+    fi
 fi
 
 if [ -n "${SONAR_HOST_URL:-}" ] && have sonar-scanner

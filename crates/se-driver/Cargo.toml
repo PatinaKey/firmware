@@ -2,13 +2,29 @@
 name = "se-driver"
 edition.workspace = true
 version.workspace = true
+authors.workspace = true
+repository.workspace = true
 license.workspace = true
-description = "TROPIC01 secure element driver for patina_key (no_std)."
+description = "A no_std, panic-free Rust driver for the TROPIC01 secure element (Noise KK1 secure channel over SPI)."
+readme = "README.md"
+documentation = "to be done"
+keywords = ["tropic01", "secure-element", "no-std", "embedded", "ecc"]
+categories = ["embedded", "no-std", "cryptography", "hardware-support"]
+# Dev/validation tooling kept out of the published package. The crate is the
+# library. The fuzz harness has its own detached workspace and the scripts need
+# external services.
+exclude = ["/fuzz", "/scripts"]
 
 [features]
 # Exposes the `fuzz` module (attacker-facing parsers) to libFuzzer harnesses.
 # Not for production. Enabled only by the fuzz crate.
 _fuzz = []
+# Compiles the live model integration tests (tests/model_itest.rs). OFF by
+# default so the normal `cargo test` and CI stay hermetic (no network, no
+# Python). Run via scripts/model-itest.sh (in this crate), which starts the
+# official TROPIC01 model first. Host-test only: validates protocol
+# byte-exactness, not physical security.
+model-itest = []
 
 [dependencies]
 embedded-hal = { workspace = true }

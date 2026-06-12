@@ -31,14 +31,16 @@ The project is under active development. Only the secure-element driver (`crates
 - ECC public-key read returns the chip's attested curve, so an upper layer cannot pick the wrong signing algorithm
 - The MAC-and-Destroy output is returned in a zeroize-on-drop secret type
 - Range-checked slot types: an out-of-range key/counter/memory/PIN index cannot be constructed
-- 171 host tests, three libFuzzer targets on parser entry points
+- `reboot` (Startup_Req) to enter Application FW before a session
+- Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/se-driver/README.md#validation-against-real-libtropic))
+- 177 host tests, three libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Roughly half of the TROPIC01 command surface: key import/erase, R-memory erase, monotonic-counter init/update, chip-info/attestation, pairing-key and config-object provisioning, and power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
+- Roughly half of the TROPIC01 command surface: key import/erase, R-memory erase, monotonic-counter init/update, chip-info/attestation, pairing-key and config-object provisioning, and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
 - SE firmware-update path (bootloader 0xB0/0xB1)
-- Validation against the `tropic01_model` emulator and silicon (today: in-repo chip mock plus a libtropic-derived handshake KAT)
+- Validation against real silicon (the `tropic01_model` emulator is already wired up; see the [validation table](crates/se-driver/README.md#validation-against-real-libtropic))
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
 
 ## Building
@@ -82,6 +84,13 @@ Gates (all blocking unless noted):
 See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full pipeline and [`sonar-project.properties`](sonar-project.properties) for the SonarQube configuration.
 
 **Note:** rustfmt is intentionally absent. The project uses a strict Allman brace style that rustfmt cannot reproduce. Formatting is reviewed, not auto-applied.
+
+**Live model integration (local only).** A separate suite drives `se-driver` against the official TROPIC01 model (`ts-tvl`). It needs Python and a TCP service, so it is **not** in the GitHub CI. Run it locally with the model installed and `LIBTROPIC` pointing at a libtropic checkout:
+
+```sh
+crates/se-driver/scripts/model-itest.sh        # direct
+LIBTROPIC=/path/to/libtropic scripts/ci-local.sh   # as an optional ci-local stage
+```
 
 ## Design principles
 
