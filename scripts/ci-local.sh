@@ -181,11 +181,11 @@ then
     fi
 fi
 
-if [ -n "${SONAR_HOST_URL:-}" ] && have sonar-scanner
+if [ -n "${SONAR_HOST_URL:-}" ] && [ -n "${SONAR_TOKEN:-}" ] && have sonar-scanner
 then
     run "sonar-scanner" sonar-scanner \
         -Dsonar.host.url="$SONAR_HOST_URL" \
-        -Dsonar.token="${SONAR_TOKEN:-}"
+        -Dsonar.token="${SONAR_TOKEN}"
 else
     skip "sonar" "export SONAR_HOST_URL and SONAR_TOKEN, install sonar-scanner"
 fi
