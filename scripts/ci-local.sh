@@ -29,6 +29,16 @@ do
     shift
 done
 
+required_target="thumbv8m.main-none-eabihf"
+
+if ! rustup target list --installed | grep -q "^${required_target}$"
+then
+    echo "ERROR: required Rust target '${required_target}' is not installed."
+    echo "Install it with:"
+    echo "  rustup target add ${required_target}"
+    exit 1
+fi
+
 passed=()
 failed=()
 skipped=()
@@ -105,14 +115,9 @@ fuzz_stage()
 RUSTFLAGS="-D warnings" run "check (host)" cargo check --workspace --locked --all-targets
 unset RUSTFLAGS
 
-if rustup target list --installed | grep -q thumbv8m.main-none-eabihf
-then
-    RUSTFLAGS="-D warnings" run "check (thumbv8m)" \
-        cargo check -p se-driver --locked --target thumbv8m.main-none-eabihf
-    unset RUSTFLAGS
-else
-    skip "check (thumbv8m)" "rustup target add thumbv8m.main-none-eabihf"
-fi
+RUSTFLAGS="-D warnings" run "check (thumbv8m)" \
+    cargo check -p se-driver --locked --target thumbv8m.main-none-eabihf
+unset RUSTFLAGS
 
 run "test (host)" cargo test --workspace --locked
 
