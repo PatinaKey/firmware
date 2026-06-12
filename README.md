@@ -1,23 +1,113 @@
-# To be done.
+# PatinaKey - Firmware
 
-## PatinaKey · Firmware
+[![CI](https://github.com/PatinaKey/firmware/actions/workflows/ci.yml/badge.svg)](https://github.com/PatinaKey/firmware/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![Rust 1.95+](https://img.shields.io/badge/Rust-1.95%2B%20edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/)
+[![no_std](https://img.shields.io/badge/no__std-bare--metal-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
 
-Rust firmware for **PatinaKey**, an open-source USB security key.
-Target: **STM32U545**.
+Open-source Rust firmware for **PatinaKey**, a USB hardware security key implementing FIDO2, OpenPGP card, and PKCS#11.
 
+---
+
+## Hardware
+
+| Component | Part | Role |
+|-----------|------|------|
+| MCU | STM32U545CEU6Q (Cortex-M33 + TrustZone) | USB FS, application logic, on-chip crypto block |
+| Secure Element | TROPIC01 TR01-C2P-T301 | Key storage, ECC signing, TRNG, PIN enforcement |
+
+The MCU and the TROPIC01 communicate over SPI. All long-term private keys live inside the TROPIC01 and are non-exportable. Every command exchange is protected by a Noise KK1 encrypted session negotiated at startup.
+
+## Status
+
+The project is under active development. Only the secure-element driver (`crates/se-driver`) exists today. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started. See [`crates/se-driver/README.md`](crates/se-driver/README.md) for the driver's detailed status and command-coverage roadmap.
+
+**Secure-element driver - working today**
+
+- Noise KK1 handshake: authenticated key agreement with the TROPIC01
+- AES-256-GCM command/response codec with advance-after-verify nonces
+- Fail-closed command gate: a crypto, structural, or parse fault on any command tears the session down and zeroizes the keys
+- The full `SeCommands` trait is assembled over nine commands: `random` (TRNG), monotonic-counter read, R-memory read/write, ECC key generation, ECC public-key read, ECDSA / EdDSA signing, and MAC-and-Destroy (PIN primitive), plus a `ping` diagnostic
+- ECC public-key read returns the chip's attested curve, so an upper layer cannot pick the wrong signing algorithm
+- The MAC-and-Destroy output is returned in a zeroize-on-drop secret type
+- Range-checked slot types: an out-of-range key/counter/memory/PIN index cannot be constructed
+- `reboot` (Startup_Req) to enter Application FW before a session
+- Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/se-driver/README.md#validation-against-real-libtropic))
+- 177 host tests, three libFuzzer targets on parser entry points
+- Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
+
+**Not yet implemented**
+
+- Roughly half of the TROPIC01 command surface: key import/erase, R-memory erase, monotonic-counter init/update, chip-info/attestation, pairing-key and config-object provisioning, and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
+- SE firmware-update path (bootloader 0xB0/0xB1)
+- Validation against real silicon (the `tropic01_model` emulator is already wired up; see the [validation table](crates/se-driver/README.md#validation-against-real-libtropic))
+- MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
+
+## Building
+
+Developed using rustc 1.95. No guarantee is provided that the code will work with an earlier version.
+
+```sh
+# Host check and tests
+cargo check --workspace --locked
+cargo test --workspace --locked
+
+# Firmware target (no_std proof - bare-metal has no test harness)
+rustup target add thumbv8m.main-none-eabihf
+cargo check -p se-driver --locked --target thumbv8m.main-none-eabihf
+```
+
+## CI
+
+The pipeline runs on every push and pull request. Run the same checks locally with:
+
+```sh
+scripts/ci-local.sh          # full run
+scripts/ci-local.sh --quick  # skip coverage and fuzz
+```
+
+Gates (all blocking unless noted):
+
+| Gate | Tool | Notes |
+|------|------|-------|
+| Check | `cargo check` | host and `thumbv8m.main-none-eabihf` |
+| Lint | `cargo clippy` | zero warnings, JSON report for SonarQube |
+| Test | `cargo test` | host via mock ports |
+| Coverage | `cargo-llvm-cov` | line floor 90%, lcov for SonarQube |
+| Advisories | `cargo audit` | blocks on any RustSec finding, SARIF export |
+| Dependency policy | `cargo deny` | license allow-list, no unknown sources, no yanked crates |
+| Unused deps | `cargo udeps` | nightly |
+| Outdated | `cargo outdated` | informational, never blocking |
+| Fuzz | `cargo fuzz` | 60s per target on PR, 15 min on weekly schedule |
+| Quality scan | SonarQube | consumes the three reports above |
+
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full pipeline and [`sonar-project.properties`](sonar-project.properties) for the SonarQube configuration.
+
+**Note:** rustfmt is intentionally absent. The project uses a strict Allman brace style that rustfmt cannot reproduce. Formatting is reviewed, not auto-applied.
+
+**Live model integration (local only).** A separate suite drives `se-driver` against the official TROPIC01 model (`ts-tvl`). It needs Python and a TCP service, so it is **not** in the GitHub CI. Run it locally with the model installed and `LIBTROPIC` pointing at a libtropic checkout:
+
+```sh
+crates/se-driver/scripts/model-itest.sh        # direct
+LIBTROPIC=/path/to/libtropic scripts/ci-local.sh   # as an optional ci-local stage
+```
+
+## Design principles
+
+- **No heap** - all buffers are statically allocated. No `Vec` or `Box` anywhere in the firmware crates
+- **No unsafe** - enforced by `#![forbid(unsafe_code)]` at the workspace level
+- **Zeroize on drop** - every secret (session keys, ephemeral scalars) implements `ZeroizeOnDrop`
+- **Typed errors** - no `unwrap` or `panic!` outside tests. Every failure path returns a typed `Result`
+- **Minimal supply chain** - prefer rewriting a small piece over pulling a non-essential crate. Every dependency is an audit liability on a security product
 
 ## License
 
-This entire workspace is open-source and licensed under the **GNU General Public License v3.0 or later**
-([GPL-3.0-or-later](LICENSE)).
+This project is licensed under the **GNU General Public License v3.0 or later** ([GPL-3.0-or-later](LICENSE)).
 
-This strong copyleft license ensures that any modifications,
-improvements, or products built upon this project remain open-source and
-freely available to the community.
+Any modifications or products built on this code must remain open-source under the same terms. This ensures that improvements to a security tool flow back to the community.
 
 ### Commercial licensing
 
-If you wish to integrate this project into a proprietary,
-closed-source commercial product (and therefore cannot comply with the GPLv3 requirement to open-source your entire product), please contact me to discuss a **Commercial License**.
+To integrate PatinaKey into a proprietary closed-source product, contact us to discuss a commercial license.
 
-Contact: contact@patinakey.fr
+Contact: **contact@patinakey.fr**

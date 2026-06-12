@@ -1,0 +1,23 @@
+# cargo-deny policy for the PatinaKey firmware.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    # The workspace itself.
+    "GPL-3.0-or-later",
+    # The audited crypto and embedded ecosystem.
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
