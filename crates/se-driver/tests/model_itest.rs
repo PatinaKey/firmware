@@ -448,6 +448,83 @@ fn mcounter_update_to_zero_then_underflow_is_recoverable()
     assert_eq!(&out, b"live");
 }
 
+#[test]
+fn ecc_key_store_then_read_public_key()
+{
+    // Import an Ed25519 seed, then read the public key the chip derives from it.
+    let mut se = fresh_session();
+    let slot = EccSlot::new(8).unwrap();
+    let seed = Zeroizing::new([0x42u8; 32]);
+    se.ecc_key_store(slot, EccCurve::Ed25519, &seed).expect("store");
+    let pk = se.ecc_public_key(slot).expect("read pubkey of imported key");
+    assert_eq!(pk.curve(), EccCurve::Ed25519);
+    assert_eq!(pk.bytes().len(), 32);
+    assert!(pk.bytes().iter().any(|&b| b != 0), "pubkey must not be all zero");
+}
+
+#[test]
+fn ecc_key_store_distinct_seeds_yield_distinct_pubkeys()
+{
+    // Storing two different seeds must yield two different public keys: proof
+    // that the imported scalar bytes actually flow through to the chip (the byte
+    // offset / length the in-repo mock cannot check).
+    let mut se = fresh_session();
+    let slot_a = EccSlot::new(8).unwrap();
+    let slot_b = EccSlot::new(9).unwrap();
+    se.ecc_key_store(slot_a, EccCurve::Ed25519, &Zeroizing::new([0x11u8; 32]))
+        .expect("store a");
+    se.ecc_key_store(slot_b, EccCurve::Ed25519, &Zeroizing::new([0x22u8; 32]))
+        .expect("store b");
+    let pk_a = se.ecc_public_key(slot_a).expect("read a");
+    let pk_b = se.ecc_public_key(slot_b).expect("read b");
+    assert_ne!(pk_a.bytes(), pk_b.bytes(), "distinct seeds must give distinct keys");
+}
+
+#[test]
+fn ecc_key_store_then_sign_with_the_imported_key()
+{
+    // The imported-key SSH / OpenPGP path: import a private key, then sign with
+    // it. A signature proves the chip holds and uses the imported scalar.
+    let mut se = fresh_session();
+    let slot = EccSlot::new(10).unwrap();
+    se.ecc_key_store(slot, EccCurve::Ed25519, &Zeroizing::new([0x7Au8; 32]))
+        .expect("store");
+    let sig = se.eddsa_sign(slot, b"sign with the imported key").expect("sign");
+    assert!(sig.0.iter().any(|&b| b != 0), "signature must not be all zero");
+}
+
+#[test]
+fn ecc_key_store_into_occupied_slot_is_recoverable()
+{
+    // Generating a key, then importing into the same slot, surfaces a recoverable
+    // SlotNotEmpty. The session must survive.
+    let mut se = fresh_session();
+    let slot = EccSlot::new(11).unwrap();
+    se.ecc_key_generate(slot, EccCurve::Ed25519).expect("keygen");
+    let stored = se.ecc_key_store(slot, EccCurve::Ed25519, &Zeroizing::new([0x33u8; 32]));
+    assert!(stored.is_err(), "store into an occupied slot must fail");
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session alive after slot-not-empty");
+    assert_eq!(&out, b"live");
+}
+
+#[test]
+fn ecc_key_erase_clears_a_slot()
+{
+    // Generate a key, read it back, erase the slot, then a read must fail
+    // (recoverable): the slot is empty again.
+    let mut se = fresh_session();
+    let slot = EccSlot::new(12).unwrap();
+    se.ecc_key_generate(slot, EccCurve::P256).expect("keygen");
+    se.ecc_public_key(slot).expect("read before erase");
+    se.ecc_key_erase(slot).expect("erase");
+    let after = se.ecc_public_key(slot);
+    assert!(after.is_err(), "reading an erased slot must fail");
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session alive after erase");
+    assert_eq!(&out, b"live");
+}
+
 // helpers
 
 /// Decodes a 64-char hex string to 32 bytes at compile time.

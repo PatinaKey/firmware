@@ -841,6 +841,86 @@ where
         )
     }
 
+    /// Imports an external private key into ECC `slot` for `curve`.
+    ///
+    /// Inherent twin of `SeCommands::ecc_key_store`. `private_key` is the raw
+    /// 32-byte scalar: the P-256 private integer or the Ed25519 seed (both 32
+    /// bytes). It travels INSIDE the AES-GCM-encrypted L3 channel, and the shared
+    /// `run` gate zeroizes the L3 plaintext on every return path, so the secret
+    /// does not linger in the buffer. The slot range is enforced by `EccSlot`.
+    ///
+    /// SECURITY: an imported key is NON-ATTESTABLE. On-chip it is
+    /// indistinguishable from a chip-generated key, so it cannot prove the
+    /// private key never left a secure element. FIDO2 credentials must use
+    /// chip-generated keys (`ecc_key_generate`); confine import to the OpenPGP /
+    /// PKCS#11 / imported-SSH path. The driver enforces no such policy.
+    ///
+    /// A non-OK RESULT is a valid authenticated reply that keeps the session
+    /// live, mirroring libtropic: SlotNotEmpty when the slot already holds a key,
+    /// InvalidKey when the scalar is malformed, plus Unauthorized / Fail /
+    /// HardwareFail. The command has no RES_DATA, so it declares `Some(0)`: an OK
+    /// result carrying any payload poisons. A bad tag, CRC, alarm, or empty
+    /// result poisons the session.
+    pub(crate) fn ecc_key_store
+    (
+        &mut self,
+        slot: EccSlot,
+        curve: EccCurve,
+        private_key: &Zeroizing<[u8; 32]>,
+    )
+    -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (48 bytes): CMD_ID || SLOT(u16 LE) || CURVE(1) ||
+        // PADDING(12, 0) || K(32). libtropic never writes the padding, so zero it
+        // explicitly: stale L3 bytes must not enter the authenticated command.
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::EccKeyStore as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3] = curve.wire_byte();
+            cmd[4..ECC_STORE_KEY_OFFSET].fill(0);
+            cmd[ECC_STORE_KEY_OFFSET..ECC_STORE_CMD_LEN].copy_from_slice(&private_key[..]);
+        }
+        // The secret scalar is now live in the L3 plaintext buffer until `run`
+        // seals it and wipes the buffer. `run` owns every return path, so no
+        // early return can skip that wipe: keep it that way on any refactor.
+        self.run(ECC_STORE_CMD_LEN, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Erases ECC `slot`, removing any stored key.
+    ///
+    /// Inherent twin of `SeCommands::ecc_key_erase`. The slot range is enforced
+    /// by `EccSlot`. Returns `Ok(())` on an erased slot.
+    ///
+    /// A non-OK RESULT is a valid authenticated reply that keeps the session
+    /// live, mirroring libtropic: SlotEmpty when the slot already holds no key,
+    /// plus Unauthorized / Fail / HardwareFail. The command has no RES_DATA, so
+    /// it declares `Some(0)`: an OK result carrying any payload poisons. A bad
+    /// tag, CRC, alarm, or empty result poisons the session.
+    pub(crate) fn ecc_key_erase(&mut self, slot: EccSlot) -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || SLOT(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::EccKeyErase as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(3, Some(0), |_res_data| Ok(()))
+    }
+
     /// Signs a 32-byte SHA-256 digest with the P-256 key in `slot` (ECDSA).
     ///
     /// Inherent twin of `SeCommands::ecdsa_sign`. The host pre-hashes the
@@ -1111,6 +1191,28 @@ where
         self.ecc_public_key(slot)
     }
 
+    fn ecc_key_store
+    (
+        &mut self,
+        slot: EccSlot,
+        curve: EccCurve,
+        private_key: &Zeroizing<[u8; 32]>,
+    )
+    -> Result<(), SeError>
+    {
+        self.ecc_key_store(slot, curve, private_key)
+    }
+
+    fn ecc_key_erase
+    (
+        &mut self,
+        slot: EccSlot,
+    )
+    -> Result<(), SeError>
+    {
+        self.ecc_key_erase(slot)
+    }
+
     fn ecdsa_sign
     (
         &mut self,
@@ -1270,6 +1372,18 @@ const ECC_PUBKEY_MAX: usize = 64;
 ///
 /// Source: libtropic `struct lt_l3_ecc_key_read_res_t` (`padding[13]`).
 const ECC_READ_PADDING: usize = 13;
+
+/// Byte offset of the imported key within the EccKeyStore command plaintext.
+///
+/// Layout: CMD_ID(1) || SLOT(2) || CURVE(1) || PADDING(12) || K(32). Source:
+/// libtropic `struct lt_l3_ecc_key_store_cmd_t` (`padding[12]` before `k[32]`).
+const ECC_STORE_KEY_OFFSET: usize = 16;
+
+/// EccKeyStore command plaintext length: header+padding(16) || K(32) = 48.
+///
+/// The imported scalar is 32 bytes for both curves (libtropic
+/// `TR01_CURVE_PRIVKEY_LEN`). Total matches `TR01_L3_ECC_KEY_STORE_CMD_SIZE`.
+const ECC_STORE_CMD_LEN: usize = ECC_STORE_KEY_OFFSET + 32;
 
 /// Padding bytes between the SLOT field and the message in a sign command
 /// (CMD_ID(1) || SLOT(2) || PADDING(13) || MSG...).
@@ -2279,6 +2393,247 @@ mod tests
         assert_eq!(dev.spi_ref().nonces(), (3, 3));
     }
 
+    /// Builds a deterministic 32-byte private scalar for the import tests.
+    fn sample_privkey() -> Zeroizing<[u8; 32]>
+    {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(3).wrapping_add(1);
+        }
+        Zeroizing::new(k)
+    }
+
+    #[test]
+    fn ecc_key_store_round_trips_both_curves()
+    {
+        let mut dev = open(ChipFault::None);
+        let key = sample_privkey();
+        assert_eq!(dev.ecc_key_store(eslot(0), EccCurve::P256, &key), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        assert_eq!(dev.ecc_key_store(eslot(31), EccCurve::Ed25519, &key), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+    }
+
+    #[test]
+    fn ecc_key_store_slot_not_empty_is_recoverable()
+    {
+        // SlotNotEmpty (0x10): the target slot already holds a key. A valid
+        // authenticated reply that keeps the session live.
+        let mut dev = open(ChipFault::SlotNotEmpty);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(2), EccCurve::Ed25519, &key),
+            Err(SeError::L3(L3Error::Result(L3Status::SlotNotEmpty)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ecc_key_store(eslot(2), EccCurve::Ed25519, &key);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::SlotNotEmpty))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn ecc_key_store_invalid_key_is_recoverable()
+    {
+        // InvalidKey (0x12): the imported scalar is malformed (e.g. out of range
+        // for the curve). Recoverable: the session stays live.
+        let mut dev = open(ChipFault::InvalidKey);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(0), EccCurve::P256, &key),
+            Err(SeError::L3(L3Error::Result(L3Status::InvalidKey)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ecc_key_store(eslot(0), EccCurve::P256, &key);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::InvalidKey))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn ecc_key_store_extra_result_byte_poisons_session()
+    {
+        // ecc_key_store is a Some(0) command: one unexpected RES_DATA byte trips
+        // the expected-length check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(0), EccCurve::P256, &key),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_store_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(0), EccCurve::P256, &key),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_store_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(0), EccCurve::P256, &key),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_store_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(0), EccCurve::P256, &key),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_store_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        let key = sample_privkey();
+        assert_eq!
+        (
+            dev.ecc_key_store(eslot(0), EccCurve::P256, &key),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_store_wipes_the_imported_key_from_the_l3_buffer()
+    {
+        // SECURITY: the imported private scalar sits in the L3 plaintext buffer.
+        // The shared run gate must zeroize it on the success path so the secret
+        // does not linger after the command returns.
+        let mut dev = open(ChipFault::None);
+        let key = sample_privkey();
+        dev.ecc_key_store(eslot(5), EccCurve::Ed25519, &key).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "secret key residue");
+    }
+
+    #[test]
+    fn ecc_key_store_wipes_the_imported_key_even_on_poison()
+    {
+        // SECURITY: even when the command poisons the session, the imported
+        // scalar must not survive in the L3 buffer.
+        let mut dev = open(ChipFault::BadResultTag);
+        let key = sample_privkey();
+        let _ = dev.ecc_key_store(eslot(5), EccCurve::Ed25519, &key);
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "secret key residue after poison");
+    }
+
+    #[test]
+    fn ecc_key_erase_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.ecc_key_erase(eslot(4)), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn ecc_key_erase_slot_empty_is_recoverable()
+    {
+        // SlotEmpty (0x15): erasing an already-empty slot. A valid authenticated
+        // reply that keeps the session live (erase is idempotent for the caller).
+        let mut dev = open(ChipFault::SlotEmpty);
+        assert_eq!
+        (
+            dev.ecc_key_erase(eslot(0)),
+            Err(SeError::L3(L3Error::Result(L3Status::SlotEmpty)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.ecc_key_erase(eslot(0));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::SlotEmpty))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn ecc_key_erase_extra_result_byte_poisons_session()
+    {
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!(dev.ecc_key_erase(eslot(0)), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_erase_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.ecc_key_erase(eslot(0)), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_erase_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.ecc_key_erase(eslot(0)), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_erase_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.ecc_key_erase(eslot(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn ecc_key_erase_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.ecc_key_erase(eslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mixed_ecc_lifecycle_keeps_nonces_in_lockstep()
+    {
+        // store, public-key read, then erase each advance both nonces once
+        // across the full ECC key lifecycle.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_ecc_pubkey(0x02, &[0x44; 32]);
+        let key = sample_privkey();
+        dev.ecc_key_store(eslot(6), EccCurve::Ed25519, &key).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        let pk = dev.ecc_public_key(eslot(6)).unwrap();
+        assert_eq!(pk.curve(), EccCurve::Ed25519);
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        dev.ecc_key_erase(eslot(6)).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
+    }
+
     /// Builds a deterministic 64-byte R || S signature for the sign tests.
     fn sample_sig() -> [u8; 64]
     {
@@ -2687,6 +3042,16 @@ mod tests
     }
 
     #[test]
+    fn mac_and_destroy_l3_buffer_is_wiped_even_on_poison()
+    {
+        // SECURITY: DATA_IN is secret material in the L3 plaintext buffer. Even
+        // when the command poisons the session, the input must not survive.
+        let mut dev = open(ChipFault::BadResultTag);
+        let _ = dev.mac_and_destroy(mdslot(3), &[0xAB; 32]).map(|o| *o.expose());
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "secret input residue after poison");
+    }
+
+    #[test]
     fn rmem_erase_round_trips_and_advances_nonces()
     {
         let mut dev = open(ChipFault::None);
@@ -2968,6 +3333,9 @@ mod tests
             se.rmem_erase(RMemSlot::new(3).expect("test slot"))?;
             se.mcounter_init(MCounterIdx::new(1).expect("test idx"), 9)?;
             se.mcounter_update(MCounterIdx::new(1).expect("test idx"))?;
+            let key = Zeroizing::new([7u8; 32]);
+            se.ecc_key_store(EccSlot::new(8).expect("test slot"), EccCurve::Ed25519, &key)?;
+            se.ecc_key_erase(EccSlot::new(8).expect("test slot"))?;
             se.mac_and_destroy(slot, input)
         }
 
@@ -2975,9 +3343,10 @@ mod tests
         let input = [0x42u8; 32];
         let out = exercise(&mut dev, mdslot(9), &input).unwrap();
         assert_eq!(out.expose(), &expected_mac_out(9, &input));
-        // random_into, rmem_erase, mcounter_init, mcounter_update, then
-        // mac_and_destroy each advance both nonces once: five round-trips.
-        assert_eq!(dev.spi_ref().nonces(), (5, 5));
+        // random_into, rmem_erase, mcounter_init, mcounter_update, ecc_key_store,
+        // ecc_key_erase, then mac_and_destroy each advance both nonces once:
+        // seven round-trips.
+        assert_eq!(dev.spi_ref().nonces(), (7, 7));
     }
 
     #[test]
