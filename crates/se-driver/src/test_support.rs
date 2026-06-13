@@ -266,6 +266,11 @@ pub(crate) enum ChipFault
     ExtraResultByte,
     /// Seal a valid result whose RESULT status is CounterInvalid (recoverable).
     CounterInvalid,
+    /// Seal a valid result whose RESULT status is UpdateErr (recoverable).
+    ///
+    /// A McounterUpdate on a counter already at zero (a decrement would
+    /// underflow). The session stays live so the caller can react.
+    UpdateErr,
     /// Seal a valid result whose RESULT status is SlotNotEmpty (recoverable).
     ///
     /// A write to an un-erased R-Memory slot. The session stays live so the
@@ -560,6 +565,7 @@ impl ChipMockSpi
             | ChipFault::ResultWrongSize
             | ChipFault::ExtraResultByte
             | ChipFault::CounterInvalid
+            | ChipFault::UpdateErr
             | ChipFault::SlotNotEmpty
             | ChipFault::InvalidKey
             | ChipFault::UnknownResultStatus =>
@@ -624,6 +630,7 @@ impl ChipMockSpi
         {
             ChipFault::ResultFail => L3Status::Fail as u8,
             ChipFault::CounterInvalid => L3Status::CounterInvalid as u8,
+            ChipFault::UpdateErr => L3Status::UpdateErr as u8,
             ChipFault::SlotNotEmpty => L3Status::SlotNotEmpty as u8,
             ChipFault::InvalidKey => L3Status::InvalidKey as u8,
             // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
@@ -640,7 +647,10 @@ impl ChipMockSpi
     /// plus the configured value, RMemDataRead returns padding plus the slot
     /// content, RMemDataWrite stores the payload and returns no RES_DATA,
     /// MacAndDestroy returns padding plus a deterministic DATA_OUT. The
-    /// `ResultFail`/`CounterInvalid`/`SlotNotEmpty` faults override the status.
+    /// `ResultFail`/`CounterInvalid`/`UpdateErr`/`SlotNotEmpty` faults override
+    /// the status. RMemDataErase, McounterInit, and McounterUpdate carry no
+    /// RES_DATA, so they fall through to the default arm (status byte only); the
+    /// model integration tests cover their erase/decrement semantics.
     fn build_result_pt(&mut self, pt: &[u8]) -> Vec<u8>
     {
         use crate::ids::CmdId;
