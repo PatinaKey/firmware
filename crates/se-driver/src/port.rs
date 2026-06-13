@@ -8,6 +8,7 @@
 //! `Tropic01<SPI, W, ActiveSession>` implements this trait.
 
 use zeroize::ZeroizeOnDrop;
+use zeroize::Zeroizing;
 
 use crate::error::SeError;
 
@@ -288,6 +289,39 @@ pub trait SeCommands
         slot: EccSlot,
     )
     -> Result<EccPublicKey, SeError>;
+
+    /// Imports an external private key into ECC `slot` for `curve`.
+    ///
+    /// `private_key` is the raw 32-byte scalar (P-256 private integer or Ed25519
+    /// seed). It is sent inside the AES-GCM-encrypted channel and the L3
+    /// plaintext is zeroized after use. The slot range (0..=31) is enforced by
+    /// `EccSlot::new`. A non-OK RESULT (SlotNotEmpty, InvalidKey, Unauthorized,
+    /// Fail, HardwareFail) keeps the session live and surfaces as a recoverable
+    /// `SeError`.
+    ///
+    /// SECURITY: an imported key is non-attestable (indistinguishable on-chip
+    /// from a chip-generated one). FIDO2 credentials must use chip-generated
+    /// keys; confine import to the OpenPGP / PKCS#11 / imported-SSH path.
+    fn ecc_key_store
+    (
+        &mut self,
+        slot: EccSlot,
+        curve: EccCurve,
+        private_key: &Zeroizing<[u8; 32]>,
+    )
+    -> Result<(), SeError>;
+
+    /// Erases ECC `slot`, removing any stored key.
+    ///
+    /// The slot range (0..=31) is enforced by `EccSlot::new`. Erasing an empty
+    /// slot surfaces a recoverable non-OK RESULT (SlotEmpty) and keeps the
+    /// session live.
+    fn ecc_key_erase
+    (
+        &mut self,
+        slot: EccSlot,
+    )
+    -> Result<(), SeError>;
 
     /// Signs a 32-byte digest with the P-256 key in `slot` (ECDSA).
     ///
