@@ -281,6 +281,11 @@ pub(crate) enum ChipFault
     /// An EccKeyRead of an empty or corrupt slot. The session stays live so the
     /// caller can generate a key and retry.
     InvalidKey,
+    /// Seal a valid result whose RESULT status is SlotEmpty (recoverable).
+    ///
+    /// An EccKeyErase of an already-empty slot. The session stays live; erasing
+    /// an empty slot is idempotent at the application level.
+    SlotEmpty,
     /// Seal a valid (OK-tag) result whose RESULT byte is an unrecognized value.
     ///
     /// The GCM tag verifies, but the status byte (0x55) maps to no `L3Status`.
@@ -568,6 +573,7 @@ impl ChipMockSpi
             | ChipFault::UpdateErr
             | ChipFault::SlotNotEmpty
             | ChipFault::InvalidKey
+            | ChipFault::SlotEmpty
             | ChipFault::UnknownResultStatus =>
             {}
         }
@@ -633,6 +639,7 @@ impl ChipMockSpi
             ChipFault::UpdateErr => L3Status::UpdateErr as u8,
             ChipFault::SlotNotEmpty => L3Status::SlotNotEmpty as u8,
             ChipFault::InvalidKey => L3Status::InvalidKey as u8,
+            ChipFault::SlotEmpty => L3Status::SlotEmpty as u8,
             // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
             ChipFault::UnknownResultStatus => 0x55,
             _ => L3Status::Ok as u8,
@@ -647,10 +654,11 @@ impl ChipMockSpi
     /// plus the configured value, RMemDataRead returns padding plus the slot
     /// content, RMemDataWrite stores the payload and returns no RES_DATA,
     /// MacAndDestroy returns padding plus a deterministic DATA_OUT. The
-    /// `ResultFail`/`CounterInvalid`/`UpdateErr`/`SlotNotEmpty` faults override
-    /// the status. RMemDataErase, McounterInit, and McounterUpdate carry no
-    /// RES_DATA, so they fall through to the default arm (status byte only); the
-    /// model integration tests cover their erase/decrement semantics.
+    /// `ResultFail`/`CounterInvalid`/`UpdateErr`/`SlotNotEmpty`/`SlotEmpty`
+    /// faults override the status. RMemDataErase, McounterInit, McounterUpdate,
+    /// EccKeyStore, and EccKeyErase carry no RES_DATA, so they fall through to
+    /// the default arm (status byte only); the model integration tests cover
+    /// their store/erase/decrement semantics.
     fn build_result_pt(&mut self, pt: &[u8]) -> Vec<u8>
     {
         use crate::ids::CmdId;
