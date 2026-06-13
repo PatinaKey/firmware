@@ -12,7 +12,7 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 embedded-hal = "1.0"
-zeroize = { version = "1.8", default-features = false, features = ["derive"] }
+zeroize = { version = "1.9", default-features = false, features = ["derive"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 sha2 = { version = "0.11", default-features = false }
