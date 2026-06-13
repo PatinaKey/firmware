@@ -95,8 +95,57 @@ audit_stage()
 
 coverage_stage()
 {
-    cargo llvm-cov --workspace --locked --lcov --output-path lcov.info || return 1
-    cargo llvm-cov report --fail-under-lines 90
+    # Mirror the GitHub coverage job. If LIBTROPIC points at a checkout with the
+    # model installed, include the live integration tests (tests/model_itest.rs)
+    # so the library paths they exercise count. Otherwise stay hermetic. The
+    # test-harness files (tests/) are excluded so only library coverage is
+    # measured, and the run is single-threaded (the model is one stateful target).
+    local feature_args=()
+    local srv=""
+    if [ -n "${LIBTROPIC:-}" ] && [ -x "${LIBTROPIC}/scripts/tropic01_model/.venv/bin/model_server" ]
+    then
+        local model="${LIBTROPIC}/scripts/tropic01_model"
+        "$model/.venv/bin/model_server" tcp -c "$model/model_cfg.yml" \
+            -o /tmp/ci-local-model-save.yml \
+            > /tmp/ci-local-model.log 2>&1 &
+        srv=$!
+        local ready=0
+        local i
+        for i in $(seq 1 50)
+        do
+            if (exec 3<>"/dev/tcp/127.0.0.1/28992") 2>/dev/null
+            then
+                exec 3>&- 3<&-
+                ready=1
+                break
+            fi
+            sleep 0.2
+        done
+        if [ "$ready" -ne 1 ]
+        then
+            echo "ERROR: model_server did not become ready on 127.0.0.1:28992" >&2
+            echo "---- model_server log ----" >&2
+            tail -200 /tmp/ci-local-model.log >&2 || true
+            kill "$srv" 2>/dev/null || true
+            wait "$srv" 2>/dev/null || true
+            return 1
+        fi
+        feature_args=(--features model-itest)
+        echo "coverage includes the live model integration tests"
+    else
+        echo "coverage hermetic only (set LIBTROPIC + install the model to add live tests)"
+    fi
+    local status=0
+    cargo llvm-cov --workspace --locked "${feature_args[@]}" \
+        --ignore-filename-regex 'tests/' \
+        --lcov --output-path lcov.info -- --test-threads=1 || status=1
+    if [ -n "$srv" ]
+    then
+        kill "$srv" 2>/dev/null || true
+        wait "$srv" 2>/dev/null || true
+    fi
+    [ "$status" -ne 0 ] && return 1
+    cargo llvm-cov report --ignore-filename-regex 'tests/' --fail-under-lines 90
 }
 
 fuzz_stage()
@@ -167,17 +216,6 @@ then
         run "fuzz (${FUZZ_SECS}s per target)" fuzz_stage
     else
         skip "fuzz" "cargo install cargo-fuzz (and a nightly toolchain)"
-    fi
-
-    # Live se-driver integration against the official TROPIC01 model. Local-only
-    # (needs Python + the model wheel + a TCP service), never in the GitHub CI.
-    # Skipped unless LIBTROPIC points at a checkout with the model installed.
-    if [ -n "${LIBTROPIC:-}" ] && [ -x "${LIBTROPIC}/scripts/tropic01_model/.venv/bin/model_server" ]
-    then
-        run "model integration (live)" crates/se-driver/scripts/model-itest.sh
-    else
-        skip "model integration (live)" \
-            "export LIBTROPIC=<libtropic checkout> and run scripts/tropic01_model/install_linux.sh"
     fi
 fi
 

@@ -7,6 +7,10 @@
 #   ports. The bare-metal target has no std, no test harness, and no runner,
 #   so the thumbv8m job proves the no_std build and lints it instead.
 #   On-hardware tests (probe-rs) become a separate job once boards exist.
+# - Live model integration: the coverage job clones the official TROPIC01 model
+#   (libtropic, pinned to a tag + commit) and drives se-driver against it
+#   end-to-end (real handshake + AES-GCM). These run under coverage so the
+#   library paths they exercise count. The test-harness files are excluded.
 # - cargo audit BLOCKS on findings (no `|| true` on the gate): a known
 #   vulnerability in the dependency tree must stop the line.
 #
@@ -101,6 +105,13 @@ jobs:
     name: Test and Coverage
     runs-on: ubuntu-latest
     needs: lint
+    env:
+      # Official TROPIC01 model (libtropic), pinned to a release tag AND its
+      # commit so the test vectors cannot drift if the tag is ever moved.
+      LIBTROPIC_REF: v4.0.0
+      # Commit the annotated tag v4.0.0 dereferences to (git rev-parse HEAD after
+      # checkout), NOT the tag-object hash.
+      LIBTROPIC_SHA: 756c8ee898ed61b12272ecb22b213edf97aab751
 
     steps:
       - name: Checkout repository
@@ -122,17 +133,70 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Run tests (Host)
+      - name: Run tests (Host, hermetic)
         run: cargo test --workspace --locked
 
-      # The _fuzz feature is a libFuzzer seam, exercised by the fuzz job,
-      # not by unit tests, so coverage runs without --all-features.
-      - name: Run coverage (Host)
-        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure model location
+        run: echo "LIBTROPIC=$RUNNER_TEMP/libtropic" >> "$GITHUB_ENV"
+
+      - name: Clone the TROPIC01 model (libtropic, pinned)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$LIBTROPIC_REF" \
+            https://github.com/tropicsquare/libtropic "$LIBTROPIC"
+          got="$(git -C "$LIBTROPIC" rev-parse HEAD)"
+          if [ "$got" != "$LIBTROPIC_SHA" ]; then
+            echo "libtropic $LIBTROPIC_REF moved: expected $LIBTROPIC_SHA, got $got" >&2
+            exit 1
+          fi
+
+      - name: Install the TROPIC01 model (ts-tvl)
+        run: "$LIBTROPIC/scripts/tropic01_model/install_linux.sh"
+
+      # Coverage over the hermetic suite PLUS the live model integration tests
+      # (tests/model_itest.rs, behind `model-itest`): the driver runs its real
+      # Noise KK1 handshake + AES-GCM against the model in the background. The
+      # library paths they exercise count toward coverage. The test-harness
+      # files (tests/) are excluded so only library coverage is measured.
+      # Single-threaded: the model is one stateful target.
+      - name: Run coverage (host + live model)
+        run: |
+          set -euo pipefail
+          MODEL="$LIBTROPIC/scripts/tropic01_model"
+          "$MODEL/.venv/bin/model_server" tcp -c "$MODEL/model_cfg.yml" \
+            -o "$RUNNER_TEMP/model-config-save.yml" \
+            > "$RUNNER_TEMP/model-server.log" 2>&1 &
+          srv=$!
+          trap 'kill "$srv" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/28992) 2>/dev/null; then
+              exec 3>&- 3<&-
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "model_server did not become ready on 127.0.0.1:28992" >&2
+            exit 1
+          fi
+          cargo llvm-cov --workspace --locked --features model-itest \
+            --ignore-filename-regex 'tests/' \
+            --lcov --output-path lcov.info -- --test-threads=1
 
       # Raise this floor as the crate grows.
       - name: Enforce coverage floor
-        run: cargo llvm-cov report --fail-under-lines 90
+        run: cargo llvm-cov report --ignore-filename-regex 'tests/' --fail-under-lines 90
+
+      - name: Show model server log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/model-server.log" || true
 
       - name: Upload coverage report
         if: always()
