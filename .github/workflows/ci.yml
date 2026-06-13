@@ -173,13 +173,19 @@ jobs:
             > "$RUNNER_TEMP/model-server.log" 2>&1 &
           srv=$!
           trap 'kill "$srv" 2>/dev/null || true' EXIT
+          ready=0
           for _ in $(seq 1 50); do
             if (exec 3<>/dev/tcp/127.0.0.1/28992) 2>/dev/null; then
               exec 3>&- 3<&-
+              ready=1
               break
             fi
             sleep 0.2
           done
+          if [ "$ready" -ne 1 ]; then
+            echo "model_server did not become ready on 127.0.0.1:28992" >&2
+            exit 1
+          fi
           cargo llvm-cov --workspace --locked --features model-itest \
             --ignore-filename-regex 'tests/' \
             --lcov --output-path lcov.info -- --test-threads=1
