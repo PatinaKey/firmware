@@ -73,7 +73,8 @@ Gates (all blocking unless noted):
 | Check | `cargo check` | host and `thumbv8m.main-none-eabihf` |
 | Lint | `cargo clippy` | zero warnings, JSON report for SonarQube |
 | Test | `cargo test` | host via mock ports |
-| Coverage | `cargo-llvm-cov` | line floor 90%, lcov for SonarQube |
+| Model integration | `tropic01_model` (`ts-tvl`) | live end-to-end against the official model (libtropic pinned). Run under coverage |
+| Coverage | `cargo-llvm-cov` | hermetic + live-model tests, line floor 90%, lcov for SonarQube |
 | Advisories | `cargo audit` | blocks on any RustSec finding, SARIF export |
 | Dependency policy | `cargo deny` | license allow-list, no unknown sources, no yanked crates |
 | Unused deps | `cargo udeps` | nightly |
@@ -85,12 +86,14 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full pipeline
 
 **Note:** rustfmt is intentionally absent. The project uses a strict Allman brace style that rustfmt cannot reproduce. Formatting is reviewed, not auto-applied.
 
-**Live model integration (local only).** A separate suite drives `se-driver` against the official TROPIC01 model (`ts-tvl`). It needs Python and a TCP service, so it is **not** in the GitHub CI. Run it locally with the model installed and `LIBTROPIC` pointing at a libtropic checkout:
+**Live model integration.** A suite drives `se-driver` end-to-end against the official TROPIC01 model (`ts-tvl`): the real Noise KK1 handshake and AES-GCM codec run against an independent implementation of the chip. The GitHub coverage job clones libtropic (pinned to a tag + commit), installs the model, and runs these under coverage, so the library paths they exercise count toward the line floor (the test-harness files are excluded from the report). Locally:
 
 ```sh
-crates/se-driver/scripts/model-itest.sh        # direct
-LIBTROPIC=/path/to/libtropic scripts/ci-local.sh   # as an optional ci-local stage
+crates/se-driver/scripts/model-itest.sh            # just the live tests
+LIBTROPIC=/path/to/libtropic scripts/ci-local.sh   # coverage then includes them
 ```
+
+The model needs Python and a one-time install (`scripts/tropic01_model/install_linux.sh` in the libtropic checkout). Without `LIBTROPIC`, the local coverage stage stays hermetic and the live tests are skipped.
 
 ## Design principles
 

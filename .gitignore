@@ -5,3 +5,6 @@
 /clippy-report.json
 /cargo-audit.sarif
 /.scannerwork
+
+# TROPIC01 model server runtime artifact (default config-out dump)
+.model_config_save.yaml
