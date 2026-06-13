@@ -385,6 +385,69 @@ fn mac_and_destroy_returns_an_output()
     assert_eq!(out.expose().len(), 32);
 }
 
+#[test]
+fn rmem_erase_allows_rewriting_a_slot()
+{
+    // The real erase-then-write flow: a second write to a written slot fails
+    // (SlotNotEmpty), but after an erase the slot rewrites and reads back the new
+    // value. This exercises 0x42 end to end against the model.
+    let mut se = fresh_session();
+    let slot = RMemSlot::new(11).unwrap();
+    se.rmem_write(slot, b"first value").expect("first write");
+    assert!(se.rmem_write(slot, b"second").is_err(), "rewrite without erase must fail");
+    se.rmem_erase(slot).expect("erase");
+    se.rmem_write(slot, b"value after erase").expect("write after erase");
+    let mut out = [0u8; 512];
+    let n = se.rmem_read_into(slot, &mut out).expect("read back");
+    assert_eq!(&out[..n], b"value after erase");
+}
+
+#[test]
+fn mcounter_init_update_get_decrements_by_one()
+{
+    // init sets the counter, get reads it back, update decrements by one. This
+    // exercises 0x80 and 0x81 end to end and checks the decrement semantics
+    // against the model (conformance, not the in-repo mock).
+    let mut se = fresh_session();
+    let idx = MCounterIdx::new(1).unwrap();
+    se.mcounter_init(idx, 100).expect("init");
+    assert_eq!(se.mcounter_get(idx).expect("get after init"), 100);
+    se.mcounter_update(idx).expect("update");
+    assert_eq!(se.mcounter_get(idx).expect("get after update"), 99);
+}
+
+#[test]
+fn mcounter_update_uninitialized_is_recoverable()
+{
+    // Updating a counter that was never initialized surfaces a recoverable error
+    // (CounterInvalid). The session must survive.
+    let mut se = fresh_session();
+    let idx = MCounterIdx::new(3).unwrap();
+    let res = se.mcounter_update(idx);
+    assert!(res.is_err(), "update on an uninitialized counter must fail");
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session alive after counter error");
+    assert_eq!(&out, b"live");
+}
+
+#[test]
+fn mcounter_update_to_zero_then_underflow_is_recoverable()
+{
+    // Initialize to 1, decrement to 0, then a further decrement underflows and
+    // surfaces a recoverable error (UpdateErr per the user-API table). The
+    // session stays live throughout.
+    let mut se = fresh_session();
+    let idx = MCounterIdx::new(4).unwrap();
+    se.mcounter_init(idx, 1).expect("init to 1");
+    se.mcounter_update(idx).expect("decrement to 0");
+    assert_eq!(se.mcounter_get(idx).expect("get"), 0);
+    let underflow = se.mcounter_update(idx);
+    assert!(underflow.is_err(), "decrement below zero must fail");
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session alive after underflow");
+    assert_eq!(&out, b"live");
+}
+
 // helpers
 
 /// Decodes a 64-char hex string to 32 bytes at compile time.

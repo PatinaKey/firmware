@@ -374,6 +374,48 @@ pub trait SeCommands
         input: &[u8; 32],
     )
     -> Result<MacAndDestroyOutput, SeError>;
+
+    /// Erases R-Memory `slot`, clearing it for a fresh write.
+    ///
+    /// A write requires an empty slot, so a rewrite is erase-then-write. The
+    /// slot range (0..=511) is enforced by `RMemSlot::new`. A non-OK RESULT
+    /// keeps the session live and surfaces as a recoverable `SeError`.
+    fn rmem_erase
+    (
+        &mut self,
+        slot: RMemSlot,
+    )
+    -> Result<(), SeError>;
+
+    /// Initializes monotonic counter `idx` to `value`.
+    ///
+    /// The anti-clone counters must be initialized before a decrement. The index
+    /// range (0..=15) is enforced by `MCounterIdx::new`; any 32-bit `value` is
+    /// accepted. A non-OK RESULT keeps the session live.
+    ///
+    /// PROVISIONING ONLY. Init can re-set a counter to a higher value and defeat
+    /// the anti-rollback guarantee, so the caller must invoke it only during
+    /// provisioning, never in normal operation. The driver enforces no policy.
+    fn mcounter_init
+    (
+        &mut self,
+        idx: MCounterIdx,
+        value: u32,
+    )
+    -> Result<(), SeError>;
+
+    /// Decrements monotonic counter `idx` by one.
+    ///
+    /// The decrement is fixed at one. A counter already at zero surfaces as a
+    /// recoverable `L3Error::Result(UpdateErr)`, and an uninitialized or locked
+    /// counter as `L3Error::Result(CounterInvalid)`; both keep the session live.
+    /// The index range (0..=15) is enforced by `MCounterIdx::new`.
+    fn mcounter_update
+    (
+        &mut self,
+        idx: MCounterIdx,
+    )
+    -> Result<(), SeError>;
 }
 
 #[cfg(test)]
