@@ -48,11 +48,11 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | TRNG | `random_into` (RandomValueGet, 0x50) |
 | ECC keys | `ecc_key_generate` (0x60), `ecc_public_key` (0x62, returns the chip-attested curve) |
 | Signing | `ecdsa_sign` (0x70, P-256), `eddsa_sign` (0x71, Ed25519) |
-| User memory | `rmem_read_into` (0x41), `rmem_write` (0x40) |
-| Counters | `mcounter_get` (0x82) |
+| User memory | `rmem_read_into` (0x41), `rmem_write` (0x40), `rmem_erase` (0x42) |
+| Counters | `mcounter_get` (0x82), `mcounter_init` (0x80), `mcounter_update` (0x81) |
 | PIN primitive | `mac_and_destroy` (0x90), output wrapped in a zeroize-on-drop secret type |
 
-These nine commands are exposed through the public `SeCommands` trait, the only
+These twelve commands are exposed through the public `SeCommands` trait, the only
 surface the FIDO2 / OpenPGP / PKCS#11 layers consume.
 
 ## Validation against real libtropic
@@ -73,8 +73,8 @@ robustness.
 | `open_session` (handshake) | Yes - real Noise KK1, every live test depends on it |
 | `ping` | Yes - small + a 600-byte payload (live 3-chunk L2 SEND) |
 | `random_into` | Yes - fills the requested buffer |
-| `rmem_write` / `rmem_read_into` | Yes - round-trips data. Re-write surfaces `SlotNotEmpty` (recoverable) |
-| `mcounter_get` | Yes - uninitialized counter surfaces `CounterInvalid` (recoverable) |
+| `rmem_write` / `rmem_read_into` / `rmem_erase` | Yes - round-trips data. Re-write surfaces `SlotNotEmpty` (recoverable). Erase clears a slot for a fresh write |
+| `mcounter_get` / `mcounter_init` / `mcounter_update` | Yes - init/update/get decrements by one. Uninitialized counter and an underflow past zero are both recoverable |
 | `ecc_key_generate` / `ecc_public_key` | Yes - P-256 (64 B) and Ed25519 (32 B). Empty slot surfaces `InvalidKey` (recoverable) |
 | `ecdsa_sign` / `eddsa_sign` | Yes - returns a 64-byte signature |
 | `mac_and_destroy` | Yes - returns the 32-byte secret output |
@@ -93,8 +93,6 @@ requires (almost everything). The rest matters for a general-purpose driver.
 | Block | Commands | What it is for | Needed by PatinaKey |
 |-------|----------|----------------|:---:|
 | Key import / erase | `EccKeyStore` 0x61, `EccKeyErase` 0x63 | Import an external Ed25519 key, erase a slot - the imported-key SSH / OpenPGP path | Yes |
-| Memory erase | `RMemDataErase` 0x42 | Erase a user-memory slot before rewrite (`rmem_write` requires it) | Yes |
-| Counter lifecycle | `McounterInit` 0x80, `McounterUpdate` 0x81 | Monotonic counter for the FIDO2 signature counter (anti-cloning) | Yes |
 | Chip info / attestation | `Get_Info` (L2) | X.509 certificate chain, CHIP_ID, firmware versions, FW bank | Yes |
 | Provisioning - pairing | `PairingKeyWrite/Read/Invalidate` 0x10-0x12 | Provision host pairing keys into the chip's 4 slots | Factory / setup |
 | Provisioning - config | `R-Config` 0x20-0x22, `I-Config` 0x30-0x31 | Reversible / irreversible config objects, access privileges (CFG_UAP) | Factory / setup |
