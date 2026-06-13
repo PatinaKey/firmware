@@ -978,6 +978,106 @@ where
         // RES_DATA = PADDING(3) || DATA_OUT(32) = 35 bytes (fixed).
         self.run(MAC_DESTROY_CMD_LEN, Some(MAC_DESTROY_RES_DATA_LEN), parse_mac_destroy)
     }
+
+    /// Erases R-Memory user-data `slot`, clearing it for a fresh write.
+    ///
+    /// Inherent twin of `SeCommands::rmem_erase`. An `rmem_write` requires the
+    /// target slot to be empty, so a rewrite is erase-then-write. The slot range
+    /// is enforced by `RMemSlot::new`. Returns `Ok(())` on an erased slot.
+    ///
+    /// The command has no RES_DATA, so it declares `Some(0)`: an OK result that
+    /// carries any payload is a structural anomaly and poisons the session. A
+    /// non-OK RESULT (FAIL, UNAUTHORIZED, ...) is a valid authenticated reply: it
+    /// surfaces as `L3Error::Result` and keeps the session live, mirroring
+    /// libtropic. A bad tag, CRC, alarm, or empty result poisons the session.
+    pub(crate) fn rmem_erase(&mut self, slot: RMemSlot) -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || UDATA_SLOT(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::RMemDataErase as u8;
+            let slot_bytes = slot.get().to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(3, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Initializes monotonic counter `idx` to `value`.
+    ///
+    /// Inherent twin of `SeCommands::mcounter_init`. The chip's anti-clone
+    /// counters must be initialized before a decrement. The index range is
+    /// enforced by `MCounterIdx`; any 32-bit `value` is accepted. Returns
+    /// `Ok(())` on an initialized counter.
+    ///
+    /// PROVISIONING ONLY. Init can re-set a counter to any value, including a
+    /// higher one, which would defeat the anti-rollback guarantee. The upper
+    /// layer must call this only during provisioning and never during normal
+    /// operation; the driver is a faithful transport and enforces no such policy.
+    ///
+    /// The command has no RES_DATA, so it declares `Some(0)`: an OK result
+    /// carrying any payload poisons the session. A non-OK RESULT is a valid
+    /// authenticated reply: it surfaces as `L3Error::Result` and keeps the
+    /// session live, mirroring libtropic. A bad tag, CRC, alarm, or empty result
+    /// poisons the session.
+    pub(crate) fn mcounter_init(&mut self, idx: MCounterIdx, value: u32) -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (8 bytes): CMD_ID || MCOUNTER_INDEX(u16 LE) ||
+        // PADDING(1, 0) || MCOUNTER_VAL(u32 LE). libtropic never writes the
+        // padding byte, so zero it here explicitly.
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::McounterInit as u8;
+            let index = u16::from(idx.get()).to_le_bytes();
+            cmd[1] = index[0];
+            cmd[2] = index[1];
+            cmd[3] = 0;
+            cmd[MCOUNTER_INIT_HEADER..MCOUNTER_INIT_CMD_LEN]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(MCOUNTER_INIT_CMD_LEN, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Decrements monotonic counter `idx` by one.
+    ///
+    /// Inherent twin of `SeCommands::mcounter_update`. The decrement is fixed at
+    /// one (the command carries no amount). The index range is enforced by
+    /// `MCounterIdx`. Returns `Ok(())` on a successful decrement.
+    ///
+    /// Two non-OK RESULTs are expected and recoverable, mirroring libtropic: a
+    /// counter already at zero replies `UpdateErr` (a decrement would underflow),
+    /// and an uninitialized or locked counter replies `CounterInvalid`. Both
+    /// surface as `L3Error::Result` and keep the session live. The command has no
+    /// RES_DATA, so it declares `Some(0)`: an OK result carrying any payload
+    /// poisons the session. A bad tag, CRC, alarm, or empty result poisons the
+    /// session.
+    pub(crate) fn mcounter_update(&mut self, idx: MCounterIdx) -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || MCOUNTER_INDEX(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::McounterUpdate as u8;
+            let index = u16::from(idx.get()).to_le_bytes();
+            cmd[1] = index[0];
+            cmd[2] = index[1];
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(3, Some(0), |_res_data| Ok(()))
+    }
 }
 
 /// The high-level command port over an active session.
@@ -1085,6 +1185,37 @@ where
     {
         self.mac_and_destroy(slot, input)
     }
+
+    fn rmem_erase
+    (
+        &mut self,
+        slot: RMemSlot,
+    )
+    -> Result<(), SeError>
+    {
+        self.rmem_erase(slot)
+    }
+
+    fn mcounter_init
+    (
+        &mut self,
+        idx: MCounterIdx,
+        value: u32,
+    )
+    -> Result<(), SeError>
+    {
+        self.mcounter_init(idx, value)
+    }
+
+    fn mcounter_update
+    (
+        &mut self,
+        idx: MCounterIdx,
+    )
+    -> Result<(), SeError>
+    {
+        self.mcounter_update(idx)
+    }
 }
 
 /// Parses a sign result `PADDING(15) || R(32) || S(32)` into a `Signature`.
@@ -1187,6 +1318,19 @@ const MAC_DESTROY_RES_PADDING: usize = 3;
 
 /// MAC-and-Destroy result RES_DATA length: PADDING(3) || DATA_OUT(32).
 const MAC_DESTROY_RES_DATA_LEN: usize = MAC_DESTROY_RES_PADDING + 32;
+
+/// McounterInit command header length: CMD_ID(1) || MCOUNTER_INDEX(2) ||
+/// PADDING(1). The u32 init value follows this header.
+///
+/// Source: libtropic `struct lt_l3_mcounter_init_cmd_t` (index u16, then a
+/// padding byte before `mcounter_val`).
+const MCOUNTER_INIT_HEADER: usize = 4;
+
+/// McounterInit command plaintext length: header(4) || MCOUNTER_VAL(u32 LE).
+///
+/// Source: libtropic `TR01_L3_MCOUNTER_INIT_CMD_SIZE` (CMD_ID + index + padding
+/// + 4-byte value = 8).
+const MCOUNTER_INIT_CMD_LEN: usize = MCOUNTER_INIT_HEADER + 4;
 
 // Compile-time invariant: the maximum EdDSA wire packet fills the L3 buffer
 // exactly. The packet is 2 (L3 CMD_SIZE prefix) || SIGN_CMD_HEADER ||
@@ -2543,6 +2687,269 @@ mod tests
     }
 
     #[test]
+    fn rmem_erase_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.rmem_erase(rslot(7)), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn rmem_erase_non_ok_result_is_recoverable()
+    {
+        // A FAIL result is a valid authenticated reply: the error surfaces but
+        // the session stays live and the nonces stay in step.
+        let mut dev = open(ChipFault::ResultFail);
+        assert_eq!
+        (
+            dev.rmem_erase(rslot(2)),
+            Err(SeError::L3(L3Error::Result(L3Status::Fail)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.rmem_erase(rslot(2));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Fail))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn rmem_erase_extra_result_byte_poisons_session()
+    {
+        // rmem_erase is a Some(0) command: it expects no RES_DATA. One unexpected
+        // byte trips the expected-length check and poisons. Guards a regression
+        // to None with a trivial closure.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!(dev.rmem_erase(rslot(0)), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_erase_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.rmem_erase(rslot(0)), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_erase_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.rmem_erase(rslot(0)), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_erase_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.rmem_erase(rslot(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn rmem_erase_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.rmem_erase(rslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_init_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.mcounter_init(mc(0), 0x0102_0304), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        // A second init at the max index and max value also round-trips, proving
+        // the 8-byte plaintext (including the u32 value) reaches the chip.
+        assert_eq!(dev.mcounter_init(mc(15), u32::MAX), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+    }
+
+    #[test]
+    fn mcounter_init_non_ok_result_is_recoverable()
+    {
+        let mut dev = open(ChipFault::ResultFail);
+        assert_eq!
+        (
+            dev.mcounter_init(mc(0), 7),
+            Err(SeError::L3(L3Error::Result(L3Status::Fail)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.mcounter_init(mc(0), 7);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Fail))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn mcounter_init_extra_result_byte_poisons_session()
+    {
+        // mcounter_init is a Some(0) command: one unexpected RES_DATA byte trips
+        // the expected-length check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!(dev.mcounter_init(mc(0), 1), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_init_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.mcounter_init(mc(0), 1), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_init_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.mcounter_init(mc(0), 1), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_init_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.mcounter_init(mc(0), 1),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_update_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.mcounter_update(mc(4)), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn mcounter_update_at_zero_is_recoverable()
+    {
+        // UpdateErr (0x13) = the counter is already at zero (a decrement would
+        // underflow). It is a valid authenticated reply per libtropic / user-API
+        // Table 36: the session stays live and the nonces stay in step.
+        let mut dev = open(ChipFault::UpdateErr);
+        assert_eq!
+        (
+            dev.mcounter_update(mc(0)),
+            Err(SeError::L3(L3Error::Result(L3Status::UpdateErr)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.mcounter_update(mc(0));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::UpdateErr))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn mcounter_update_counter_invalid_is_recoverable()
+    {
+        // CounterInvalid (0x14) = an uninitialized or locked counter: a valid
+        // authenticated reply. The session stays live and the nonces stay in step.
+        let mut dev = open(ChipFault::CounterInvalid);
+        assert_eq!
+        (
+            dev.mcounter_update(mc(0)),
+            Err(SeError::L3(L3Error::Result(L3Status::CounterInvalid)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.mcounter_update(mc(0));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::CounterInvalid))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn mcounter_update_extra_result_byte_poisons_session()
+    {
+        // mcounter_update is a Some(0) command: one unexpected RES_DATA byte
+        // trips the expected-length check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!(dev.mcounter_update(mc(0)), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_update_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.mcounter_update(mc(0)), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_update_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.mcounter_update(mc(0)), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_update_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.mcounter_update(mc(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_update_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.mcounter_update(mc(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mcounter_l3_buffer_is_wiped_after_a_successful_init()
+    {
+        let mut dev = open(ChipFault::None);
+        dev.mcounter_init(mc(0), 0xDEAD_BEEF).unwrap();
+        assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "plaintext residue");
+    }
+
+    #[test]
+    fn mixed_mcounter_rmem_erase_sequence_keeps_nonces_in_lockstep()
+    {
+        // An init, an update, an rmem_erase, and a ping each advance both nonces
+        // once across the mixed 2c-command sequence.
+        let mut dev = open(ChipFault::None);
+        let mut buf = [0u8; 16];
+        dev.mcounter_init(mc(2), 50).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        dev.mcounter_update(mc(2)).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        dev.rmem_erase(rslot(3)).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
+        dev.ping_into(b"x", &mut buf).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (4, 4));
+    }
+
+    #[test]
     fn se_commands_trait_dispatch_round_trips()
     {
         // Drive several commands through the SeCommands trait, not the inherent
@@ -2558,6 +2965,9 @@ mod tests
         {
             let mut out = [0u8; 8];
             se.random_into(&mut out)?;
+            se.rmem_erase(RMemSlot::new(3).expect("test slot"))?;
+            se.mcounter_init(MCounterIdx::new(1).expect("test idx"), 9)?;
+            se.mcounter_update(MCounterIdx::new(1).expect("test idx"))?;
             se.mac_and_destroy(slot, input)
         }
 
@@ -2565,8 +2975,9 @@ mod tests
         let input = [0x42u8; 32];
         let out = exercise(&mut dev, mdslot(9), &input).unwrap();
         assert_eq!(out.expose(), &expected_mac_out(9, &input));
-        // random_into then mac_and_destroy each advance both nonces once.
-        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        // random_into, rmem_erase, mcounter_init, mcounter_update, then
+        // mac_and_destroy each advance both nonces once: five round-trips.
+        assert_eq!(dev.spi_ref().nonces(), (5, 5));
     }
 
     #[test]
