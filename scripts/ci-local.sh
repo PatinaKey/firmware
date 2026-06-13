@@ -109,16 +109,27 @@ coverage_stage()
             -o /tmp/ci-local-model-save.yml \
             > /tmp/ci-local-model.log 2>&1 &
         srv=$!
+        local ready=0
         local i
         for i in $(seq 1 50)
         do
             if (exec 3<>"/dev/tcp/127.0.0.1/28992") 2>/dev/null
             then
                 exec 3>&- 3<&-
+                ready=1
                 break
             fi
             sleep 0.2
         done
+        if [ "$ready" -ne 1 ]
+        then
+            echo "ERROR: model_server did not become ready on 127.0.0.1:28992" >&2
+            echo "---- model_server log ----" >&2
+            tail -200 /tmp/ci-local-model.log >&2 || true
+            kill "$srv" 2>/dev/null || true
+            wait "$srv" 2>/dev/null || true
+            return 1
+        fi
         feature_args=(--features model-itest)
         echo "coverage includes the live model integration tests"
     else
