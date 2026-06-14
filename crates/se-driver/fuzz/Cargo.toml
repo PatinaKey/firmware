@@ -38,3 +38,10 @@ path = "fuzz_targets/parse_handshake_resp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "parse_stpub"
+path = "fuzz_targets/parse_stpub.rs"
+test = false
+doc = false
+bench = false

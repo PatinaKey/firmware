@@ -15,6 +15,7 @@
 #![cfg_attr(not(test), no_std)]
 
 mod buf;
+mod cert;
 mod crc;
 mod crypto;
 mod device;
@@ -34,6 +35,7 @@ mod wait;
 mod test_support;
 
 // Curated public surface. Nothing else is exported.
+pub use crate::cert::parse_stpub;
 pub use crate::device::ActiveSession;
 pub use crate::device::Bootloader;
 pub use crate::device::FwBankId;
@@ -41,6 +43,7 @@ pub use crate::device::NoSession;
 pub use crate::device::SessionConfig;
 pub use crate::device::StartupId;
 pub use crate::device::Tropic01;
+pub use crate::error::CertError;
 pub use crate::error::HandshakeError;
 pub use crate::error::L1Error;
 pub use crate::error::L2Error;
@@ -96,5 +99,12 @@ pub mod fuzz
     pub fn parse_handshake_resp(data: &[u8])
     {
         let _ = crate::device::parse_handshake_resp(data);
+    }
+
+    /// Drives the certificate-store STPUB parser over arbitrary bytes. Must
+    /// never panic.
+    pub fn parse_stpub(data: &[u8])
+    {
+        let _ = crate::cert::parse_stpub(data);
     }
 }

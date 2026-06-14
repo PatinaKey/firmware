@@ -2864,6 +2864,56 @@ fn x509_certificate_rejects_a_short_block()
 }
 
 #[test]
+fn read_chip_stpub_rejects_a_too_small_scratch_before_any_traffic()
+{
+    let mut dev = no_session(GetInfoFault::None);
+    let before = dev.spi_ref().transaction_count();
+    let mut scratch = std::vec![0u8; GET_INFO_CERT_STORE_LEN - 1];
+    assert_eq!(dev.read_chip_stpub(&mut scratch), Err(SeError::BufferTooSmall));
+    // The buffer check is up front: no chip traffic on a too-small scratch.
+    assert_eq!(dev.spi_ref().transaction_count(), before);
+}
+
+#[test]
+fn read_chip_stpub_extracts_stpub_from_a_seeded_store()
+{
+    // A minimal DEVICE cert carrying a known X25519 key, wrapped in a valid
+    // 10-byte store header, seeded into the first cert-store block (the rest of
+    // the 3840-byte store is the chip's natural padding). Proves read_chip_stpub
+    // wires the read into the DER walk end to end on the host mock.
+    const KEY: [u8; 32] = [
+        0x95, 0x08, 0xf0, 0x32, 0x1c, 0xb1, 0xd2, 0xe5, 0xd1, 0xf1, 0xa4, 0x60, 0x9c, 0x05, 0x41,
+        0xb7, 0x80, 0xe6, 0xdd, 0x50, 0xd6, 0x48, 0x2b, 0x6b, 0x08, 0xb2, 0xc2, 0x7e, 0x7b, 0x76,
+        0x26, 0x47,
+    ];
+    // DEVICE cert: SEQUENCE { [0]{INTEGER 1}, OID commonName, OID id-X25519,
+    // BIT STRING 00||KEY } (52 bytes).
+    let mut cert = [0u8; 52];
+    cert[0] = 0x30;
+    cert[1] = 50;
+    cert[2..7].copy_from_slice(&[0xA0, 0x03, 0x02, 0x01, 0x01]);
+    cert[7..12].copy_from_slice(&[0x06, 0x03, 0x55, 0x04, 0x03]);
+    cert[12..17].copy_from_slice(&[0x06, 0x03, 0x2B, 0x65, 0x6E]);
+    cert[17..20].copy_from_slice(&[0x03, 0x21, 0x00]);
+    cert[20..52].copy_from_slice(&KEY);
+    // Store header: version 01, num_certs 04, LEN[0] = 52, LEN[1..4] = 0.
+    let mut block0 = [0u8; 128];
+    block0[0] = 0x01;
+    block0[1] = 0x04;
+    block0[2..4].copy_from_slice(&52u16.to_be_bytes());
+    block0[10..10 + cert.len()].copy_from_slice(&cert);
+
+    let mut dev = no_session(GetInfoFault::None);
+    dev.spi_mut().set_get_info(ObjectId::X509Certificate as u8, 0, &block0);
+    for blk in 1..GET_INFO_CERT_STORE_BLOCKS
+    {
+        dev.spi_mut().set_get_info(ObjectId::X509Certificate as u8, blk as u8, &[0u8; 128]);
+    }
+    let mut scratch = std::vec![0u8; GET_INFO_CERT_STORE_LEN];
+    assert_eq!(dev.read_chip_stpub(&mut scratch), Ok(KEY));
+}
+
+#[test]
 fn riscv_fw_version_returns_four_bytes()
 {
     let mut dev = no_session(GetInfoFault::None);

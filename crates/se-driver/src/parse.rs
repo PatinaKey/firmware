@@ -39,6 +39,16 @@ pub(crate) fn take_le_u16(input: &[u8]) -> Result<(&[u8], u16), ParseError>
     Ok((rest, u16::from_le_bytes(bytes)))
 }
 
+/// Reads a big-endian `u16` from the front of `input`.
+///
+/// Returns `(rest, value)`. Errors when fewer than 2 bytes remain. The X.509
+/// certificate-store header lengths are big-endian, unlike the L2/L3 fields.
+pub(crate) fn take_be_u16(input: &[u8]) -> Result<(&[u8], u16), ParseError>
+{
+    let (rest, bytes) = take_array::<2>(input)?;
+    Ok((rest, u16::from_be_bytes(bytes)))
+}
+
 /// Reads exactly `N` bytes and returns them as a fixed-size array.
 ///
 /// The array type carries the length proof, so callers avoid a second
@@ -109,6 +119,20 @@ mod tests
     fn take_le_u16_short_errors()
     {
         assert_eq!(take_le_u16(&[0x01]), Err(ParseError::UnexpectedEnd));
+    }
+
+    #[test]
+    fn take_be_u16_is_big_endian()
+    {
+        let (rest, v) = take_be_u16(&[0x12, 0x34, 0x99]).unwrap();
+        assert_eq!(v, 0x1234);
+        assert_eq!(rest, &[0x99]);
+    }
+
+    #[test]
+    fn take_be_u16_short_errors()
+    {
+        assert_eq!(take_be_u16(&[0x01]), Err(ParseError::UnexpectedEnd));
     }
 
     #[test]

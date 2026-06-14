@@ -674,6 +674,32 @@ fn get_info_x509_certificate_store_reads_full_3840_bytes()
 }
 
 #[test]
+fn parse_stpub_extracts_pinned_stpub_from_model_cert_store()
+{
+    // Byte-exact proof against the independent ts-tvl model: read the real cert
+    // store, walk the DEVICE certificate's DER, and assert the extracted STPUB
+    // equals the model's pinned chip static key. A wrong header parse, DER walk,
+    // crop, or byte order would yield the wrong 32 bytes.
+    let mut dev = fresh_no_session();
+    let mut store = [0u8; 3840];
+    let n = dev.x509_certificate_into(&mut store).expect("x509 cert store");
+    assert_eq!(n, 3840);
+    let stpub = se_driver::parse_stpub(&store).expect("parse STPUB from model cert store");
+    assert_eq!(stpub, STPUB, "extracted STPUB must match the model's pinned key");
+}
+
+#[test]
+fn read_chip_stpub_returns_pinned_stpub()
+{
+    // The ergonomic helper reads the store and extracts STPUB in one call, using
+    // a caller-provided 3840-byte scratch buffer.
+    let mut dev = fresh_no_session();
+    let mut scratch = [0u8; 3840];
+    let stpub = dev.read_chip_stpub(&mut scratch).expect("read_chip_stpub");
+    assert_eq!(stpub, STPUB, "read_chip_stpub must match the model's pinned key");
+}
+
+#[test]
 fn get_info_fw_bank_needs_maintenance_mode()
 {
     // FW_BANK is readable ONLY in Start-up (Maintenance) Mode. fresh_no_session
