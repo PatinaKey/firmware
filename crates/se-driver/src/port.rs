@@ -146,6 +146,34 @@ impl MCounterIdx
     }
 }
 
+/// A pairing key slot index (0..=3).
+///
+/// The private field encodes the valid range. `new` rejects an out-of-range
+/// value with `InvalidArgument`, so no command can send a bad slot to the chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingKeySlot(u8);
+
+impl PairingKeySlot
+{
+    /// Builds a slot index, rejecting any value above 3.
+    ///
+    /// Errors with `InvalidArgument` outside 0..=3.
+    pub const fn new(value: u8) -> Result<Self, SeError>
+    {
+        if value > 3
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        Ok(PairingKeySlot(value))
+    }
+
+    /// Returns the wire index.
+    pub(crate) const fn get(self) -> u8
+    {
+        self.0
+    }
+}
+
 /// A MAC-and-Destroy PIN-attempt slot index (0..=127).
 ///
 /// The private field encodes the valid range. `new` rejects an out-of-range
@@ -168,6 +196,148 @@ impl MacDestroySlot
     }
 
     /// Returns the wire index.
+    pub(crate) const fn get(self) -> u8
+    {
+        self.0
+    }
+}
+
+/// A named TROPIC01 configuration object (CO) register.
+///
+/// Each variant is one CO address the R-Config / I-Config commands target. The
+/// type is the whitelist: an out-of-range or unnamed address cannot be
+/// constructed, so it can never reach the wire (the role libtropic's runtime
+/// `conf_addr_valid` plays, enforced here BY THE TYPE). `wire_addr` yields the
+/// u16 address sent in the command. Addresses match libtropic
+/// `tropic01_bootloader_co.h` / `tropic01_application_co.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigObjectAddr
+{
+    // Bootloader / Application configuration.
+    /// Start-up behaviour.
+    CfgStartUp,
+    /// Tamper sensor configuration.
+    CfgSensors,
+    /// Debug-interface configuration.
+    CfgDebug,
+    /// General-purpose output configuration.
+    CfgGpo,
+    /// Sleep-mode configuration.
+    CfgSleepMode,
+
+    // UAP (user access privileges): which pairing keys may run each command.
+    /// UAP for PairingKeyWrite.
+    CfgUapPairingKeyWrite,
+    /// UAP for PairingKeyRead.
+    CfgUapPairingKeyRead,
+    /// UAP for PairingKeyInvalidate.
+    CfgUapPairingKeyInvalidate,
+    /// UAP for both R-Config write AND erase (one register gates both).
+    CfgUapRConfigWriteErase,
+    /// UAP for R-Config read.
+    CfgUapRConfigRead,
+    /// UAP for I-Config write (the irreversible bit-burn command).
+    CfgUapIConfigWrite,
+    /// UAP for I-Config read.
+    CfgUapIConfigRead,
+
+    // UAP for the functional L3 commands.
+    /// UAP for Ping.
+    CfgUapPing,
+    /// UAP for R-Memory data write.
+    CfgUapRMemDataWrite,
+    /// UAP for R-Memory data read.
+    CfgUapRMemDataRead,
+    /// UAP for R-Memory data erase.
+    CfgUapRMemDataErase,
+    /// UAP for RandomValueGet.
+    CfgUapRandomValueGet,
+    /// UAP for EccKeyGenerate.
+    CfgUapEccKeyGenerate,
+    /// UAP for EccKeyStore.
+    CfgUapEccKeyStore,
+    /// UAP for EccKeyRead.
+    CfgUapEccKeyRead,
+    /// UAP for EccKeyErase.
+    CfgUapEccKeyErase,
+    /// UAP for EcdsaSign.
+    CfgUapEcdsaSign,
+    /// UAP for EddsaSign.
+    CfgUapEddsaSign,
+    /// UAP for McounterInit.
+    CfgUapMcounterInit,
+    /// UAP for McounterGet.
+    CfgUapMcounterGet,
+    /// UAP for McounterUpdate.
+    CfgUapMcounterUpdate,
+    /// UAP for MacAndDestroy (the PIN primitive).
+    CfgUapMacAndDestroy,
+}
+
+impl ConfigObjectAddr
+{
+    /// Returns the u16 CO address sent on the wire.
+    ///
+    /// Source: libtropic `tropic01_bootloader_co.h` /
+    /// `tropic01_application_co.h`.
+    pub(crate) const fn wire_addr(self) -> u16
+    {
+        match self
+        {
+            ConfigObjectAddr::CfgStartUp => 0x0000,
+            ConfigObjectAddr::CfgSensors => 0x0008,
+            ConfigObjectAddr::CfgDebug => 0x0010,
+            ConfigObjectAddr::CfgGpo => 0x0014,
+            ConfigObjectAddr::CfgSleepMode => 0x0018,
+            ConfigObjectAddr::CfgUapPairingKeyWrite => 0x0020,
+            ConfigObjectAddr::CfgUapPairingKeyRead => 0x0024,
+            ConfigObjectAddr::CfgUapPairingKeyInvalidate => 0x0028,
+            ConfigObjectAddr::CfgUapRConfigWriteErase => 0x0030,
+            ConfigObjectAddr::CfgUapRConfigRead => 0x0034,
+            ConfigObjectAddr::CfgUapIConfigWrite => 0x0040,
+            ConfigObjectAddr::CfgUapIConfigRead => 0x0044,
+            ConfigObjectAddr::CfgUapPing => 0x0100,
+            ConfigObjectAddr::CfgUapRMemDataWrite => 0x0110,
+            ConfigObjectAddr::CfgUapRMemDataRead => 0x0114,
+            ConfigObjectAddr::CfgUapRMemDataErase => 0x0118,
+            ConfigObjectAddr::CfgUapRandomValueGet => 0x0120,
+            ConfigObjectAddr::CfgUapEccKeyGenerate => 0x0130,
+            ConfigObjectAddr::CfgUapEccKeyStore => 0x0134,
+            ConfigObjectAddr::CfgUapEccKeyRead => 0x0138,
+            ConfigObjectAddr::CfgUapEccKeyErase => 0x013C,
+            ConfigObjectAddr::CfgUapEcdsaSign => 0x0140,
+            ConfigObjectAddr::CfgUapEddsaSign => 0x0144,
+            ConfigObjectAddr::CfgUapMcounterInit => 0x0150,
+            ConfigObjectAddr::CfgUapMcounterGet => 0x0154,
+            ConfigObjectAddr::CfgUapMcounterUpdate => 0x0158,
+            ConfigObjectAddr::CfgUapMacAndDestroy => 0x0160,
+        }
+    }
+}
+
+/// An I-Config bit index (0..=31).
+///
+/// The private field encodes the valid range. `new` rejects an out-of-range
+/// value with `InvalidArgument`, so no command can send a bad bit index to the
+/// chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigBitIndex(u8);
+
+impl ConfigBitIndex
+{
+    /// Builds a bit index, rejecting any value above 31.
+    ///
+    /// Errors with `InvalidArgument` outside 0..=31.
+    pub const fn new(value: u8) -> Result<Self, SeError>
+    {
+        if value > 31
+        {
+            return Err(SeError::InvalidArgument);
+        }
+        Ok(ConfigBitIndex(value))
+    }
+
+    /// Returns the wire bit index.
     pub(crate) const fn get(self) -> u8
     {
         self.0
@@ -450,6 +620,132 @@ pub trait SeCommands
         idx: MCounterIdx,
     )
     -> Result<(), SeError>;
+
+    /// Writes the host pairing public key `public_key` into pairing `slot`.
+    ///
+    /// Provisions one of the four pairing slots the handshake authenticates
+    /// against (`SessionConfig.shipub` / `pkey_index` select the slot chip-side).
+    /// `public_key` is the 32-byte host static pairing PUBLIC key (`S_HiPub`),
+    /// not a secret. The slot range (0..=3) is enforced by `PairingKeySlot::new`.
+    /// A non-OK RESULT (HardwareFail on an OTP write error that permanently
+    /// invalidates the slot, plus Unauthorized / Fail) keeps the session live and
+    /// surfaces as a recoverable `SeError`.
+    ///
+    /// PROVISIONING ONLY. Overwriting the slot named by the session `pkey_index`
+    /// (the active handshake key) can permanently prevent re-establishing a secure
+    /// channel.
+    fn pairing_key_write
+    (
+        &mut self,
+        slot: PairingKeySlot,
+        public_key: &[u8; 32],
+    )
+    -> Result<(), SeError>;
+
+    /// Reads the host pairing public key stored in pairing `slot`.
+    ///
+    /// Returns the slot's 32-byte public pairing key (`S_HiPub`) by value. The
+    /// slot range (0..=3) is enforced by `PairingKeySlot::new`. A non-OK RESULT
+    /// (SlotEmpty on an unprovisioned slot, SlotInvalid on an invalidated one,
+    /// plus Unauthorized / Fail) keeps the session live and surfaces as a
+    /// recoverable `SeError`.
+    fn pairing_key_read
+    (
+        &mut self,
+        slot: PairingKeySlot,
+    )
+    -> Result<[u8; 32], SeError>;
+
+    /// Invalidates pairing `slot`, blocking future handshakes against it.
+    ///
+    /// The slot range (0..=3) is enforced by `PairingKeySlot::new`. A non-OK
+    /// RESULT (HardwareFail on an OTP write error, plus Unauthorized / Fail)
+    /// keeps the session live and surfaces as a recoverable `SeError`.
+    ///
+    /// PROVISIONING ONLY. Invalidating the slot named by the session `pkey_index`
+    /// (the active handshake key) can permanently prevent re-establishing a secure
+    /// channel.
+    fn pairing_key_invalidate
+    (
+        &mut self,
+        slot: PairingKeySlot,
+    )
+    -> Result<(), SeError>;
+
+    /// Writes the 32-bit `value` to R-Config object `addr`.
+    ///
+    /// R-Config is the reversible working copy of the chip configuration. A
+    /// write here can be undone by an erase, unlike I-Config. A non-OK RESULT
+    /// (Unauthorized, Fail, ...) keeps the session live and surfaces as a
+    /// recoverable `SeError`.
+    ///
+    /// The final configuration the chip enforces is the bitwise AND of I-Config
+    /// and R-Config, applied AFTER the next boot. `CfgUapRConfigWriteErase` gates
+    /// both this write and `r_config_erase` (one UAP register for both).
+    fn r_config_write
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+        value: u32,
+    )
+    -> Result<(), SeError>;
+
+    /// Reads the 32-bit value of R-Config object `addr`.
+    ///
+    /// Returns the reversible working-copy value. A non-OK RESULT keeps the
+    /// session live and surfaces as a recoverable `SeError`.
+    fn r_config_read
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+    )
+    -> Result<u32, SeError>;
+
+    /// Erases the ENTIRE R-Config, setting every object back to all-ones.
+    ///
+    /// This is NOT a per-object erase: it wipes the WHOLE R-Config (all
+    /// configuration objects to all-1s) in one command. A caller expecting to
+    /// clear a single object will instead reset the entire reversible config.
+    /// `CfgUapRConfigWriteErase` gates both this erase and `r_config_write`.
+    fn r_config_erase
+    (
+        &mut self,
+    )
+    -> Result<(), SeError>;
+
+    /// Burns a single bit of I-Config object `addr` from 1 to 0.
+    ///
+    /// SECURITY: I-Config is OTP / IRREVERSIBLE. A bit only flips 1 -> 0 and can
+    /// NEVER be restored. There is NO I-Config erase. The chip enforces the
+    /// bitwise AND of I-Config and R-Config AFTER the next boot. Burning all
+    /// access bits of a `CfgUap*` object to 0 PERMANENTLY disables that command
+    /// for every pairing key. The chip's response to re-writing an
+    /// already-cleared bit is unspecified by the TROPIC01 documentation, so the
+    /// caller must not rely on a particular status.
+    ///
+    /// PROVISIONING ONLY. The bit range (0..=31) is enforced by
+    /// `ConfigBitIndex::new`. A non-OK RESULT keeps the session live and surfaces
+    /// as a recoverable `SeError`, EXCEPT that a HardwareFail on an I-Config write
+    /// is fatal on real silicon (the chip enters ALARM). The driver enforces no
+    /// policy on when this runs.
+    fn i_config_write
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+        bit: ConfigBitIndex,
+    )
+    -> Result<(), SeError>;
+
+    /// Reads the 32-bit value of I-Config object `addr`.
+    ///
+    /// Returns the irreversible-config value. A non-OK RESULT keeps the session
+    /// live and surfaces as a recoverable `SeError`.
+    fn i_config_read
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+    )
+    -> Result<u32, SeError>;
 }
 
 #[cfg(test)]
@@ -486,6 +782,13 @@ mod tests
     }
 
     #[test]
+    fn pairing_key_slot_accepts_max_and_rejects_one_past()
+    {
+        assert_eq!(PairingKeySlot::new(3).map(|s| s.get()), Ok(3));
+        assert_eq!(PairingKeySlot::new(4), Err(SeError::InvalidArgument));
+    }
+
+    #[test]
     fn ecc_curve_wire_bytes_match_libtropic()
     {
         assert_eq!(EccCurve::P256.wire_byte(), 0x01);
@@ -517,5 +820,30 @@ mod tests
         assert_eq!(EccCurve::from_wire_byte(0x00), None);
         assert_eq!(EccCurve::from_wire_byte(0x03), None);
         assert_eq!(EccCurve::from_wire_byte(0xFF), None);
+    }
+
+    #[test]
+    fn config_bit_index_accepts_max_and_rejects_one_past()
+    {
+        assert_eq!(ConfigBitIndex::new(31).map(|b| b.get()), Ok(31));
+        assert_eq!(ConfigBitIndex::new(32), Err(SeError::InvalidArgument));
+    }
+
+    #[test]
+    fn config_object_addr_wire_addrs_match_libtropic()
+    {
+        // Source: libtropic tropic01_bootloader_co.h / tropic01_application_co.h.
+        assert_eq!(ConfigObjectAddr::CfgStartUp.wire_addr(), 0x0000);
+        assert_eq!(ConfigObjectAddr::CfgSensors.wire_addr(), 0x0008);
+        assert_eq!(ConfigObjectAddr::CfgDebug.wire_addr(), 0x0010);
+        assert_eq!(ConfigObjectAddr::CfgGpo.wire_addr(), 0x0014);
+        assert_eq!(ConfigObjectAddr::CfgSleepMode.wire_addr(), 0x0018);
+        assert_eq!(ConfigObjectAddr::CfgUapPairingKeyWrite.wire_addr(), 0x0020);
+        assert_eq!(ConfigObjectAddr::CfgUapRConfigWriteErase.wire_addr(), 0x0030);
+        assert_eq!(ConfigObjectAddr::CfgUapIConfigWrite.wire_addr(), 0x0040);
+        assert_eq!(ConfigObjectAddr::CfgUapIConfigRead.wire_addr(), 0x0044);
+        assert_eq!(ConfigObjectAddr::CfgUapPing.wire_addr(), 0x0100);
+        assert_eq!(ConfigObjectAddr::CfgUapEccKeyErase.wire_addr(), 0x013C);
+        assert_eq!(ConfigObjectAddr::CfgUapMacAndDestroy.wire_addr(), 0x0160);
     }
 }

@@ -33,10 +33,13 @@ use zeroize::Zeroizing;
 
 use se_driver::EccCurve;
 use se_driver::EccSlot;
+use se_driver::FwBankId;
 use se_driver::MCounterIdx;
 use se_driver::MacDestroySlot;
+use se_driver::PairingKeySlot;
 use se_driver::RMemSlot;
 use se_driver::SeCommands;
+use se_driver::SeError;
 use se_driver::SeWait;
 use se_driver::SessionConfig;
 use se_driver::StartupId;
@@ -214,15 +217,26 @@ impl SeWait for NoWait
     }
 }
 
-/// Opens a fresh, reset, app-mode secure session against the model.
-fn fresh_session() -> Tropic01<ModelSpi, NoWait, se_driver::ActiveSession>
+/// Resets the model and reboots it into Application FW, leaving a `NoSession`
+/// handle (before `open_session`).
+///
+/// Get_Info is a plain L2 command that runs in `NoSession` (reading the device
+/// certificate to obtain STPUB happens this way, before any secure channel), so
+/// the Get_Info live tests use this rather than `fresh_session`.
+fn fresh_no_session() -> Tropic01<ModelSpi, NoWait, se_driver::NoSession>
 {
     let mut spi = ModelSpi::connect();
     spi.reset_target();
     let mut dev = Tropic01::new(spi, NoWait);
     // Chip boots in Start-up Mode; reboot into Application FW (driver public API).
     dev.reboot(StartupId::Reboot).expect("reboot into Application FW");
+    dev
+}
 
+/// Opens a fresh, reset, app-mode secure session against the model.
+fn fresh_session() -> Tropic01<ModelSpi, NoWait, se_driver::ActiveSession>
+{
+    let dev = fresh_no_session();
     let ehpriv = Zeroizing::new(EHPRIV);
     let shipriv = Zeroizing::new(SHIPRIV);
     let cfg = SessionConfig
@@ -523,6 +537,161 @@ fn ecc_key_erase_clears_a_slot()
     let mut out = [0u8; 4];
     se.ping_into(b"live", &mut out).expect("session alive after erase");
     assert_eq!(&out, b"live");
+}
+
+#[test]
+fn pairing_key_read_slot0_returns_the_prod0_host_pubkey()
+{
+    // STRONG conformance proof: slot 0 holds the prod0 host pairing public key
+    // (the handshake authenticates against it). The read must return exactly
+    // SHIPUB (libtropic lt_sh0pub_prod0), which proves the byte order and the
+    // 3-byte padding skip are correct. Read-only: it never disturbs slot 0.
+    let mut se = fresh_session();
+    let key = se.pairing_key_read(PairingKeySlot::new(0).unwrap()).expect("read slot 0");
+    assert_eq!(key, SHIPUB, "slot 0 must hold the prod0 host pairing pubkey");
+}
+
+#[test]
+fn pairing_key_read_empty_slot_is_recoverable()
+{
+    // An unprovisioned pairing slot reads back a recoverable error (SlotEmpty).
+    // The session must survive. Slot 3 is left unprovisioned by the model config.
+    let mut se = fresh_session();
+    let res = se.pairing_key_read(PairingKeySlot::new(3).unwrap());
+    assert!(res.is_err(), "reading an unprovisioned pairing slot must surface an error");
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session alive after pairing slot-empty");
+    assert_eq!(&out, b"live");
+}
+
+#[test]
+fn pairing_key_write_then_read_then_invalidate_round_trip()
+{
+    // Provision an EMPTY non-handshake slot (slot 1), read it back, then
+    // invalidate it. Slot 0 is the active handshake slot and is never touched
+    // here, so this cannot break the running session's pairing. After
+    // invalidation a read must surface a recoverable error (SlotInvalid or
+    // SlotEmpty) with the session still live.
+    let mut se = fresh_session();
+    let slot = PairingKeySlot::new(1).unwrap();
+    // Deterministic non-zero test key (matches the device.rs sample_pairing_key
+    // formula; the two crates cannot share a private test helper).
+    let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+    se.pairing_key_write(slot, &key).expect("write pairing slot 1");
+    let read_back = se.pairing_key_read(slot).expect("read pairing slot 1");
+    assert_eq!(read_back, key, "pairing slot 1 must read back what was written");
+    se.pairing_key_invalidate(slot).expect("invalidate pairing slot 1");
+    let after = se.pairing_key_read(slot);
+    assert!(after.is_err(), "reading an invalidated pairing slot must surface an error");
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session alive after pairing invalidate");
+    assert_eq!(&out, b"live");
+}
+
+// Config objects (R-Config / I-Config, L3)
+
+#[test]
+fn r_config_write_read_erase_round_trip()
+{
+    // Write a known value to a SAFE CO register, read it back, then erase the
+    // whole R-Config and confirm the read returns the all-ones default.
+    //
+    // SAFETY: CfgUapPing gates only the Ping command's access, and a config write
+    // takes effect ONLY after the next boot (app note 006 sec 3.1). The model
+    // never reboots mid-test, so this cannot change the running session's access.
+    // We deliberately AVOID CfgUapRConfigWriteErase, CfgUapIConfigWrite, and the
+    // pairing-key UAPs, any of which could lock the session out of its own
+    // recovery / handshake path.
+    let mut se = fresh_session();
+    let addr = se_driver::ConfigObjectAddr::CfgUapPing;
+    se.r_config_write(addr, 0x0A0B_0C0D).expect("r-config write");
+    assert_eq!(se.r_config_read(addr).expect("r-config read"), 0x0A0B_0C0D);
+    se.r_config_erase().expect("r-config erase (whole config)");
+    // An erased R-Config object reads back as all-ones (every bit set to 1).
+    assert_eq!(se.r_config_read(addr).expect("read after erase"), 0xFFFF_FFFF);
+}
+
+#[test]
+fn i_config_read_returns_a_value()
+{
+    // I-Config is read-only here: reading a CO is always safe. We assert only
+    // that the transport returns a 32-bit value (the exact bits depend on the
+    // model's factory I-Config). The byte order and 3-byte padding skip are
+    // proven byte-exact by the R-Config round-trip above (identical result shape).
+    //
+    // I-Config WRITE is NOT exercised live: it is an OTP, irreversible bit-burn
+    // whose effect is deferred to the next boot (libtropic lt_i_config_write /
+    // app note 006 sec 3.1). The model persists writes to its save file and the
+    // deferred-to-boot semantics make a safe in-session write/read-back
+    // verification unreliable, so a live burn risks silently locking out the
+    // model's pairing/session access for later tests. The write path is fully
+    // covered by the in-repo mock unit tests: i_config_write_request_layout_is_
+    // byte_exact pins the ADDRESS || BIT_INDEX bytes, plus recoverable-status and
+    // every teardown fault.
+    let mut se = fresh_session();
+    let _ = se.i_config_read(se_driver::ConfigObjectAddr::CfgUapPing).expect("i-config read");
+}
+
+// Get_Info (L2, NoSession)
+
+#[test]
+fn get_info_chip_id_reads_128_bytes()
+{
+    // CHIP_ID is one 128-byte Get_Info block, readable in Application FW. The
+    // model populates it, so it must be non-zero.
+    let mut dev = fresh_no_session();
+    let mut out = [0u8; 128];
+    let n = dev.chip_id_into(&mut out).expect("chip id");
+    assert_eq!(n, 128);
+    assert!(out.iter().any(|&b| b != 0), "CHIP_ID must not be all zero");
+}
+
+#[test]
+fn get_info_riscv_and_spect_fw_versions_are_four_bytes()
+{
+    // Both FW versions are 4-byte Get_Info reads. We assert the transport length
+    // only: the exact bytes depend on the model's configured FW build, and in a
+    // non-Application context the high bit may be a sentinel (see riscv/spect docs).
+    let mut dev = fresh_no_session();
+    let riscv = dev.riscv_fw_version().expect("riscv fw version");
+    assert_eq!(riscv.len(), 4);
+    let spect = dev.spect_fw_version().expect("spect fw version");
+    assert_eq!(spect.len(), 4);
+}
+
+#[test]
+fn get_info_x509_certificate_store_reads_full_3840_bytes()
+{
+    // The cert store is 30 * 128 = 3840 raw DER bytes. Reading the whole store
+    // exercises the 30-block loop against the model. The store carries the device
+    // certificate chain, so it must be non-zero. ASN.1 parsing to extract STPUB is
+    // a separate deferred layer (not tested here).
+    let mut dev = fresh_no_session();
+    let mut out = [0u8; 3840];
+    let n = dev.x509_certificate_into(&mut out).expect("x509 cert store");
+    assert_eq!(n, 3840);
+    assert!(out.iter().any(|&b| b != 0), "the cert store must not be all zero");
+}
+
+#[test]
+fn get_info_fw_bank_needs_maintenance_mode()
+{
+    // FW_BANK is readable ONLY in Start-up (Maintenance) Mode. fresh_no_session
+    // reboots into Application FW, where the chip rejects a FW_BANK Get_Info with
+    // an L2 error status. We assert the API is reachable and the rejection is a
+    // recoverable L2 error (no session state to lose). A full Maintenance-mode
+    // FW_BANK read belongs with the bootloader/FW-update slice (increment 2c),
+    // which drives the chip into Maintenance Mode; it is out of scope here.
+    let mut dev = fresh_no_session();
+    let mut out = [0u8; 64];
+    let res = dev.fw_bank_into(FwBankId::Fw1, &mut out);
+    // The rejection must be an L2-layer error (a chip status or a malformed
+    // frame), not a vacuous transport/buffer error. The exact status is left
+    // unpinned so the test does not break on a model status variation.
+    assert!(
+        matches!(res, Err(SeError::L2(_))),
+        "FW_BANK in Application FW mode must fail with an L2 error, got {res:?}"
+    );
 }
 
 // helpers

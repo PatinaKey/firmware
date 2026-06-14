@@ -30,18 +30,22 @@ use crate::ids::CmdId;
 use crate::ids::L2ReqId;
 use crate::ids::L2Status;
 use crate::ids::L3Status;
+use crate::ids::ObjectId;
 use crate::l1;
 use crate::l2::frame;
 use crate::l3;
 use crate::parse::take;
 use crate::parse::take_array;
 use crate::parse::take_u8;
+use crate::port::ConfigBitIndex;
+use crate::port::ConfigObjectAddr;
 use crate::port::EccCurve;
 use crate::port::EccPublicKey;
 use crate::port::EccSlot;
 use crate::port::MCounterIdx;
 use crate::port::MacAndDestroyOutput;
 use crate::port::MacDestroySlot;
+use crate::port::PairingKeySlot;
 use crate::port::RMemSlot;
 use crate::port::SeCommands;
 use crate::port::Signature;
@@ -124,6 +128,42 @@ impl StartupId
     }
 }
 
+/// Which firmware bank a `Get_Info` FW_BANK read targets.
+///
+/// The `Get_Info_Req` BLOCK_INDEX selects the bank for object FW_BANK. The chip
+/// holds two mutable application banks (FW1/FW2) and two SPECT banks
+/// (SPECT1/SPECT2). FW_BANK is readable only in Start-up (Maintenance) Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FwBankId
+{
+    /// First application firmware bank.
+    Fw1,
+    /// Second application firmware bank.
+    Fw2,
+    /// First SPECT firmware bank.
+    Spect1,
+    /// Second SPECT firmware bank.
+    Spect2,
+}
+
+impl FwBankId
+{
+    /// Returns the `Get_Info_Req` BLOCK_INDEX wire byte for this bank.
+    ///
+    /// Source: libtropic `lt_bank_id_t` (`FW_BANK_FW1` 0x01, `FW_BANK_FW2` 0x02,
+    /// `FW_BANK_SPECT1` 0x11, `FW_BANK_SPECT2` 0x12).
+    const fn wire_byte(self) -> u8
+    {
+        match self
+        {
+            FwBankId::Fw1 => 0x01,
+            FwBankId::Fw2 => 0x02,
+            FwBankId::Spect1 => 0x11,
+            FwBankId::Spect2 => 0x12,
+        }
+    }
+}
+
 /// The TROPIC01 device handle.
 ///
 /// Generic over the SPI device port and the wait provider, with a type-state
@@ -180,6 +220,154 @@ where
             return Err(SeError::L2(L2Error::BadFrame));
         }
         Ok(())
+    }
+
+    /// Reads one `Get_Info` block into `out`, returning the RSP_DATA length.
+    ///
+    /// Sends a `Get_Info_Req` (L2 0x01) with REQ_DATA = OBJECT_ID || BLOCK_INDEX
+    /// and copies the response RSP_DATA into `out`. This is the shared L2 body for
+    /// every object type. The per-object response-length handling lives in the
+    /// public wrappers. No secure channel: this runs before `open_session`,
+    /// exactly as reading the device certificate to obtain STPUB does.
+    ///
+    /// A non-OK chip status surfaces as `SeError::L2(L2Error::Status(_))` via
+    /// `parse_response` and is recoverable by nature (no session state). A
+    /// continuation status (`*Cont`) is anomalous for a single-frame `Get_Info`
+    /// reply and is rejected as `L2Error::BadFrame`. `out` too small for the
+    /// RSP_DATA returns `SeError::BufferTooSmall`.
+    fn get_info_block
+    (
+        &mut self,
+        object_id: ObjectId,
+        block_index: u8,
+        out: &mut [u8],
+    )
+    -> Result<usize, SeError>
+    {
+        // Get_Info_Req body = OBJECT_ID(1) || BLOCK_INDEX(1). REQ_LEN = 2.
+        let body = [object_id as u8, block_index];
+        let n = frame::build_request(L2ReqId::GetInfo as u8, &body, &mut self.l2)?;
+        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
+        let frame_len =
+            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
+        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        // A Get_Info reply fits one L2 chunk (RSP_DATA <= 128), so only a single
+        // RequestOk frame is expected. *Cont (or any other accepted status) is a
+        // malformed reply for this command.
+        if !matches!(resp.status, L2Status::RequestOk)
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        if out.len() < resp.data.len()
+        {
+            return Err(SeError::BufferTooSmall);
+        }
+        out[..resp.data.len()].copy_from_slice(resp.data);
+        Ok(resp.data.len())
+    }
+
+    /// Reads the full raw X.509 certificate store into `out`.
+    ///
+    /// The store is a fixed `GET_INFO_CERT_STORE_LEN` (3840) DER bytes across
+    /// `GET_INFO_CERT_STORE_BLOCKS` (30) `Get_Info` blocks. `out` must hold the
+    /// whole store: a shorter buffer is rejected with `BufferTooSmall` up front,
+    /// before any chip traffic. Returns `GET_INFO_CERT_STORE_LEN`.
+    ///
+    /// This returns the RAW store. Extracting STPUB by walking the ASN.1 is a
+    /// separate deferred layer (libtropic `lt_get_st_pub`), kept out of this slice
+    /// so no new attacker-facing decoder is introduced here. Requires Application
+    /// FW mode.
+    pub fn x509_certificate_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
+    {
+        // The store length is fixed and known to the caller, so require the full
+        // buffer up front, before any chip traffic, mirroring rmem_read_into's
+        // protocol-MAX check (se-driver lesson 2b.2). Recoverable: no session.
+        if out.len() < GET_INFO_CERT_STORE_LEN
+        {
+            return Err(SeError::BufferTooSmall);
+        }
+        for i in 0..GET_INFO_CERT_STORE_BLOCKS
+        {
+            let start = i * GET_INFO_BLOCK_LEN;
+            let end = start + GET_INFO_BLOCK_LEN;
+            let n = self.get_info_block(ObjectId::X509Certificate, i as u8, &mut out[start..end])?;
+            if n != GET_INFO_BLOCK_LEN
+            {
+                // Every cert-store block is a full 128-byte block. A short block
+                // is a malformed reply.
+                return Err(SeError::L2(L2Error::BadFrame));
+            }
+        }
+        Ok(GET_INFO_CERT_STORE_LEN)
+    }
+
+    /// Reads the 128-byte CHIP_ID into `out`, returning 128.
+    ///
+    /// CHIP_ID is one fixed 128-byte `Get_Info` block. It uses `_into` rather
+    /// than a by-value return (unlike the 4-byte versions) so the caller controls
+    /// placement of the larger payload. BLOCK_INDEX is a don't-care, so 0 is sent.
+    /// `out` shorter than 128 bytes is rejected by `get_info_block` with
+    /// `BufferTooSmall`. A reply not exactly 128 bytes is a malformed frame.
+    pub fn chip_id_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
+    {
+        let n = self.get_info_block(ObjectId::ChipId, 0, out)?;
+        if n != GET_INFO_BLOCK_LEN
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        Ok(GET_INFO_BLOCK_LEN)
+    }
+
+    /// Reads the 4-byte RISC-V (application) firmware version.
+    ///
+    /// Returns the RAW 4 bytes. In Start-up Mode the version's high bit is set
+    /// (the sentinel `0x80000000`, no Application FW loaded). The caller must
+    /// interpret it. The driver is a faithful transport and does not mask it.
+    pub fn riscv_fw_version(&mut self) -> Result<[u8; 4], SeError>
+    {
+        let mut buf = [0u8; 4];
+        let n = self.get_info_block(ObjectId::RiscvFwVersion, 0, &mut buf)?;
+        if n != buf.len()
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        Ok(buf)
+    }
+
+    /// Reads the 4-byte SPECT firmware version.
+    ///
+    /// Returns the RAW 4 bytes. In Start-up Mode SPECT returns the sentinel
+    /// `0x80000000` (high bit set, no SPECT FW running). The driver does not mask
+    /// it. The caller interprets the value.
+    pub fn spect_fw_version(&mut self) -> Result<[u8; 4], SeError>
+    {
+        let mut buf = [0u8; 4];
+        let n = self.get_info_block(ObjectId::SpectFwVersion, 0, &mut buf)?;
+        if n != buf.len()
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        Ok(buf)
+    }
+
+    /// Reads the FW_BANK header for `bank` into `out`, returning its length.
+    ///
+    /// The bank header is variable length: 0 (empty bank), 20, or 52 bytes. Any
+    /// other length is a malformed reply. `out` shorter than the returned data is
+    /// rejected by `get_info_block` with `BufferTooSmall`. Returns the byte
+    /// count. Supported only in Start-up (Maintenance) Mode.
+    pub fn fw_bank_into(&mut self, bank: FwBankId, out: &mut [u8]) -> Result<usize, SeError>
+    {
+        let n = self.get_info_block(ObjectId::FwBank, bank.wire_byte(), out)?;
+        // A FW_BANK header is empty, or a 20- or 52-byte record. Any other length
+        // is a structural anomaly. Sizes from libtropic
+        // TR01_L2_GET_INFO_FW_HEADER_SIZE_BOOT_V2_EMPTY_BANK (0) / _BOOT_V1 (20) /
+        // _BOOT_V2 (52).
+        if n != 0 && n != 20 && n != 52
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        Ok(n)
     }
 }
 
@@ -1158,6 +1346,339 @@ where
         // No RES_DATA: expect an empty payload after the RESULT byte.
         self.run(3, Some(0), |_res_data| Ok(()))
     }
+
+    /// Writes the host pairing public key `public_key` into pairing `slot`.
+    ///
+    /// Inherent twin of `SeCommands::pairing_key_write`. Provisions one of the
+    /// four pairing slots the Noise KK1 handshake authenticates against:
+    /// `SessionConfig.shipub` is the same `S_HiPub` key and `pkey_index` selects
+    /// the slot chip-side. `public_key` is a PUBLIC key, not a secret, so it is
+    /// not wrapped in `Zeroizing`. The slot range is enforced by
+    /// `PairingKeySlot`. Returns `Ok(())` on a stored write.
+    ///
+    /// PROVISIONING ONLY. A pairing slot backs a future handshake. Overwriting
+    /// the slot named by the session `pkey_index` (the active handshake key) can
+    /// permanently prevent re-establishing a secure channel, so treat this as a
+    /// provisioning step. The driver enforces no policy on when it runs.
+    ///
+    /// A non-OK RESULT is a valid authenticated reply that keeps the session
+    /// live, mirroring libtropic: HardwareFail on an OTP write error (the slot is
+    /// then permanently invalidated), plus Unauthorized / Fail. The command has
+    /// no RES_DATA, so it declares `Some(0)`: an OK result carrying any payload
+    /// poisons. A bad tag, CRC, alarm, or empty result poisons the session.
+    pub(crate) fn pairing_key_write
+    (
+        &mut self,
+        slot: PairingKeySlot,
+        public_key: &[u8; 32],
+    )
+    -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (36 bytes): CMD_ID || SLOT(u16 LE) || PADDING(1, 0) ||
+        // S_HIPUB(32). libtropic never writes the padding byte, so zero it here
+        // explicitly: stale L3 bytes must not enter the authenticated command.
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::PairingKeyWrite as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+            cmd[3] = 0;
+            cmd[PAIRING_KEY_WRITE_KEY_OFFSET..PAIRING_KEY_WRITE_CMD_LEN]
+                .copy_from_slice(public_key);
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(PAIRING_KEY_WRITE_CMD_LEN, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Reads the host pairing public key stored in pairing `slot`.
+    ///
+    /// Inherent twin of `SeCommands::pairing_key_read`. Returns the slot's
+    /// 32-byte public pairing key (`S_HiPub`) by value. The slot range is
+    /// enforced by `PairingKeySlot`.
+    ///
+    /// RES_DATA = PADDING(3) || S_HIPUB(32) = 35 bytes (fixed). A non-OK RESULT
+    /// is a valid authenticated reply that keeps the session live, mirroring
+    /// libtropic: SlotEmpty on an unprovisioned slot, SlotInvalid on an
+    /// invalidated one, plus Unauthorized / Fail. A bad tag, CRC, alarm, empty
+    /// result, or wrong-size result poisons the session.
+    pub(crate) fn pairing_key_read
+    (
+        &mut self,
+        slot: PairingKeySlot,
+    )
+    -> Result<[u8; 32], SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || SLOT(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::PairingKeyRead as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+        }
+        // RES_DATA = PADDING(3) || S_HIPUB(32) = 35 bytes (fixed). Skip the
+        // padding, then copy the 32 key bytes.
+        self.run
+        (
+            3,
+            // PADDING(3) + S_HIPUB(32).
+            Some(35),
+            |res_data|
+            {
+                let (_padding, rest) = take(res_data, 3)?;
+                let (tail, key) = take_array::<32>(rest)?;
+                if !tail.is_empty()
+                {
+                    // Standalone-correct: reject any trailing byte instead of
+                    // leaning on run's Some(35) check, mirroring parse_signature.
+                    return Err(L3Error::Oversize);
+                }
+                Ok(key)
+            },
+        )
+    }
+
+    /// Invalidates pairing `slot`, blocking future handshakes against it.
+    ///
+    /// Inherent twin of `SeCommands::pairing_key_invalidate`. The slot range is
+    /// enforced by `PairingKeySlot`. Returns `Ok(())` on an invalidated slot.
+    ///
+    /// PROVISIONING ONLY. Invalidating the slot named by the session `pkey_index`
+    /// (the active handshake key) can permanently prevent re-establishing a secure
+    /// channel. The driver enforces no policy on when it runs.
+    ///
+    /// A non-OK RESULT is a valid authenticated reply that keeps the session
+    /// live, mirroring libtropic: HardwareFail on an OTP write error, plus
+    /// Unauthorized / Fail. The command has no RES_DATA, so it declares `Some(0)`:
+    /// an OK result carrying any payload poisons. A bad tag, CRC, alarm, or empty
+    /// result poisons the session.
+    pub(crate) fn pairing_key_invalidate
+    (
+        &mut self,
+        slot: PairingKeySlot,
+    )
+    -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || SLOT(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::PairingKeyInvalidate as u8;
+            let slot_bytes = u16::from(slot.get()).to_le_bytes();
+            cmd[1] = slot_bytes[0];
+            cmd[2] = slot_bytes[1];
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(3, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Writes the 32-bit `value` to R-Config object `addr`.
+    ///
+    /// Inherent twin of `SeCommands::r_config_write`. R-Config is the reversible
+    /// working copy of the chip configuration: a write can be undone by
+    /// `r_config_erase`. `value` is a PUBLIC config word, not a secret, so it is
+    /// not wrapped in `Zeroizing`. The address is constrained to a named CO by
+    /// `ConfigObjectAddr`, so no invalid address can reach the wire.
+    ///
+    /// The chip enforces the bitwise AND of I-Config and R-Config AFTER the next
+    /// boot, so a write here does not change the running session's access.
+    /// `CfgUapRConfigWriteErase` gates both this write and the erase.
+    ///
+    /// A non-OK RESULT (Unauthorized, Fail, ...) is a valid authenticated reply
+    /// that keeps the session live, mirroring libtropic. The command has no
+    /// RES_DATA, so it declares `Some(0)`: an OK result carrying any payload
+    /// poisons. A bad tag, CRC, alarm, or empty result poisons the session.
+    pub(crate) fn r_config_write
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+        value: u32,
+    )
+    -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (8 bytes): CMD_ID || ADDRESS(u16 LE) || PADDING(1, 0) ||
+        // VALUE(u32 LE). libtropic leaves the padding byte uninitialized, so zero
+        // it here explicitly: stale L3 bytes must not enter the authenticated
+        // command.
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::RConfigWrite as u8;
+            let addr_bytes = addr.wire_addr().to_le_bytes();
+            cmd[1] = addr_bytes[0];
+            cmd[2] = addr_bytes[1];
+            cmd[3] = 0;
+            cmd[R_CONFIG_WRITE_VALUE_OFFSET..R_CONFIG_WRITE_CMD_LEN]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(R_CONFIG_WRITE_CMD_LEN, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Reads the 32-bit value of R-Config object `addr`.
+    ///
+    /// Inherent twin of `SeCommands::r_config_read`. Returns the reversible
+    /// working-copy value. The address is constrained to a named CO by
+    /// `ConfigObjectAddr`.
+    ///
+    /// RES_DATA = PADDING(3) || VALUE(u32 LE) = 7 bytes (fixed). A non-OK RESULT
+    /// keeps the session live, mirroring libtropic. A bad tag, CRC, alarm, empty
+    /// result, or wrong-size result poisons the session.
+    pub(crate) fn r_config_read
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+    )
+    -> Result<u32, SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || ADDRESS(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::RConfigRead as u8;
+            let addr_bytes = addr.wire_addr().to_le_bytes();
+            cmd[1] = addr_bytes[0];
+            cmd[2] = addr_bytes[1];
+        }
+        // RES_DATA = PADDING(3) || VALUE(u32 LE).
+        self.run(3, Some(7), parse_config_value)
+    }
+
+    /// Erases the ENTIRE R-Config, setting every object back to all-ones.
+    ///
+    /// Inherent twin of `SeCommands::r_config_erase`. This is NOT a per-object
+    /// erase: it wipes the WHOLE R-Config (all configuration objects to all-1s)
+    /// in one command (libtropic `lt_l3_r_config_erase`). A caller expecting to
+    /// clear a single object will instead reset the entire reversible config.
+    /// `CfgUapRConfigWriteErase` gates both this erase and `r_config_write`.
+    ///
+    /// A non-OK RESULT keeps the session live, mirroring libtropic. The command
+    /// has no RES_DATA, so it declares `Some(0)`: an OK result carrying any
+    /// payload poisons. A bad tag, CRC, alarm, or empty result poisons the
+    /// session.
+    pub(crate) fn r_config_erase(&mut self) -> Result<(), SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (1 byte): CMD_ID only. There is no address: the whole
+        // R-Config is erased.
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::RConfigErase as u8;
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(1, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Burns a single bit of I-Config object `addr` from 1 to 0.
+    ///
+    /// Inherent twin of `SeCommands::i_config_write`. The address is constrained
+    /// to a named CO by `ConfigObjectAddr` and the bit to 0..=31 by
+    /// `ConfigBitIndex`, so no invalid value can reach the wire. Returns `Ok(())`
+    /// on a burned bit.
+    ///
+    /// WARNING: I-Config is OTP and IRREVERSIBLE. This command flips ONE bit from
+    /// 1 to 0 (never a 32-bit value write), and the bit can NEVER be restored:
+    /// app note 006 sec 3.1, "Only 1 -> 0 transition ... cannot be reverted".
+    /// There is no I-Config erase. The chip enforces the bitwise AND of I-Config
+    /// and R-Config AFTER the next boot (app note 006 sec 3.1). Burning all access
+    /// bits of a CFG_UAP_* object to 0 PERMANENTLY disables that command for every
+    /// pairing key: CFG_UAP_I_CONFIG_WRITE locks out all future config changes,
+    /// CFG_UAP_R_CONFIG_WRITE_ERASE locks out R-Config recovery, and
+    /// CFG_UAP_MAC_AND_DESTROY permanently kills the PIN primitive (app note 006
+    /// sec 4.2 and 4.3.3 warnings). A HardwareFail (0x17) on an I-Config write is
+    /// FATAL: the chip switches permanently to ALARM (user-API Table 22). The
+    /// chip's response to re-writing an already-cleared bit is NOT documented by
+    /// the TROPIC01 docs, so the caller must not rely on a particular status.
+    ///
+    /// PROVISIONING ONLY. The driver enforces no policy on when this runs; the
+    /// upper layer must. A non-OK RESULT is a valid authenticated reply that
+    /// keeps the session live, mirroring libtropic. The command has no RES_DATA,
+    /// so it declares `Some(0)`: an OK result carrying any payload poisons. A bad
+    /// tag, CRC, alarm, or empty result poisons the session.
+    pub(crate) fn i_config_write
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+        bit: ConfigBitIndex,
+    )
+    -> Result<(), SeError>
+    {
+        // SECURITY: this burns an OTP bit (1 -> 0) that can never be restored.
+        // The byte layout below carries ADDRESS and BIT_INDEX only, no value: a
+        // single-bit burn, not a word write. See the doc warning above for the
+        // lock-out and ALARM hazards.
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (4 bytes): CMD_ID || ADDRESS(u16 LE) || BIT_INDEX(1).
+        // There is NO value and NO padding: this burns one bit, it does not write
+        // a word.
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::IConfigWrite as u8;
+            let addr_bytes = addr.wire_addr().to_le_bytes();
+            cmd[1] = addr_bytes[0];
+            cmd[2] = addr_bytes[1];
+            cmd[3] = bit.get();
+        }
+        // No RES_DATA: expect an empty payload after the RESULT byte.
+        self.run(4, Some(0), |_res_data| Ok(()))
+    }
+
+    /// Reads the 32-bit value of I-Config object `addr`.
+    ///
+    /// Inherent twin of `SeCommands::i_config_read`. Returns the irreversible
+    /// config value. The address is constrained to a named CO by
+    /// `ConfigObjectAddr`. The result shape is identical to `r_config_read`, so
+    /// the two share `parse_config_value`.
+    ///
+    /// RES_DATA = PADDING(3) || VALUE(u32 LE) = 7 bytes (fixed). A non-OK RESULT
+    /// keeps the session live, mirroring libtropic. A bad tag, CRC, alarm, empty
+    /// result, or wrong-size result poisons the session.
+    pub(crate) fn i_config_read
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+    )
+    -> Result<u32, SeError>
+    {
+        if self.state.is_poisoned()
+        {
+            return Err(SeError::SessionLost);
+        }
+        // CMD plaintext (3 bytes): CMD_ID || ADDRESS(u16 LE).
+        {
+            let cmd = self.cmd_plaintext();
+            cmd[0] = CmdId::IConfigRead as u8;
+            let addr_bytes = addr.wire_addr().to_le_bytes();
+            cmd[1] = addr_bytes[0];
+            cmd[2] = addr_bytes[1];
+        }
+        // RES_DATA = PADDING(3) || VALUE(u32 LE).
+        self.run(3, Some(7), parse_config_value)
+    }
 }
 
 /// The high-level command port over an active session.
@@ -1318,6 +1839,88 @@ where
     {
         self.mcounter_update(idx)
     }
+
+    fn pairing_key_write
+    (
+        &mut self,
+        slot: PairingKeySlot,
+        public_key: &[u8; 32],
+    )
+    -> Result<(), SeError>
+    {
+        self.pairing_key_write(slot, public_key)
+    }
+
+    fn pairing_key_read
+    (
+        &mut self,
+        slot: PairingKeySlot,
+    )
+    -> Result<[u8; 32], SeError>
+    {
+        self.pairing_key_read(slot)
+    }
+
+    fn pairing_key_invalidate
+    (
+        &mut self,
+        slot: PairingKeySlot,
+    )
+    -> Result<(), SeError>
+    {
+        self.pairing_key_invalidate(slot)
+    }
+
+    fn r_config_write
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+        value: u32,
+    )
+    -> Result<(), SeError>
+    {
+        self.r_config_write(addr, value)
+    }
+
+    fn r_config_read
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+    )
+    -> Result<u32, SeError>
+    {
+        self.r_config_read(addr)
+    }
+
+    fn r_config_erase
+    (
+        &mut self,
+    )
+    -> Result<(), SeError>
+    {
+        self.r_config_erase()
+    }
+
+    fn i_config_write
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+        bit: ConfigBitIndex,
+    )
+    -> Result<(), SeError>
+    {
+        self.i_config_write(addr, bit)
+    }
+
+    fn i_config_read
+    (
+        &mut self,
+        addr: ConfigObjectAddr,
+    )
+    -> Result<u32, SeError>
+    {
+        self.i_config_read(addr)
+    }
 }
 
 /// Parses a sign result `PADDING(15) || R(32) || S(32)` into a `Signature`.
@@ -1355,6 +1958,43 @@ fn parse_mac_destroy(res_data: &[u8]) -> Result<MacAndDestroyOutput, L3Error>
     }
     Ok(MacAndDestroyOutput::new(data_out))
 }
+
+/// Parses a config-read result `PADDING(3) || VALUE(u32 LE)` into a `u32`.
+///
+/// Shared by `r_config_read` and `i_config_read`: their result structs are
+/// byte-identical (libtropic `lt_l3_r_config_read_res_t` /
+/// `lt_l3_i_config_read_res_t`). Standalone-correct: it owns the 3-byte padding
+/// skip, the little-endian u32 read, and the empty-tail check, so it does not
+/// lean on the caller's `Some(7)` precondition. Mirrors `mcounter_get`'s parser
+/// while rejecting any trailing byte, so a future `None` caller cannot silently
+/// accept an oversize result.
+fn parse_config_value(res_data: &[u8]) -> Result<u32, L3Error>
+{
+    let (_padding, rest) = take(res_data, CONFIG_READ_PADDING)?;
+    let (tail, value) = take_array::<4>(rest)?;
+    if !tail.is_empty()
+    {
+        return Err(L3Error::Oversize);
+    }
+    Ok(u32::from_le_bytes(value))
+}
+
+/// `Get_Info` block size in bytes (the chip serves every object in 128-byte
+/// blocks). Used for the cert-store loop and the CHIP_ID length check.
+///
+/// Source: libtropic `GET_INFO_BLOCK_LEN`.
+const GET_INFO_BLOCK_LEN: usize = 128;
+
+/// Number of 128-byte blocks in the X.509 certificate store.
+///
+/// Source: libtropic `LT_CERT_STORE_BLOCKS` (the cert store is 30 blocks).
+const GET_INFO_CERT_STORE_BLOCKS: usize = 30;
+
+/// Total X.509 certificate store length in bytes (30 * 128 = 3840).
+///
+/// Used for the up-front buffer check and the read-loop end bound. Derived from
+/// the block count and block size, so the two can never drift apart.
+const GET_INFO_CERT_STORE_LEN: usize = GET_INFO_CERT_STORE_BLOCKS * GET_INFO_BLOCK_LEN;
 
 /// Maximum R-Memory user-data DATA length in bytes (target firmware >= 2.0.0).
 ///
@@ -1446,6 +2086,40 @@ const MCOUNTER_INIT_HEADER: usize = 4;
 /// + 4-byte value = 8).
 const MCOUNTER_INIT_CMD_LEN: usize = MCOUNTER_INIT_HEADER + 4;
 
+/// Byte offset of the host pairing public key within the PairingKeyWrite
+/// command plaintext.
+///
+/// Layout: CMD_ID(1) || SLOT(2) || PADDING(1) || S_HIPUB(32). Source: libtropic
+/// `struct lt_l3_pairing_key_write_cmd_t` (`slot` u16, a padding byte, then
+/// `s_hipub[32]`).
+const PAIRING_KEY_WRITE_KEY_OFFSET: usize = 4;
+
+/// PairingKeyWrite command plaintext length: header+padding(4) || S_HIPUB(32).
+///
+/// Total matches libtropic `TR01_L3_PAIRING_KEY_WRITE_CMD_SIZE`.
+const PAIRING_KEY_WRITE_CMD_LEN: usize = PAIRING_KEY_WRITE_KEY_OFFSET + 32;
+
+/// Byte offset of VALUE within the RConfigWrite command plaintext.
+///
+/// Layout: CMD_ID(1) || ADDRESS(2) || PADDING(1) || VALUE(4). The value sits
+/// after a padding byte the address does not imply, so the offset is non-obvious
+/// and earns a name. Source: libtropic `struct lt_l3_r_config_write_cmd_t`
+/// (`address` u16, a `padding` byte, then `value`).
+const R_CONFIG_WRITE_VALUE_OFFSET: usize = 4;
+
+/// RConfigWrite command plaintext length: header+padding(4) || VALUE(u32) = 8.
+///
+/// Total matches libtropic `TR01_L3_R_CONFIG_WRITE_CMD_SIZE`.
+const R_CONFIG_WRITE_CMD_LEN: usize = R_CONFIG_WRITE_VALUE_OFFSET + 4;
+
+/// Padding bytes before VALUE in a config-read result
+/// (PADDING(3) || VALUE(u32 LE)).
+///
+/// Source: libtropic `struct lt_l3_r_config_read_res_t` /
+/// `lt_l3_i_config_read_res_t` (`padding[3]`). The two result structs are
+/// byte-identical, which is what justifies the shared `parse_config_value`.
+const CONFIG_READ_PADDING: usize = 3;
+
 // Compile-time invariant: the maximum EdDSA wire packet fills the L3 buffer
 // exactly. The packet is 2 (L3 CMD_SIZE prefix) || SIGN_CMD_HEADER ||
 // EDDSA_MSG_MAX || GCM_TAG_LEN. If any term drifts, the build fails here
@@ -1493,6 +2167,7 @@ mod tests
     use crate::test_support::vectors;
     use crate::test_support::ChipFault;
     use crate::test_support::ChipMockSpi;
+    use crate::test_support::GetInfoFault;
     use crate::test_support::MockSpi;
     use crate::test_support::MockWait;
     use crate::test_support::RecordingSpi;
@@ -3372,6 +4047,788 @@ mod tests
         assert!(dev.l3.as_slice().iter().all(|&b| b == 0));
     }
 
+    /// Builds a pairing key slot index, panicking only in test code on a bad
+    /// constant.
+    fn pslot(value: u8) -> PairingKeySlot
+    {
+        PairingKeySlot::new(value).expect("test pairing key slot out of range")
+    }
+
+    /// Builds a deterministic 32-byte host pairing public key for the tests.
+    fn sample_pairing_key() -> [u8; 32]
+    {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate()
+        {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        k
+    }
+
+    #[test]
+    fn pairing_key_write_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        let key = sample_pairing_key();
+        assert_eq!(dev.pairing_key_write(pslot(0), &key), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        assert_eq!(dev.pairing_key_write(pslot(3), &key), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+    }
+
+    #[test]
+    fn pairing_key_write_hardware_fail_is_recoverable()
+    {
+        // HardwareFail (0x17): an OTP write error. A valid authenticated reply
+        // that keeps the session live.
+        let mut dev = open(ChipFault::HardwareFail);
+        let key = sample_pairing_key();
+        assert_eq!
+        (
+            dev.pairing_key_write(pslot(1), &key),
+            Err(SeError::L3(L3Error::Result(L3Status::HardwareFail)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.pairing_key_write(pslot(1), &key);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::HardwareFail))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn pairing_key_write_extra_result_byte_poisons_session()
+    {
+        // pairing_key_write is a Some(0) command: one unexpected RES_DATA byte
+        // trips the expected-length check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        let key = sample_pairing_key();
+        assert_eq!
+        (
+            dev.pairing_key_write(pslot(0), &key),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_write_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        let key = sample_pairing_key();
+        assert_eq!
+        (
+            dev.pairing_key_write(pslot(0), &key),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_write_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        let key = sample_pairing_key();
+        assert_eq!
+        (
+            dev.pairing_key_write(pslot(0), &key),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_write_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        let key = sample_pairing_key();
+        assert_eq!
+        (
+            dev.pairing_key_write(pslot(0), &key),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_write_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        let key = sample_pairing_key();
+        assert_eq!
+        (
+            dev.pairing_key_write(pslot(0), &key),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_read_round_trips_returns_32_byte_key()
+    {
+        // The mock returns PADDING(3) || S_HIPUB(32). The driver must skip the
+        // padding and return exactly the configured 32-byte key.
+        let mut dev = open(ChipFault::None);
+        let key = sample_pairing_key();
+        dev.spi_mut().set_pairing_key(key);
+        assert_eq!(dev.pairing_key_read(pslot(0)), Ok(key));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn pairing_key_read_slot_empty_is_recoverable()
+    {
+        // SlotEmpty (0x15): an unprovisioned pairing slot. A valid authenticated
+        // reply that keeps the session live.
+        let mut dev = open(ChipFault::SlotEmpty);
+        assert_eq!
+        (
+            dev.pairing_key_read(pslot(2)),
+            Err(SeError::L3(L3Error::Result(L3Status::SlotEmpty)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.pairing_key_read(pslot(2));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::SlotEmpty))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn pairing_key_read_slot_invalid_is_recoverable()
+    {
+        // SlotInvalid (0x16): an invalidated pairing slot. A valid authenticated
+        // reply that keeps the session live.
+        let mut dev = open(ChipFault::SlotInvalid);
+        assert_eq!
+        (
+            dev.pairing_key_read(pslot(1)),
+            Err(SeError::L3(L3Error::Result(L3Status::SlotInvalid)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.pairing_key_read(pslot(1));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::SlotInvalid))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn pairing_key_read_wrong_size_result_poisons_session()
+    {
+        // An authenticated OK result one byte short of the fixed 35-byte RES_DATA
+        // trips run's expected_res_data_len check and poisons.
+        let mut dev = open(ChipFault::ResultWrongSize);
+        assert_eq!
+        (
+            dev.pairing_key_read(pslot(0)),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_read_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.pairing_key_read(pslot(0)), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_read_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.pairing_key_read(pslot(0)), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_read_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.pairing_key_read(pslot(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_read_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.pairing_key_read(pslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_invalidate_succeeds_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.pairing_key_invalidate(pslot(2)), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn pairing_key_invalidate_hardware_fail_is_recoverable()
+    {
+        // HardwareFail (0x17): an OTP write error. A valid authenticated reply
+        // that keeps the session live.
+        let mut dev = open(ChipFault::HardwareFail);
+        assert_eq!
+        (
+            dev.pairing_key_invalidate(pslot(0)),
+            Err(SeError::L3(L3Error::Result(L3Status::HardwareFail)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.pairing_key_invalidate(pslot(0));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::HardwareFail))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn pairing_key_invalidate_extra_result_byte_poisons_session()
+    {
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!
+        (
+            dev.pairing_key_invalidate(pslot(0)),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_invalidate_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.pairing_key_invalidate(pslot(0)), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_invalidate_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.pairing_key_invalidate(pslot(0)), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_invalidate_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.pairing_key_invalidate(pslot(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn pairing_key_invalidate_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.pairing_key_invalidate(pslot(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    // ---- Config objects (R-Config / I-Config, L3) ----
+
+    #[test]
+    fn r_config_write_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.r_config_write(ConfigObjectAddr::CfgUapPing, 0x0102_0304), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        // A second write at a different object and the max value also round-trips,
+        // proving the 8-byte plaintext (including the u32 value) reaches the chip.
+        assert_eq!(dev.r_config_write(ConfigObjectAddr::CfgSensors, u32::MAX), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+    }
+
+    #[test]
+    fn r_config_write_request_layout_is_byte_exact()
+    {
+        // Pin the wire layout the chip actually decrypts: CMD_ID || ADDRESS(u16 LE)
+        // || PADDING(1,=0) || VALUE(u32 LE). The mock ignores a write payload, so
+        // without this the value/address/padding encoding would be untested.
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.r_config_write(ConfigObjectAddr::CfgSensors, 0x0A0B_0C0D), Ok(()));
+        assert_eq!
+        (
+            dev.spi_ref().last_command(),
+            // 0x20, addr 0x0008 LE, padding 0, value 0x0A0B0C0D LE.
+            &[0x20, 0x08, 0x00, 0x00, 0x0D, 0x0C, 0x0B, 0x0A]
+        );
+    }
+
+    #[test]
+    fn r_config_write_unauthorized_is_recoverable()
+    {
+        // Unauthorized (0x01) is a known L3Status: run maps it to a recoverable
+        // L3Error::Result and keeps the session live. No poison.
+        let mut dev = open(ChipFault::Unauthorized);
+        assert_eq!
+        (
+            dev.r_config_write(ConfigObjectAddr::CfgUapPing, 7),
+            Err(SeError::L3(L3Error::Result(L3Status::Unauthorized)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.r_config_write(ConfigObjectAddr::CfgUapPing, 7);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Unauthorized))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn r_config_write_extra_result_byte_poisons_session()
+    {
+        // r_config_write is a Some(0) command: one unexpected RES_DATA byte trips
+        // the expected-length check and poisons.
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!
+        (
+            dev.r_config_write(ConfigObjectAddr::CfgUapPing, 1),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_write_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.r_config_write(ConfigObjectAddr::CfgUapPing, 1),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_write_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!
+        (
+            dev.r_config_write(ConfigObjectAddr::CfgUapPing, 1),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_write_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.r_config_write(ConfigObjectAddr::CfgUapPing, 1),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_write_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.r_config_write(ConfigObjectAddr::CfgUapPing, 1),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_read_round_trips_returns_the_value()
+    {
+        // The mock returns PADDING(3) || VALUE(u32 LE). The driver must skip the
+        // padding and return exactly the configured value, proving the LE read.
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_config_value(0xDEAD_BEEF);
+        assert_eq!(dev.r_config_read(ConfigObjectAddr::CfgUapPing), Ok(0xDEAD_BEEF));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn r_config_read_unauthorized_is_recoverable()
+    {
+        let mut dev = open(ChipFault::Unauthorized);
+        assert_eq!
+        (
+            dev.r_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Result(L3Status::Unauthorized)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.r_config_read(ConfigObjectAddr::CfgUapPing);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Unauthorized))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn r_config_read_wrong_size_result_poisons_session()
+    {
+        // An authenticated OK result one byte short of the fixed 7-byte RES_DATA
+        // trips run's expected_res_data_len check and poisons.
+        let mut dev = open(ChipFault::ResultWrongSize);
+        assert_eq!
+        (
+            dev.r_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_read_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.r_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_read_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!
+        (
+            dev.r_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_read_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.r_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_read_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.r_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_erase_round_trips_and_advances_nonces()
+    {
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.r_config_erase(), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn r_config_erase_unauthorized_is_recoverable()
+    {
+        let mut dev = open(ChipFault::Unauthorized);
+        assert_eq!
+        (
+            dev.r_config_erase(),
+            Err(SeError::L3(L3Error::Result(L3Status::Unauthorized)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.r_config_erase();
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Unauthorized))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn r_config_erase_extra_result_byte_poisons_session()
+    {
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!(dev.r_config_erase(), Err(SeError::L3(L3Error::Oversize)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_erase_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!(dev.r_config_erase(), Err(SeError::L3(L3Error::Tag)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_erase_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!(dev.r_config_erase(), Err(SeError::L2(L2Error::Crc)));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_erase_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!(dev.r_config_erase(), Err(SeError::L2(L2Error::L1(L1Error::Alarm))));
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn r_config_erase_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.r_config_erase(),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    /// Builds an I-Config bit index, panicking only in test code on a bad
+    /// constant.
+    fn cbit(value: u8) -> ConfigBitIndex
+    {
+        ConfigBitIndex::new(value).expect("test config bit index out of range")
+    }
+
+    #[test]
+    fn i_config_write_round_trips_and_advances_nonces()
+    {
+        // The write carries ADDRESS || BIT_INDEX (no value). A successful burn
+        // round-trips and advances both nonces; a second at the max bit also
+        // works, proving the 4-byte plaintext reaches the chip.
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        assert_eq!(dev.i_config_write(ConfigObjectAddr::CfgSensors, cbit(31)), Ok(()));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+    }
+
+    #[test]
+    fn i_config_write_request_layout_is_byte_exact()
+    {
+        // The irreversible bit-burn has no live model test (a real burn is one-way
+        // and the model defers config to next boot), so pin its 4-byte wire layout
+        // here: CMD_ID || ADDRESS(u16 LE) || BIT_INDEX(u8). A transposed address or
+        // bit would mis-burn an OTP bit, so this assertion is load-bearing.
+        let mut dev = open(ChipFault::None);
+        assert_eq!(dev.i_config_write(ConfigObjectAddr::CfgSensors, cbit(31)), Ok(()));
+        assert_eq!
+        (
+            dev.spi_ref().last_command(),
+            // 0x30, addr 0x0008 LE, bit_index 31 (0x1F). No value, no padding.
+            &[0x30, 0x08, 0x00, 0x1F]
+        );
+    }
+
+    #[test]
+    fn i_config_write_unauthorized_is_recoverable()
+    {
+        let mut dev = open(ChipFault::Unauthorized);
+        assert_eq!
+        (
+            dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(3)),
+            Err(SeError::L3(L3Error::Result(L3Status::Unauthorized)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(3));
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Unauthorized))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn i_config_write_extra_result_byte_poisons_session()
+    {
+        let mut dev = open(ChipFault::ExtraResultByte);
+        assert_eq!
+        (
+            dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_write_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_write_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!
+        (
+            dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_write_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_write_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_read_round_trips_returns_the_value()
+    {
+        let mut dev = open(ChipFault::None);
+        dev.spi_mut().set_config_value(0x1122_3344);
+        assert_eq!(dev.i_config_read(ConfigObjectAddr::CfgUapIConfigRead), Ok(0x1122_3344));
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    }
+
+    #[test]
+    fn i_config_read_unauthorized_is_recoverable()
+    {
+        let mut dev = open(ChipFault::Unauthorized);
+        assert_eq!
+        (
+            dev.i_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Result(L3Status::Unauthorized)))
+        );
+        let before = dev.spi_ref().transaction_count();
+        let r = dev.i_config_read(ConfigObjectAddr::CfgUapPing);
+        assert_eq!(r, Err(SeError::L3(L3Error::Result(L3Status::Unauthorized))));
+        assert!(dev.spi_ref().transaction_count() > before, "chip traffic continues");
+        assert_eq!(dev.spi_ref().nonces(), (2, 2), "nonces stay in lockstep");
+    }
+
+    #[test]
+    fn i_config_read_wrong_size_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::ResultWrongSize);
+        assert_eq!
+        (
+            dev.i_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_read_bad_tag_poisons_session()
+    {
+        let mut dev = open(ChipFault::BadResultTag);
+        assert_eq!
+        (
+            dev.i_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Tag))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_read_l2_crc_err_poisons_session()
+    {
+        let mut dev = open(ChipFault::L2CrcErr);
+        assert_eq!
+        (
+            dev.i_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L2(L2Error::Crc))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_read_alarm_poisons_session()
+    {
+        let mut dev = open(ChipFault::Alarm);
+        assert_eq!
+        (
+            dev.i_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L2(L2Error::L1(L1Error::Alarm)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn i_config_read_empty_result_poisons_session()
+    {
+        let mut dev = open(ChipFault::EmptyResult);
+        assert_eq!
+        (
+            dev.i_config_read(ConfigObjectAddr::CfgUapPing),
+            Err(SeError::L3(L3Error::Parse(ParseError::UnexpectedEnd)))
+        );
+        assert_session_lost_and_quiet(&mut dev);
+    }
+
+    #[test]
+    fn mixed_config_sequence_keeps_nonces_in_lockstep()
+    {
+        // An R-Config write, an R-Config read of that value, an erase, an
+        // I-Config read, and an I-Config write each advance both nonces once.
+        let mut dev = open(ChipFault::None);
+        // The mock ignores a write payload and returns the seeded read value, so
+        // use a DISTINCT written value to make clear this counts nonces, it does
+        // not simulate a real write-then-read-back.
+        dev.spi_mut().set_config_value(0xAABB_CCDD);
+        dev.r_config_write(ConfigObjectAddr::CfgUapPing, 0x0102_0304).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (1, 1));
+        assert_eq!(dev.r_config_read(ConfigObjectAddr::CfgUapPing), Ok(0xAABB_CCDD));
+        assert_eq!(dev.spi_ref().nonces(), (2, 2));
+        dev.r_config_erase().unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (3, 3));
+        assert_eq!(dev.i_config_read(ConfigObjectAddr::CfgUapPing), Ok(0xAABB_CCDD));
+        assert_eq!(dev.spi_ref().nonces(), (4, 4));
+        dev.i_config_write(ConfigObjectAddr::CfgSensors, cbit(5)).unwrap();
+        assert_eq!(dev.spi_ref().nonces(), (5, 5));
+    }
+
     /// Asserts a poisoned session fast-fails with `SessionLost` and issues no
     /// further SPI transaction.
     fn assert_session_lost_and_quiet(dev: &mut Tropic01<ChipMockSpi, MockWait, ActiveSession>)
@@ -3414,5 +4871,237 @@ mod tests
         // Idempotent.
         s.poison();
         assert!(s.is_poisoned());
+    }
+
+    // ---- Get_Info (L2, NoSession) ----
+
+    #[test]
+    fn fw_bank_id_wire_bytes_match_libtropic()
+    {
+        // Source: libtropic lt_bank_id_t.
+        assert_eq!(FwBankId::Fw1.wire_byte(), 0x01);
+        assert_eq!(FwBankId::Fw2.wire_byte(), 0x02);
+        assert_eq!(FwBankId::Spect1.wire_byte(), 0x11);
+        assert_eq!(FwBankId::Spect2.wire_byte(), 0x12);
+    }
+
+    #[test]
+    fn get_info_request_frame_matches_libtropic_golden()
+    {
+        // Byte-exact Get_Info_Req for OBJECT_ID ChipId, BLOCK_INDEX 0:
+        // REQ_ID 0x01, REQ_LEN 0x02, OBJECT_ID 0x01, BLOCK_INDEX 0x00, CRC 0x2B92.
+        let mut buf = [0u8; L2_FRAME_MAX];
+        let body = [ObjectId::ChipId as u8, 0u8];
+        let n = frame::build_request(L2ReqId::GetInfo as u8, &body, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[0x01, 0x02, 0x01, 0x00, 0x2B, 0x92]);
+    }
+
+    /// Builds a `NoSession` device over a chip mock with the given Get_Info fault.
+    fn no_session(fault: GetInfoFault) -> Tropic01<ChipMockSpi, MockWait, NoSession>
+    {
+        let mut spi =
+            ChipMockSpi::new(vectors::KCMD, vectors::KRES, vectors::ETPUB, vectors::T_TAUTH, ChipFault::None);
+        spi.set_get_info_fault(fault);
+        Tropic01::new(spi, MockWait::new())
+    }
+
+    #[test]
+    fn chip_id_round_trips_128_bytes()
+    {
+        let mut block = [0u8; 128];
+        for (i, b) in block.iter_mut().enumerate()
+        {
+            *b = i as u8;
+        }
+        let mut dev = no_session(GetInfoFault::None);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &block);
+        let mut out = [0u8; 128];
+        let n = dev.chip_id_into(&mut out).unwrap();
+        assert_eq!(n, 128);
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn chip_id_rejects_a_too_small_buffer()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0u8; 128]);
+        let mut out = [0u8; 64];
+        assert_eq!(dev.chip_id_into(&mut out), Err(SeError::BufferTooSmall));
+    }
+
+    #[test]
+    fn chip_id_rejects_a_short_block()
+    {
+        let mut dev = no_session(GetInfoFault::WrongLen);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0xAAu8; 128]);
+        let mut out = [0u8; 128];
+        assert_eq!(dev.chip_id_into(&mut out), Err(SeError::L2(L2Error::BadFrame)));
+    }
+
+    #[test]
+    fn x509_certificate_reads_full_store()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        // Seed all 30 blocks with a per-block fingerprint so the concatenation
+        // is checkable byte-for-byte.
+        let mut expected = std::vec![0u8; GET_INFO_CERT_STORE_LEN];
+        for blk in 0..GET_INFO_CERT_STORE_BLOCKS
+        {
+            let mut block = [0u8; 128];
+            for (i, b) in block.iter_mut().enumerate()
+            {
+                *b = (blk as u8).wrapping_add(i as u8);
+            }
+            dev.spi_mut().set_get_info(ObjectId::X509Certificate as u8, blk as u8, &block);
+            expected[blk * 128..(blk + 1) * 128].copy_from_slice(&block);
+        }
+        let mut out = std::vec![0u8; GET_INFO_CERT_STORE_LEN];
+        let n = dev.x509_certificate_into(&mut out).unwrap();
+        assert_eq!(n, GET_INFO_CERT_STORE_LEN);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn x509_certificate_rejects_a_too_small_buffer_before_any_traffic()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        let before = dev.spi_ref().transaction_count();
+        let mut out = std::vec![0u8; GET_INFO_CERT_STORE_LEN - 1];
+        assert_eq!(dev.x509_certificate_into(&mut out), Err(SeError::BufferTooSmall));
+        // The check is up front: no chip traffic on a too-small buffer.
+        assert_eq!(dev.spi_ref().transaction_count(), before);
+    }
+
+    #[test]
+    fn x509_certificate_rejects_a_short_block()
+    {
+        let mut dev = no_session(GetInfoFault::WrongLen);
+        for blk in 0..GET_INFO_CERT_STORE_BLOCKS
+        {
+            dev.spi_mut().set_get_info(ObjectId::X509Certificate as u8, blk as u8, &[0u8; 128]);
+        }
+        let mut out = std::vec![0u8; GET_INFO_CERT_STORE_LEN];
+        assert_eq!(dev.x509_certificate_into(&mut out), Err(SeError::L2(L2Error::BadFrame)));
+    }
+
+    #[test]
+    fn riscv_fw_version_returns_four_bytes()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        dev.spi_mut().set_get_info(ObjectId::RiscvFwVersion as u8, 0, &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(dev.riscv_fw_version().unwrap(), [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn spect_fw_version_returns_the_startup_sentinel()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        // Start-up Mode SPECT sentinel 0x80000000 in little-endian wire order.
+        dev.spi_mut().set_get_info(ObjectId::SpectFwVersion as u8, 0, &[0x00, 0x00, 0x00, 0x80]);
+        assert_eq!(dev.spect_fw_version().unwrap(), [0x00, 0x00, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn fw_bank_into_reads_a_20_byte_bank()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        let header = [0x5Au8; 20];
+        dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Fw1.wire_byte(), &header);
+        let mut out = [0u8; 64];
+        let n = dev.fw_bank_into(FwBankId::Fw1, &mut out).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(&out[..20], &header);
+    }
+
+    #[test]
+    fn fw_bank_into_reads_a_52_byte_bank()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        let header = [0xC3u8; 52];
+        dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Spect2.wire_byte(), &header);
+        let mut out = [0u8; 64];
+        let n = dev.fw_bank_into(FwBankId::Spect2, &mut out).unwrap();
+        assert_eq!(n, 52);
+        assert_eq!(&out[..52], &header);
+    }
+
+    #[test]
+    fn fw_bank_into_reads_an_empty_bank()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        // An empty bank replies with zero-length RSP_DATA (object unset == empty).
+        let mut out = [0u8; 64];
+        let n = dev.fw_bank_into(FwBankId::Fw2, &mut out).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn fw_bank_into_rejects_an_unexpected_length()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        // 30 bytes is not in {0, 20, 52}: a structural anomaly.
+        dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Fw1.wire_byte(), &[0u8; 30]);
+        let mut out = [0u8; 64];
+        assert_eq!(dev.fw_bank_into(FwBankId::Fw1, &mut out), Err(SeError::L2(L2Error::BadFrame)));
+    }
+
+    #[test]
+    fn fw_bank_into_selects_the_requested_bank()
+    {
+        let mut dev = no_session(GetInfoFault::None);
+        // Each bank gets a distinct 20-byte header; reading SPECT1 must return
+        // SPECT1's, proving the BLOCK_INDEX selects the right bank.
+        dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Fw1.wire_byte(), &[0x11u8; 20]);
+        dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Spect1.wire_byte(), &[0x22u8; 20]);
+        let mut out = [0u8; 64];
+        let n = dev.fw_bank_into(FwBankId::Spect1, &mut out).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(&out[..20], &[0x22u8; 20]);
+    }
+
+    #[test]
+    fn get_info_error_status_is_recoverable()
+    {
+        let mut dev = no_session(GetInfoFault::ErrorStatus);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0u8; 128]);
+        let mut out = [0u8; 128];
+        // An L2 error status surfaces via parse_response, no session state.
+        assert_eq!(
+            dev.chip_id_into(&mut out),
+            Err(SeError::L2(L2Error::Status(L2Status::UnknownErr)))
+        );
+    }
+
+    #[test]
+    fn get_info_bad_crc_surfaces_as_crc_error()
+    {
+        let mut dev = no_session(GetInfoFault::BadCrc);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0u8; 128]);
+        let mut out = [0u8; 128];
+        assert_eq!(dev.chip_id_into(&mut out), Err(SeError::L2(L2Error::Crc)));
+    }
+
+    #[test]
+    fn get_info_cont_status_is_rejected_as_bad_frame()
+    {
+        // A valid-CRC reply with a *Cont status must NOT be mistaken for a
+        // complete single-frame Get_Info reply (a truncated read). The
+        // get_info_block guard rejects any non-RequestOk status as BadFrame.
+        let mut dev = no_session(GetInfoFault::ContStatus);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0u8; 128]);
+        let mut out = [0u8; 128];
+        assert_eq!(dev.chip_id_into(&mut out), Err(SeError::L2(L2Error::BadFrame)));
+    }
+
+    #[test]
+    fn get_info_no_response_surfaces_as_an_error()
+    {
+        // With no queued reply the read path sees no valid frame. The call must
+        // surface a recoverable error, never hang or panic.
+        let mut dev = no_session(GetInfoFault::NoResp);
+        dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0u8; 128]);
+        let mut out = [0u8; 128];
+        assert!(dev.chip_id_into(&mut out).is_err());
     }
 }
