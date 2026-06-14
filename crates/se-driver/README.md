@@ -15,10 +15,7 @@ as a clean-room rewrite with the official C SDK
 > mock (incl. fault injection), a libtropic-derived handshake KAT, and a **live
 > end-to-end suite against the official `tropic01_model` emulator** (real
 > handshake + real AES-GCM, see [Validation](#validation-against-real-libtropic)).
-> Most of the chip's command surface is wired. What remains is the X.509 cert
-> ASN.1 parse, the firmware-update bootloader API, and power/mode control (see
-> [Roadmap](#roadmap)). It has not yet run on real silicon. Not production-grade
-> yet.
+> Most of the chip's command surface is wired, including STPUB extraction from the X.509 cert store. What remains is X.509 chain verification, the firmware-update bootloader API, and power/mode control (see [Roadmap](#roadmap)). It has not yet run on real silicon. Not production-grade yet.
 
 ## What it does
 
@@ -47,6 +44,7 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | Secure channel | Noise KK1 handshake, `open_session` / `close_session`, session teardown gate |
 | Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW) |
 | Chip info (L2) | `Get_Info`: `x509_certificate_into` (raw cert store), `chip_id_into`, `riscv_fw_version`, `spect_fw_version`, `fw_bank_into` - read before a session, no secure channel |
+| Attestation (parse) | `parse_stpub` / `read_chip_stpub`: extract the chip static X25519 key (STPUB) from the X.509 cert store via a depth-bounded, panic-free DER walk. Extraction only - chain-signature verification is deferred |
 | Diagnostics | `ping` round-trip |
 | TRNG | `random_into` (RandomValueGet, 0x50) |
 | ECC keys | `ecc_key_generate` (0x60), `ecc_public_key` (0x62, returns the chip-attested curve), `ecc_key_store` (0x61, import a private key), `ecc_key_erase` (0x63) |
@@ -86,6 +84,7 @@ robustness.
 | `mac_and_destroy` | Yes - returns the 32-byte secret output |
 | `pairing_key_write` / `pairing_key_read` / `pairing_key_invalidate` | Yes - slot 0 reads back the prod0 host pairing pubkey (byte-exact). Write-read-invalidate round-trip on a spare slot. Reading an unprovisioned slot is recoverable |
 | `Get_Info`: cert store / chip id / fw versions | Yes - reads the full 3840-byte cert store, the 128-byte CHIP_ID, and the 4-byte RISCV/SPECT versions. FW_BANK is rejected outside Maintenance Mode (deferred to the FW-update slice) |
+| `parse_stpub` / `read_chip_stpub` (STPUB) | Yes - extracts STPUB from the live model's real device certificate and asserts it byte-exact against the model's pinned `s_t_pub`. A golden-constant proof that the DER walk is byte-faithful to an independent implementation |
 | `r_config_write` / `r_config_read` / `r_config_erase` | Yes - write a CO value to a safe register, read it back byte-exact, erase the whole R-Config and read back all-ones. I-Config read live. The irreversible I-Config write is mock-only (a real burn is one-way) |
 
 The L2 multi-chunk SEND path additionally has a **byte-exact golden KAT**: real
@@ -101,7 +100,7 @@ requires (almost everything). The rest matters for a general-purpose driver.
 
 | Block | Commands | What it is for | Needed by PatinaKey |
 |-------|----------|----------------|:---:|
-| Attestation (parse) | X.509 ASN.1 decode of the cert store | Extract STPUB and the cert chain from the raw bytes `Get_Info` already returns | Yes |
+| Attestation (verify) | X.509 chain-signature verification up to the Tropic root | Prove the chip's identity (STPUB extraction is done; verifying the cert chain authenticates it) | Yes |
 | Firmware update | bootloader 0xB0 / 0xB1 | Update the chip's application / SPECT firmware | Yes (planned) |
 | Power / mode | sleep, get-mode (`reboot` done) | Low-power, bootloader vs application mode | Later |
 
@@ -129,9 +128,11 @@ their own HAL (today the ports are the crate's own `SpiDevice` / `SeWait` traits
 
 Host tests drive the driver through mock SPI / wait ports and an in-repo chip mock
 (with fault injection). The Noise KK1 key schedule and the L2 multi-chunk SEND
-frames are checked against golden KATs generated from real libtropic. Three
-libFuzzer targets cover the attacker-facing parsers (behind the `_fuzz` feature).
-The build is proven `no_std` on `thumbv8m.main-none-eabihf`.
+frames are checked against golden KATs generated from real libtropic, and the
+X.509 STPUB walk against the real device certificate. Four libFuzzer targets
+cover the attacker-facing parsers - L2 response, L3 result decrypt, handshake
+response, and the cert-store STPUB decoder (behind the `_fuzz` feature). The
+build is proven `no_std` on `thumbv8m.main-none-eabihf`.
 
 ```sh
 cargo test -p se-driver

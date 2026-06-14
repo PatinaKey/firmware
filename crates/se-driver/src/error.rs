@@ -70,6 +70,31 @@ pub enum HandshakeError
     L2(L2Error),
 }
 
+/// X.509 certificate-store parsing errors.
+///
+/// Raised while extracting STPUB from the `Get_Info` cert store. The DER is
+/// attacker-influenced (it comes from the chip), so every variant is a
+/// fail-closed rejection. Recoverable: this runs before any session, so there
+/// is nothing to poison. Maps libtropic's cert/ASN.1 return codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertError
+{
+    /// The store header was wrong (bad version or num_certs) or a declared
+    /// length truncated the header or the DEVICE certificate. Maps libtropic
+    /// `LT_CERT_STORE_INVALID`.
+    BadStore,
+    /// A DER feature the parser does not support: a length in long-form over 2
+    /// bytes or indefinite, or nesting deeper than the depth cap. Maps libtropic
+    /// `LT_CERT_UNSUPPORTED`.
+    Unsupported,
+    /// No X25519 key object was found in the DEVICE certificate. Maps libtropic
+    /// `LT_CERT_ITEM_NOT_FOUND`.
+    KeyNotFound,
+    /// The DER structure was otherwise malformed (a bounds or structure fault
+    /// while walking the certificate).
+    Malformed,
+}
+
 /// Bounds-checked parser errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError
@@ -95,6 +120,8 @@ pub enum SeError
     L3(L3Error),
     /// The handshake failed.
     Handshake(HandshakeError),
+    /// Parsing the X.509 certificate store (STPUB extraction) failed.
+    Cert(CertError),
     /// The session was torn down. Re-handshake before any further L3 command.
     SessionLost,
     /// The AES-GCM nonce counter reached its maximum. Session is fatal.
@@ -177,6 +204,14 @@ impl From<ParseError> for SeError
     }
 }
 
+impl From<CertError> for SeError
+{
+    fn from(e: CertError) -> Self
+    {
+        SeError::Cert(e)
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -221,6 +256,13 @@ mod tests
         assert_eq!(c, SeError::L3(L3Error::Tag));
         let d: SeError = HandshakeError::Dh.into();
         assert_eq!(d, SeError::Handshake(HandshakeError::Dh));
+    }
+
+    #[test]
+    fn cert_folds_into_se_error()
+    {
+        let e: SeError = CertError::KeyNotFound.into();
+        assert_eq!(e, SeError::Cert(CertError::KeyNotFound));
     }
 
     #[test]

@@ -158,6 +158,35 @@ where
         Ok(GET_INFO_CERT_STORE_LEN)
     }
 
+    /// Reads the cert store and extracts STPUB (the chip static X25519 key).
+    ///
+    /// Reads the full X.509 store into the caller-provided `scratch`, then walks
+    /// the DEVICE certificate's DER to STPUB and returns the 32 bytes by value
+    /// (STPUB is PUBLIC). `scratch` must hold the whole store: shorter than
+    /// `GET_INFO_CERT_STORE_LEN` is rejected with `BufferTooSmall` up front,
+    /// before any chip traffic. STPUB is returned by value, so `scratch` is not
+    /// retained: the caller may reuse or wipe it after this returns.
+    ///
+    /// The store is 3840 bytes; the caller passes the buffer so the ~4.4 KiB
+    /// static handle does not grow a 3840-byte stack frame. Requires Application
+    /// FW mode.
+    ///
+    /// SECURITY: this extracts STPUB only; it does NOT verify the certificate
+    /// chain up to the Tropic root (mirrors libtropic `lt_get_st_pub`). The
+    /// handshake auth tag binds STPUB, but full chain validation is a future
+    /// slice. See `cert::parse_stpub`.
+    pub fn read_chip_stpub(&mut self, scratch: &mut [u8]) -> Result<[u8; 32], SeError>
+    {
+        // Require the full store buffer up front, before any traffic, mirroring
+        // x509_certificate_into. Recoverable: no session.
+        if scratch.len() < GET_INFO_CERT_STORE_LEN
+        {
+            return Err(SeError::BufferTooSmall);
+        }
+        self.x509_certificate_into(scratch)?;
+        crate::cert::parse_stpub(&scratch[..GET_INFO_CERT_STORE_LEN])
+    }
+
     /// Reads the 128-byte CHIP_ID into `out`, returning 128.
     ///
     /// CHIP_ID is one fixed 128-byte `Get_Info` block. It uses `_into` rather
