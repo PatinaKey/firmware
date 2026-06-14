@@ -283,14 +283,54 @@ pub(crate) enum ChipFault
     InvalidKey,
     /// Seal a valid result whose RESULT status is SlotEmpty (recoverable).
     ///
-    /// An EccKeyErase of an already-empty slot. The session stays live; erasing
-    /// an empty slot is idempotent at the application level.
+    /// An EccKeyErase of an already-empty slot, or a PairingKeyRead of an
+    /// unprovisioned pairing slot. The session stays live.
     SlotEmpty,
+    /// Seal a valid result whose RESULT status is SlotInvalid (recoverable).
+    ///
+    /// A PairingKeyRead of an invalidated pairing slot. The session stays live.
+    SlotInvalid,
+    /// Seal a valid result whose RESULT status is HardwareFail (recoverable).
+    ///
+    /// A PairingKeyWrite / PairingKeyInvalidate OTP write error. The session
+    /// stays live so the caller can react.
+    HardwareFail,
+    /// Seal a valid result whose RESULT status is Unauthorized (recoverable).
+    ///
+    /// An R-Config / I-Config command the active pairing key may not run. The
+    /// session stays live so the caller can react.
+    Unauthorized,
     /// Seal a valid (OK-tag) result whose RESULT byte is an unrecognized value.
     ///
     /// The GCM tag verifies, but the status byte (0x55) maps to no `L3Status`.
     /// The host must surface a recoverable parse error and keep the session.
     UnknownResultStatus,
+}
+
+/// A fault the chip mock injects on the next `Get_Info` reply.
+///
+/// `Get_Info` is a plain L2 command (no secure channel), so its faults live on
+/// the L2 frame, not the L3 result: a wrong RSP_LEN, an error status, a bad CRC,
+/// or no response at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetInfoFault
+{
+    /// Reply faithfully with the configured object payload.
+    None,
+    /// Drop the last RSP_DATA byte so the reply length is one short.
+    WrongLen,
+    /// Reply with an L2 UnknownErr status instead of the data.
+    ErrorStatus,
+    /// Corrupt the reply frame CRC.
+    BadCrc,
+    /// Queue no response (the read path then sees RSP_LEN = 0xFF).
+    NoResp,
+    /// Reply with a valid-CRC frame carrying a RequestCont (more-chunks) status.
+    ///
+    /// A single-frame Get_Info reply must be RequestOk. A *Cont status is a
+    /// malformed reply for this command and must be rejected, not mistaken for a
+    /// complete frame (a truncated read).
+    ContStatus,
 }
 
 /// One queued chip output: a full L2 frame, or an alarm signal on the read.
@@ -359,6 +399,11 @@ pub(crate) struct ChipMockSpi
     ecc_read_pubkey: Vec<u8>,
     ecc_read_pad: usize,
     sign_signature: [u8; 64],
+    pairing_key: [u8; 32],
+    config_value: u32,
+    get_info_objects: BTreeMap<(u8, u8), Vec<u8>>,
+    get_info_fault: GetInfoFault,
+    last_cmd: Vec<u8>,
 }
 
 impl ChipMockSpi
@@ -393,7 +438,40 @@ impl ChipMockSpi
             ecc_read_pubkey: Vec::new(),
             ecc_read_pad: 13,
             sign_signature: [0u8; 64],
+            pairing_key: [0u8; 32],
+            config_value: 0,
+            last_cmd: Vec::new(),
+            get_info_objects: BTreeMap::new(),
+            get_info_fault: GetInfoFault::None,
         }
+    }
+
+    /// Sets the RSP_DATA the mock returns for `Get_Info(object_id, block_index)`.
+    ///
+    /// An object/block left unset replies with the configured fault, or (with
+    /// `GetInfoFault::None`) an empty RSP_DATA frame.
+    pub(crate) fn set_get_info(&mut self, object_id: u8, block_index: u8, data: &[u8])
+    {
+        self.get_info_objects
+            .insert((object_id, block_index), data.to_vec());
+    }
+
+    /// Selects the fault the mock injects on the next `Get_Info` reply.
+    pub(crate) fn set_get_info_fault(&mut self, fault: GetInfoFault)
+    {
+        self.get_info_fault = fault;
+    }
+
+    /// Sets the 32-byte S_HIPUB the mock returns for a PairingKeyRead.
+    pub(crate) fn set_pairing_key(&mut self, key: [u8; 32])
+    {
+        self.pairing_key = key;
+    }
+
+    /// Sets the u32 value the mock returns for an R-Config or I-Config read.
+    pub(crate) fn set_config_value(&mut self, value: u32)
+    {
+        self.config_value = value;
     }
 
     /// Sets the 64-byte R || S signature the mock returns for a sign command.
@@ -456,6 +534,15 @@ impl ChipMockSpi
         (self.cmd_nonce, self.res_nonce)
     }
 
+    /// Returns the last decrypted command plaintext (CMD_ID || CMD_DATA).
+    ///
+    /// Lets a write test pin the byte-exact request layout the chip received,
+    /// including fields the mock otherwise ignores (a write command's payload).
+    pub(crate) fn last_command(&self) -> &[u8]
+    {
+        &self.last_cmd
+    }
+
     /// Frames `data` into a full L2 response frame `[STATUS|LEN|DATA|CRC]`.
     fn frame(status: u8, data: &[u8]) -> Vec<u8>
     {
@@ -478,7 +565,14 @@ impl ChipMockSpi
         let id = frame[0];
         let len = frame[1] as usize;
         let data = &frame[2..2 + len.min(frame.len().saturating_sub(2))];
-        if id == L2ReqId::Handshake as u8
+        if id == L2ReqId::GetInfo as u8
+        {
+            // Get_Info_Req REQ_DATA = OBJECT_ID(1) || BLOCK_INDEX(1).
+            let object_id = data.first().copied().unwrap_or(0);
+            let block_index = data.get(1).copied().unwrap_or(0);
+            self.handle_get_info(object_id, block_index);
+        }
+        else if id == L2ReqId::Handshake as u8
         {
             let mut body = Vec::with_capacity(48);
             body.extend_from_slice(&self.etpub);
@@ -524,11 +618,62 @@ impl ChipMockSpi
         }
     }
 
+    /// Queues the `Get_Info` reply for `(object_id, block_index)`.
+    ///
+    /// Replies with a single RequestOk frame carrying the configured RSP_DATA
+    /// (empty if unset). The active `GetInfoFault` perturbs the reply for the
+    /// driver's error paths.
+    fn handle_get_info(&mut self, object_id: u8, block_index: u8)
+    {
+        if self.get_info_fault == GetInfoFault::NoResp
+        {
+            return;
+        }
+        if self.get_info_fault == GetInfoFault::ErrorStatus
+        {
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::UnknownErr as u8, &[])));
+            return;
+        }
+        if self.get_info_fault == GetInfoFault::ContStatus
+        {
+            // A valid-CRC frame with a continuation status: the driver must
+            // reject it rather than treat it as a complete reply.
+            let data = self
+                .get_info_objects
+                .get(&(object_id, block_index))
+                .cloned()
+                .unwrap_or_default();
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::RequestCont as u8, &data)));
+            return;
+        }
+        let mut data = self
+            .get_info_objects
+            .get(&(object_id, block_index))
+            .cloned()
+            .unwrap_or_default();
+        if self.get_info_fault == GetInfoFault::WrongLen && !data.is_empty()
+        {
+            data.truncate(data.len() - 1);
+        }
+        let mut f = Self::frame(L2Status::RequestOk as u8, &data);
+        if self.get_info_fault == GetInfoFault::BadCrc
+        {
+            let idx = f.len() - 1;
+            f[idx] ^= 0xFF;
+        }
+        self.pending.push_back(Pending::Frame(f));
+    }
+
     /// Decrypts the accumulated command and queues the (possibly faulted) result.
     fn produce_result(&mut self, cmd_size: usize)
     {
         let pt = open(&self.kcmd, self.cmd_nonce, &self.accum[2..2 + cmd_size + 16]);
         self.cmd_nonce += 1;
+        // Record the decrypted command plaintext (CMD_ID || CMD_DATA) so a write
+        // test can assert the byte-exact request layout the chip actually saw.
+        self.last_cmd = pt.clone();
         let mut res_pt = self.build_result_pt(&pt);
         if self.fault == ChipFault::ResultWrongSize && res_pt.len() > 1
         {
@@ -574,6 +719,9 @@ impl ChipMockSpi
             | ChipFault::SlotNotEmpty
             | ChipFault::InvalidKey
             | ChipFault::SlotEmpty
+            | ChipFault::SlotInvalid
+            | ChipFault::HardwareFail
+            | ChipFault::Unauthorized
             | ChipFault::UnknownResultStatus =>
             {}
         }
@@ -640,6 +788,9 @@ impl ChipMockSpi
             ChipFault::SlotNotEmpty => L3Status::SlotNotEmpty as u8,
             ChipFault::InvalidKey => L3Status::InvalidKey as u8,
             ChipFault::SlotEmpty => L3Status::SlotEmpty as u8,
+            ChipFault::SlotInvalid => L3Status::SlotInvalid as u8,
+            ChipFault::HardwareFail => L3Status::HardwareFail as u8,
+            ChipFault::Unauthorized => L3Status::Unauthorized as u8,
             // 0x55 maps to no known L3Status: an unrecognized RESULT byte.
             ChipFault::UnknownResultStatus => 0x55,
             _ => L3Status::Ok as u8,
@@ -653,12 +804,16 @@ impl ChipMockSpi
     /// returns padding plus deterministic bytes, McounterGet returns padding
     /// plus the configured value, RMemDataRead returns padding plus the slot
     /// content, RMemDataWrite stores the payload and returns no RES_DATA,
-    /// MacAndDestroy returns padding plus a deterministic DATA_OUT. The
-    /// `ResultFail`/`CounterInvalid`/`UpdateErr`/`SlotNotEmpty`/`SlotEmpty`
-    /// faults override the status. RMemDataErase, McounterInit, McounterUpdate,
-    /// EccKeyStore, and EccKeyErase carry no RES_DATA, so they fall through to
-    /// the default arm (status byte only); the model integration tests cover
-    /// their store/erase/decrement semantics.
+    /// MacAndDestroy returns padding plus a deterministic DATA_OUT,
+    /// PairingKeyRead returns padding plus the configured S_HIPUB, RConfigRead
+    /// and IConfigRead return padding plus the configured u32 config value. The
+    /// `ResultFail`/`CounterInvalid`/`UpdateErr`/`SlotNotEmpty`/`SlotEmpty`/
+    /// `SlotInvalid`/`HardwareFail` faults override the status. RMemDataErase,
+    /// McounterInit, McounterUpdate, EccKeyStore, EccKeyErase, PairingKeyWrite,
+    /// PairingKeyInvalidate, RConfigWrite, RConfigErase, and IConfigWrite carry no
+    /// RES_DATA, so they fall through to the default arm (status byte only); the
+    /// model integration tests cover their store/erase/decrement/provisioning
+    /// semantics.
     fn build_result_pt(&mut self, pt: &[u8]) -> Vec<u8>
     {
         use crate::ids::CmdId;
@@ -756,6 +911,20 @@ impl ChipMockSpi
                     let din = pt.get(4 + i).copied().unwrap_or(0);
                     res_pt.push(din ^ slot_lo ^ (i as u8));
                 }
+            }
+            Ok(CmdId::PairingKeyRead) =>
+            {
+                // RES_DATA = PADDING(3) || S_HIPUB(32). Returns the configured
+                // pairing key so a test can assert the 3-byte padding skip.
+                res_pt.extend_from_slice(&[0u8; 3]);
+                res_pt.extend_from_slice(&self.pairing_key);
+            }
+            Ok(CmdId::RConfigRead | CmdId::IConfigRead) =>
+            {
+                // RES_DATA = PADDING(3) || VALUE(u32 LE). Both reads share one
+                // result shape, so the configured value covers both commands.
+                res_pt.extend_from_slice(&[0u8; 3]);
+                res_pt.extend_from_slice(&self.config_value.to_le_bytes());
             }
             _ =>
             {}

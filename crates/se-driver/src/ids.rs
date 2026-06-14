@@ -83,12 +83,6 @@ impl TryFrom<u8> for CmdId
 /// Get_Info_Req OBJECT_ID values.
 ///
 /// Source: libtropic `src/lt_l2_api_structs.h`.
-// The only non-test consumer (`Get_Info_Req` for the cert store, chip id, fw
-// versions) is not wired yet, so the enum is dead in the non-test build.
-// `#[allow]` (not `#[expect]`) is required here because the unit tests DO use
-// `ObjectId`, so the lint is fulfilled in the test build and an `#[expect]`
-// would fire `unfulfilled_lint_expectations` there.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ObjectId
