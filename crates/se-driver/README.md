@@ -15,9 +15,10 @@ as a clean-room rewrite with the official C SDK
 > mock (incl. fault injection), a libtropic-derived handshake KAT, and a **live
 > end-to-end suite against the official `tropic01_model` emulator** (real
 > handshake + real AES-GCM, see [Validation](#validation-against-real-libtropic)).
-> Roughly half of the chip's command surface is still unwired (see
-> [Roadmap](#roadmap)) and it has not yet run on real silicon. Not
-> production-grade yet.
+> Most of the chip's command surface is wired. What remains is the X.509 cert
+> ASN.1 parse, the firmware-update bootloader API, and power/mode control (see
+> [Roadmap](#roadmap)). It has not yet run on real silicon. Not production-grade
+> yet.
 
 ## What it does
 
@@ -31,8 +32,9 @@ crate is the host's mouth and ears for that chip:
 - **Fail-closed command gate** - a crypto, structural, or parse fault on any
   command tears the session down and zeroizes the keys. A benign, authenticated
   non-OK status keeps the session live, mirroring libtropic.
-- **Range-checked slot types** - an out-of-range key / counter / memory / PIN slot
-  index cannot even be constructed.
+- **Range-checked index types** - an out-of-range key / counter / memory / PIN /
+  pairing slot or I-Config bit index cannot even be constructed, and a config
+  object address is a closed enum, so only valid registers reach the wire.
 
 All key material (host pairing keys, chip static public key, per-session ephemeral,
 pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardcodes no secrets.
@@ -44,6 +46,7 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | Transport | L1 SPI, L2 framing + multi-chunk reassembly |
 | Secure channel | Noise KK1 handshake, `open_session` / `close_session`, session teardown gate |
 | Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW) |
+| Chip info (L2) | `Get_Info`: `x509_certificate_into` (raw cert store), `chip_id_into`, `riscv_fw_version`, `spect_fw_version`, `fw_bank_into` - read before a session, no secure channel |
 | Diagnostics | `ping` round-trip |
 | TRNG | `random_into` (RandomValueGet, 0x50) |
 | ECC keys | `ecc_key_generate` (0x60), `ecc_public_key` (0x62, returns the chip-attested curve), `ecc_key_store` (0x61, import a private key), `ecc_key_erase` (0x63) |
@@ -51,8 +54,10 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | User memory | `rmem_read_into` (0x41), `rmem_write` (0x40), `rmem_erase` (0x42) |
 | Counters | `mcounter_get` (0x82), `mcounter_init` (0x80), `mcounter_update` (0x81) |
 | PIN primitive | `mac_and_destroy` (0x90), output wrapped in a zeroize-on-drop secret type |
+| Pairing keys | `pairing_key_write` (0x10), `pairing_key_read` (0x11), `pairing_key_invalidate` (0x12) - provision the chip's 4 host-pairing slots |
+| Config objects | `r_config_write` (0x20), `r_config_read` (0x21), `r_config_erase` (0x22, whole R-Config), `i_config_write` (0x30, irreversible OTP bit-burn), `i_config_read` (0x31) - per-command access privileges (CFG_UAP) and chip behaviour |
 
-These fourteen commands are exposed through the public `SeCommands` trait, the only
+These twenty-two commands are exposed through the public `SeCommands` trait, the only
 surface the FIDO2 / OpenPGP / PKCS#11 layers consume.
 
 ## Validation against real libtropic
@@ -79,6 +84,9 @@ robustness.
 | `ecc_key_store` / `ecc_key_erase` | Yes - import a key (distinct seeds give distinct pubkeys), sign with an imported key, erase clears a slot. Import into an occupied slot surfaces `SlotNotEmpty` (recoverable) |
 | `ecdsa_sign` / `eddsa_sign` | Yes - returns a 64-byte signature |
 | `mac_and_destroy` | Yes - returns the 32-byte secret output |
+| `pairing_key_write` / `pairing_key_read` / `pairing_key_invalidate` | Yes - slot 0 reads back the prod0 host pairing pubkey (byte-exact). Write-read-invalidate round-trip on a spare slot. Reading an unprovisioned slot is recoverable |
+| `Get_Info`: cert store / chip id / fw versions | Yes - reads the full 3840-byte cert store, the 128-byte CHIP_ID, and the 4-byte RISCV/SPECT versions. FW_BANK is rejected outside Maintenance Mode (deferred to the FW-update slice) |
+| `r_config_write` / `r_config_read` / `r_config_erase` | Yes - write a CO value to a safe register, read it back byte-exact, erase the whole R-Config and read back all-ones. I-Config read live. The irreversible I-Config write is mock-only (a real burn is one-way) |
 
 The L2 multi-chunk SEND path additionally has a **byte-exact golden KAT**: real
 libtropic frames captured from the model are asserted byte-for-byte against the
@@ -93,9 +101,7 @@ requires (almost everything). The rest matters for a general-purpose driver.
 
 | Block | Commands | What it is for | Needed by PatinaKey |
 |-------|----------|----------------|:---:|
-| Chip info / attestation | `Get_Info` (L2) | X.509 certificate chain, CHIP_ID, firmware versions, FW bank | Yes |
-| Provisioning - pairing | `PairingKeyWrite/Read/Invalidate` 0x10-0x12 | Provision host pairing keys into the chip's 4 slots | Factory / setup |
-| Provisioning - config | `R-Config` 0x20-0x22, `I-Config` 0x30-0x31 | Reversible / irreversible config objects, access privileges (CFG_UAP) | Factory / setup |
+| Attestation (parse) | X.509 ASN.1 decode of the cert store | Extract STPUB and the cert chain from the raw bytes `Get_Info` already returns | Yes |
 | Firmware update | bootloader 0xB0 / 0xB1 | Update the chip's application / SPECT firmware | Yes (planned) |
 | Power / mode | sleep, get-mode (`reboot` done) | Low-power, bootloader vs application mode | Later |
 
