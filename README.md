@@ -27,18 +27,20 @@ The project is under active development. Only the secure-element driver (`crates
 - Noise KK1 handshake: authenticated key agreement with the TROPIC01
 - AES-256-GCM command/response codec with advance-after-verify nonces
 - Fail-closed command gate: a crypto, structural, or parse fault on any command tears the session down and zeroizes the keys
-- The full `SeCommands` trait is assembled over fourteen commands: `random` (TRNG), monotonic-counter read / init / update, R-memory read / write / erase, ECC key generation / public-key read / import / erase, ECDSA / EdDSA signing, and MAC-and-Destroy (PIN primitive), plus a `ping` diagnostic
+- The full `SeCommands` trait is assembled over twenty-two commands: `random` (TRNG), monotonic-counter read / init / update, R-memory read / write / erase, ECC key generation / public-key read / import / erase, ECDSA / EdDSA signing, MAC-and-Destroy (PIN primitive), host-pairing-key write / read / invalidate, and R/I-config object write / read / erase (access privileges, irreversible OTP), plus a `ping` diagnostic
 - ECC public-key read returns the chip's attested curve, so an upper layer cannot pick the wrong signing algorithm
 - The MAC-and-Destroy output is returned in a zeroize-on-drop secret type
-- Range-checked slot types: an out-of-range key/counter/memory/PIN index cannot be constructed
+- Range-checked slot types: an out-of-range key/counter/memory/PIN/pairing index cannot be constructed
 - `reboot` (Startup_Req) to enter Application FW before a session
+- `Get_Info` (L2, no session): reads the raw X.509 certificate store, CHIP_ID, and RISCV/SPECT firmware versions
+- Configuration objects: R-Config write / read / erase and I-Config write / read, gating per-command access by pairing key (CFG_UAP). The I-Config write is a documented irreversible OTP bit-burn
 - Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/se-driver/README.md#validation-against-real-libtropic))
-- 219 host tests, three libFuzzer targets on parser entry points
+- 301 host tests, three libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Part of the TROPIC01 command surface: chip-info/attestation, pairing-key and config-object provisioning, and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
+- Part of the TROPIC01 command surface: X.509 cert parsing (ASN.1 STPUB extraction), the firmware-update bootloader API, and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
 - SE firmware-update path (bootloader 0xB0/0xB1)
 - Validation against real silicon (the `tropic01_model` emulator is already wired up. See the [validation table](crates/se-driver/README.md#validation-against-real-libtropic))
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
