@@ -33,15 +33,16 @@ The project is under active development. Only the secure-element driver (`crates
 - Range-checked slot types: an out-of-range key/counter/memory/PIN/pairing index cannot be constructed
 - `reboot` (Startup_Req) to enter Application FW before a session
 - `Get_Info` (L2, no session): reads the raw X.509 certificate store, CHIP_ID, and RISCV/SPECT firmware versions
-- STPUB extraction: `parse_stpub` / `read_chip_stpub` walk the X.509 cert store's DER (depth-bounded, panic-free) to pull the chip static X25519 key for the handshake. Extraction only, chain verification is deferred
+- STPUB extraction: `parse_stpub` / `read_chip_stpub` walk the X.509 cert store's DER (depth-bounded, panic-free) to pull the chip static X25519 key for the handshake
+- X.509 chain verification: `verify_cert_chain` / `parse_verified_stpub` authenticate the chip identity by verifying the cert chain (ECDSA P-384/SHA-384 then P-521/SHA-512) up to a caller-pinned Tropic root, never trusting the store's own root. Cryptographic path only - validity dates and revocation are left to the integrator
 - Configuration objects: R-Config write / read / erase and I-Config write / read, gating per-command access by pairing key (CFG_UAP). The I-Config write is a documented irreversible OTP bit-burn
 - Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/se-driver/README.md#validation-against-real-libtropic))
-- 330 host tests, four libFuzzer targets on parser entry points
+- 352 host tests, five libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Part of the TROPIC01 command surface: X.509 chain-signature verification (STPUB extraction is done), the firmware-update bootloader API, and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
+- Part of the TROPIC01 command surface: the firmware-update bootloader API and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
 - SE firmware-update path (bootloader 0xB0/0xB1)
 - Validation against real silicon (the `tropic01_model` emulator is already wired up. See the [validation table](crates/se-driver/README.md#validation-against-real-libtropic))
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition

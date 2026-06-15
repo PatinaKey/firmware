@@ -18,6 +18,12 @@ use x25519_dalek::PublicKey;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
 
+use p384::ecdsa::signature::Verifier;
+use p384::ecdsa::Signature as P384Signature;
+use p384::ecdsa::VerifyingKey as P384VerifyingKey;
+use p521::ecdsa::Signature as P521Signature;
+use p521::ecdsa::VerifyingKey as P521VerifyingKey;
+
 /// AES-GCM authentication tag length, in bytes.
 pub(crate) const GCM_TAG_LEN: usize = 16;
 
@@ -137,6 +143,65 @@ pub(crate) fn aes256gcm_open
     cipher
         .decrypt_in_place_detached(&nonce, aad, buffer, &tag)
         .map_err(|_| CryptoError)
+}
+
+/// Verifies an ECDSA/P-384 signature over `msg` with SHA-384.
+///
+/// `pubkey_sec1` is the SEC1 uncompressed point (0x04 || X || Y, 97 bytes).
+/// `msg` is the raw message (the tbsCertificate bytes). The curve default digest
+/// hashes it with SHA-384 internally, matching ecdsa-with-SHA384. `sig_der` is
+/// the ECDSA-Sig-Value DER (SEQUENCE { INTEGER r, INTEGER s }). Any parse or
+/// verification failure maps to `CryptoError`.
+///
+/// This operates on PUBLIC certificate data, so constant time is not required.
+pub(crate) fn ecdsa_p384_sha384_verify
+(
+    pubkey_sec1: &[u8],
+    msg: &[u8],
+    sig_der: &[u8],
+)
+-> Result<(), CryptoError>
+{
+    let vk = P384VerifyingKey::from_sec1_bytes(pubkey_sec1).map_err(|_| CryptoError)?;
+    let sig = P384Signature::from_der(sig_der).map_err(|_| CryptoError)?;
+    // `verify` applies the curve default digest (SHA-384) to `msg`.
+    vk.verify(msg, &sig).map_err(|_| CryptoError)
+}
+
+/// Verifies an ECDSA/P-521 signature over `msg` with SHA-512.
+///
+/// `pubkey_sec1` is the SEC1 uncompressed point (0x04 || X || Y, 133 bytes).
+/// `msg` is the raw message (the tbsCertificate bytes); the curve default digest
+/// hashes it with SHA-512 internally, matching ecdsa-with-SHA512. `sig_der` is
+/// the ECDSA-Sig-Value DER (SEQUENCE { INTEGER r, INTEGER s }). Any parse or
+/// verification failure maps to `CryptoError`.
+///
+/// This operates on PUBLIC certificate data, so constant time is not required.
+pub(crate) fn ecdsa_p521_sha512_verify
+(
+    pubkey_sec1: &[u8],
+    msg: &[u8],
+    sig_der: &[u8],
+)
+-> Result<(), CryptoError>
+{
+    let vk = P521VerifyingKey::from_sec1_bytes(pubkey_sec1).map_err(|_| CryptoError)?;
+    let sig = P521Signature::from_der(sig_der).map_err(|_| CryptoError)?;
+    // `verify` applies the curve default digest (SHA-512) to `msg`.
+    vk.verify(msg, &sig).map_err(|_| CryptoError)
+}
+
+/// Validates that `point` is a real P-521 curve point (SEC1 uncompressed).
+///
+/// Attempts to construct a P-521 verifying key from the SEC1 bytes. A point that
+/// is off the curve, the wrong length, or not 0x04-prefixed is rejected here, so
+/// a malformed pinned anchor fails at construction rather than at first verify.
+///
+/// This operates on PUBLIC key data, so constant time is not required.
+pub(crate) fn p521_validate_point(point: &[u8]) -> Result<(), CryptoError>
+{
+    P521VerifyingKey::from_sec1_bytes(point).map_err(|_| CryptoError)?;
+    Ok(())
 }
 
 #[cfg(test)]

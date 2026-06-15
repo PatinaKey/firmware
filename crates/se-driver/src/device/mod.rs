@@ -91,7 +91,7 @@ pub enum StartupId
 {
     /// Restart and initialize as after a power cycle (loads Application FW).
     Reboot,
-    /// Restart but stay in Start-up (Maintenance) Mode; do not load Application FW.
+    /// Restart but stay in Start-up (Maintenance) Mode. Do not load Application FW.
     MaintenanceReboot,
 }
 

@@ -72,6 +72,18 @@ const SHIPUB: [u8; 32] = hex32("f975eb3c2fd790c96f294f1557a5031780c9aafa140da28f
 // Host ephemeral private key (fresh per session. Fixed here for determinism).
 const EHPRIV: [u8; 32] = hex32("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
 
+// Pinned TEST trust anchor: the P-521 root public key (SEC1 0x04 || X || Y).
+//
+// This is the model's TEST root, captured from model_cfg.yml and cross-checked
+// with openssl. PROD differs: the integrator compiles in the real root. The
+// chain verifier anchors trust HERE, never in the store's self-signed root.
+const MODEL_TEST_ROOT_PUBKEY: [u8; 133] = hex_arr::<133>(
+    "040135c7a24d16b374b207ade8fe50f503ad34e0e596c83fc98adb4c4388ca0ad9b24e\
+     77e984b8978253a8e0d6fd68eaa8d9c9a9a6c8835a138cccff51130da109868000cdf7f\
+     ad5a02bbd84453c5636f25f1c395bdc22ee7b441a81b59f20405389f47d65f074a602f9\
+     332df13379f27d654f4e1b0fd456c1a99f5436640f7ee04e1b4881",
+);
+
 /// A bus error from the model shim.
 #[derive(Debug)]
 struct ModelError;
@@ -228,7 +240,7 @@ fn fresh_no_session() -> Tropic01<ModelSpi, NoWait, se_driver::NoSession>
     let mut spi = ModelSpi::connect();
     spi.reset_target();
     let mut dev = Tropic01::new(spi, NoWait);
-    // Chip boots in Start-up Mode; reboot into Application FW (driver public API).
+    // Chip boots in Start-up Mode. Reboot into Application FW (driver public API).
     dev.reboot(StartupId::Reboot).expect("reboot into Application FW");
     dev
 }
@@ -575,7 +587,7 @@ fn pairing_key_write_then_read_then_invalidate_round_trip()
     let mut se = fresh_session();
     let slot = PairingKeySlot::new(1).unwrap();
     // Deterministic non-zero test key (matches the device.rs sample_pairing_key
-    // formula; the two crates cannot share a private test helper).
+    // formula. The two crates cannot share a private test helper).
     let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
     se.pairing_key_write(slot, &key).expect("write pairing slot 1");
     let read_back = se.pairing_key_read(slot).expect("read pairing slot 1");
@@ -700,14 +712,62 @@ fn read_chip_stpub_returns_pinned_stpub()
 }
 
 #[test]
+fn verify_cert_chain_accepts_the_model_chain()
+{
+    // Read the real store from the model and verify its signature chain up to
+    // the PINNED P-521 TEST root. The model serves an INDEPENDENT chain. If the
+    // tbs byte-range extraction, mixed-algorithm dispatch, SPKI point parsing,
+    // or the ECDSA verify were wrong, this would fail.
+    let mut dev = fresh_no_session();
+    let mut store = [0u8; 3840];
+    let n = dev.x509_certificate_into(&mut store).expect("x509 cert store");
+    assert_eq!(n, 3840);
+    let anchor = se_driver::RootAnchor::from_sec1_p521(&MODEL_TEST_ROOT_PUBKEY)
+        .expect("pinned root is well-formed");
+    se_driver::verify_cert_chain(&store, &anchor).expect("model chain verifies under pinned root");
+}
+
+#[test]
+fn verify_cert_chain_rejects_a_wrong_anchor()
+{
+    // A deliberately wrong pinned anchor must make the product-CA link fail. The
+    // anchor validates the point eagerly, so the wrong anchor is a DIFFERENT but
+    // VALID on-curve P-521 point, derived from a fixed scalar.
+    let mut dev = fresh_no_session();
+    let mut store = [0u8; 3840];
+    dev.x509_certificate_into(&mut store).expect("x509 cert store");
+    let point = other_valid_p521_point();
+    let anchor = se_driver::RootAnchor::from_sec1_p521(&point).expect("valid P-521 point");
+    assert!(
+        se_driver::verify_cert_chain(&store, &anchor).is_err(),
+        "a wrong pinned anchor must reject the chain"
+    );
+}
+
+#[test]
+fn read_verified_chip_stpub_returns_pinned_stpub()
+{
+    // The verified helper reads the store, verifies the chain to the pinned
+    // root, and returns STPUB only through that trusted path.
+    let mut dev = fresh_no_session();
+    let mut scratch = [0u8; 3840];
+    let anchor = se_driver::RootAnchor::from_sec1_p521(&MODEL_TEST_ROOT_PUBKEY)
+        .expect("pinned root is well-formed");
+    let stpub = dev
+        .read_verified_chip_stpub(&mut scratch, &anchor)
+        .expect("read_verified_chip_stpub");
+    assert_eq!(stpub, STPUB, "verified STPUB must match the model's pinned key");
+}
+
+#[test]
 fn get_info_fw_bank_needs_maintenance_mode()
 {
     // FW_BANK is readable ONLY in Start-up (Maintenance) Mode. fresh_no_session
     // reboots into Application FW, where the chip rejects a FW_BANK Get_Info with
     // an L2 error status. We assert the API is reachable and the rejection is a
     // recoverable L2 error (no session state to lose). A full Maintenance-mode
-    // FW_BANK read belongs with the bootloader/FW-update slice (increment 2c),
-    // which drives the chip into Maintenance Mode; it is out of scope here.
+    // FW_BANK read belongs with the bootloader/FW-update slice,
+    // which drives the chip into Maintenance Mode. It is out of scope here.
     let mut dev = fresh_no_session();
     let mut out = [0u8; 64];
     let res = dev.fw_bank_into(FwBankId::Fw1, &mut out);
@@ -722,6 +782,23 @@ fn get_info_fw_bank_needs_maintenance_mode()
 
 // helpers
 
+/// A valid-but-unrelated P-521 SEC1 point, for the "wrong anchor" test.
+///
+/// Derived from a fixed non-trivial scalar so it is a real on-curve point that
+/// the eagerly-validating anchor constructor accepts, yet differs from the model
+/// TEST root, so the chain fails to verify under it.
+fn other_valid_p521_point() -> [u8; 133]
+{
+    use p521::ecdsa::SigningKey;
+    let mut scalar = p521::FieldBytes::default();
+    scalar[65] = 0x02;
+    let sk = SigningKey::from_bytes(&scalar).expect("nonzero scalar");
+    let enc = sk.verifying_key().to_sec1_point(false);
+    let mut out = [0u8; 133];
+    out.copy_from_slice(enc.as_bytes());
+    out
+}
+
 /// Decodes a 64-char hex string to 32 bytes at compile time.
 const fn hex32(s: &str) -> [u8; 32]
 {
@@ -734,6 +811,42 @@ const fn hex32(s: &str) -> [u8; 32]
         i += 1;
     }
     out
+}
+
+/// Decodes a hex string (whitespace allowed) to `N` bytes at compile time.
+///
+/// Skips ASCII whitespace, so the literal may be wrapped across lines.
+const fn hex_arr<const N: usize>(s: &str) -> [u8; N]
+{
+    let b = s.as_bytes();
+    let mut out = [0u8; N];
+    let mut bi = 0;
+    let mut oi = 0;
+    while oi < N
+    {
+        // Skip whitespace before the high nibble.
+        while is_ws(b[bi])
+        {
+            bi += 1;
+        }
+        let hi = nib(b[bi]);
+        bi += 1;
+        while is_ws(b[bi])
+        {
+            bi += 1;
+        }
+        let lo = nib(b[bi]);
+        bi += 1;
+        out[oi] = (hi << 4) | lo;
+        oi += 1;
+    }
+    out
+}
+
+/// Reports whether `c` is ASCII whitespace (space, tab, CR, LF).
+const fn is_ws(c: u8) -> bool
+{
+    matches!(c, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 /// Maps one hex digit to its nibble value.

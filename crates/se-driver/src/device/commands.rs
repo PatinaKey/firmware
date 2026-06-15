@@ -588,7 +588,7 @@ where
     /// SECURITY: an imported key is NON-ATTESTABLE. On-chip it is
     /// indistinguishable from a chip-generated key, so it cannot prove the
     /// private key never left a secure element. FIDO2 credentials must use
-    /// chip-generated keys (`ecc_key_generate`); confine import to the OpenPGP /
+    /// chip-generated keys (`ecc_key_generate`). Confine import to the OpenPGP /
     /// PKCS#11 / imported-SSH path. The driver enforces no such policy.
     ///
     /// A non-OK RESULT is a valid authenticated reply that keeps the session
@@ -764,8 +764,8 @@ where
     /// by the `&[u8; 32]` type, so no runtime argument check is needed. A non-OK
     /// RESULT (Fail, Unauthorized, InvalidCmd) is a valid authenticated reply:
     /// it surfaces as `L3Error::Result` and keeps the session live, mirroring
-    /// libtropic. A consumed slot still replies OK with a changed output;
-    /// destruction is observed host-side, so Fail never means "slot consumed".
+    /// libtropic. A consumed slot still replies OK with a changed output.
+    /// Destruction is observed host-side, so Fail never means "slot consumed".
     /// A bad tag, CRC, alarm, empty result, or wrong-size result poisons the
     /// session.
     pub(crate) fn mac_and_destroy
@@ -828,13 +828,13 @@ where
     ///
     /// Inherent twin of `SeCommands::mcounter_init`. The chip's anti-clone
     /// counters must be initialized before a decrement. The index range is
-    /// enforced by `MCounterIdx`; any 32-bit `value` is accepted. Returns
+    /// enforced by `MCounterIdx`. Any 32-bit `value` is accepted. Returns
     /// `Ok(())` on an initialized counter.
     ///
     /// PROVISIONING ONLY. Init can re-set a counter to any value, including a
     /// higher one, which would defeat the anti-rollback guarantee. The upper
     /// layer must call this only during provisioning and never during normal
-    /// operation; the driver is a faithful transport and enforces no such policy.
+    /// operation. The driver is a faithful transport and enforces no such policy.
     ///
     /// The command has no RES_DATA, so it declares `Some(0)`: an OK result
     /// carrying any payload poisons the session. A non-OK RESULT is a valid
@@ -1159,7 +1159,7 @@ where
     /// chip's response to re-writing an already-cleared bit is NOT documented by
     /// the TROPIC01 docs, so the caller must not rely on a particular status.
     ///
-    /// PROVISIONING ONLY. The driver enforces no policy on when this runs; the
+    /// PROVISIONING ONLY. The driver enforces no policy on when this runs. The
     /// upper layer must. A non-OK RESULT is a valid authenticated reply that
     /// keeps the session live, mirroring libtropic. The command has no RES_DATA,
     /// so it declares `Some(0)`: an OK result carrying any payload poisons. A bad

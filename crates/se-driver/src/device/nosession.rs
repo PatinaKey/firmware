@@ -58,7 +58,7 @@ where
     /// Reboots the chip into the mode selected by `startup_id`.
     ///
     /// Sends a `Startup_Req` (L2 0xB3). The chip boots into Start-up Mode after a
-    /// power cycle; `StartupId::Reboot` loads the Application FW (required before
+    /// power cycle. `StartupId::Reboot` loads the Application FW (required before
     /// `open_session`, since the secure channel and L3 commands live there).
     /// Returns `Ok(())` on the empty success ack. Errors on a bus fault or an
     /// unexpected acknowledgement. Mirrors libtropic `lt_reboot`.
@@ -167,11 +167,11 @@ where
     /// before any chip traffic. STPUB is returned by value, so `scratch` is not
     /// retained: the caller may reuse or wipe it after this returns.
     ///
-    /// The store is 3840 bytes; the caller passes the buffer so the ~4.4 KiB
+    /// The store is 3840 bytes. The caller passes the buffer so the ~4.4 KiB
     /// static handle does not grow a 3840-byte stack frame. Requires Application
     /// FW mode.
     ///
-    /// SECURITY: this extracts STPUB only; it does NOT verify the certificate
+    /// SECURITY: this extracts STPUB only. It does NOT verify the certificate
     /// chain up to the Tropic root (mirrors libtropic `lt_get_st_pub`). The
     /// handshake auth tag binds STPUB, but full chain validation is a future
     /// slice. See `cert::parse_stpub`.
@@ -185,6 +185,45 @@ where
         }
         self.x509_certificate_into(scratch)?;
         crate::cert::parse_stpub(&scratch[..GET_INFO_CERT_STORE_LEN])
+    }
+
+    /// Reads the cert store, verifies the chain, then extracts STPUB.
+    ///
+    /// Mirrors `read_chip_stpub`, but verifies the certificate-chain signatures
+    /// up to the caller-PINNED root `anchor` before returning STPUB. STPUB is
+    /// thus only returned through a verified path. Reads the full store into
+    /// `scratch`, runs `parse_verified_stpub`, and returns the 32 STPUB bytes by
+    /// value (STPUB is PUBLIC). `scratch` is not retained.
+    ///
+    /// `scratch` must hold the whole store: shorter than `GET_INFO_CERT_STORE_LEN`
+    /// is rejected with `BufferTooSmall` up front, before any chip traffic.
+    ///
+    /// SECURITY: the trust anchor is supplied OUT-OF-BAND, never read from the
+    /// store. The PROD root differs from any TEST root. The integrator compiles
+    /// in the correct production root point. This verifies the cryptographic
+    /// chain only. date-validity and revocation are deferred (see
+    /// `cert::verify_cert_chain`).
+    ///
+    /// SEAM: `open_session` currently takes STPUB via `SessionConfig`. To make a
+    /// session depend on a VERIFIED STPUB, the caller obtains it here and passes
+    /// it to `open_session`. Wiring verification into `open_session` directly is
+    /// a follow-up. The verified-STPUB value already flows through this method.
+    pub fn read_verified_chip_stpub
+    (
+        &mut self,
+        scratch: &mut [u8],
+        anchor: &crate::RootAnchor,
+    )
+    -> Result<[u8; 32], SeError>
+    {
+        // Require the full store buffer up front, before any traffic, mirroring
+        // read_chip_stpub. Recoverable: no session.
+        if scratch.len() < GET_INFO_CERT_STORE_LEN
+        {
+            return Err(SeError::BufferTooSmall);
+        }
+        self.x509_certificate_into(scratch)?;
+        crate::cert::parse_verified_stpub(&scratch[..GET_INFO_CERT_STORE_LEN], anchor)
     }
 
     /// Reads the 128-byte CHIP_ID into `out`, returning 128.

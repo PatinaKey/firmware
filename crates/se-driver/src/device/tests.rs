@@ -2,7 +2,7 @@
 //!
 //! Moved verbatim from `device.rs` and de-indented. Device-local types,
 //! constants, and the test-only accessors (`spi_ref`, `spi_mut`, `seed_nonces`)
-//! are imported by name from the parent module; crate-internal items and the
+//! are imported by name from the parent module. Crate-internal items and the
 //! chip mock are imported explicitly.
 
 use super::ActiveSession;
@@ -73,7 +73,7 @@ fn reboot_succeeds_on_empty_request_ok_ack()
 #[test]
 fn reboot_rejects_a_nonempty_ack()
 {
-    // A Startup ack must carry no data; a non-empty one is a malformed reply.
+    // A Startup ack must carry no data. A non-empty one is a malformed reply.
     let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[0xAA])];
     let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
     assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::BadFrame)));
@@ -82,7 +82,7 @@ fn reboot_rejects_a_nonempty_ack()
 #[test]
 fn reboot_rejects_a_continuation_status()
 {
-    // Only RequestOk acknowledges a Startup_Req; a *Cont status is anomalous.
+    // Only RequestOk acknowledges a Startup_Req. A *Cont status is anomalous.
     let acks = std::vec![l2_frame(L2Status::RequestCont as u8, &[])];
     let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
     assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::BadFrame)));
@@ -2498,7 +2498,7 @@ fn cbit(value: u8) -> ConfigBitIndex
 fn i_config_write_round_trips_and_advances_nonces()
 {
     // The write carries ADDRESS || BIT_INDEX (no value). A successful burn
-    // round-trips and advances both nonces; a second at the max bit also
+    // round-trips and advances both nonces. A second at the max bit also
     // works, proving the 4-byte plaintext reaches the chip.
     let mut dev = open(ChipFault::None);
     assert_eq!(dev.i_config_write(ConfigObjectAddr::CfgUapPing, cbit(0)), Ok(()));
@@ -2978,7 +2978,7 @@ fn fw_bank_into_rejects_an_unexpected_length()
 fn fw_bank_into_selects_the_requested_bank()
 {
     let mut dev = no_session(GetInfoFault::None);
-    // Each bank gets a distinct 20-byte header; reading SPECT1 must return
+    // Each bank gets a distinct 20-byte header. Reading SPECT1 must return
     // SPECT1's, proving the BLOCK_INDEX selects the right bank.
     dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Fw1.wire_byte(), &[0x11u8; 20]);
     dev.spi_mut().set_get_info(ObjectId::FwBank as u8, FwBankId::Spect1.wire_byte(), &[0x22u8; 20]);

@@ -45,3 +45,10 @@ path = "fuzz_targets/parse_stpub.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "verify_cert_chain"
+path = "fuzz_targets/verify_cert_chain.rs"
+test = false
+doc = false
+bench = false

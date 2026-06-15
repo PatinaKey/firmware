@@ -14,9 +14,25 @@ license = "GPL-3.0-or-later"
 embedded-hal = "1.0"
 zeroize = { version = "1.9", default-features = false, features = ["derive"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
+# ECDSA verification of the TROPIC01 X.509 attestation chain (P-384/SHA-384 on
+# the lower links, P-521/SHA-512 up to the Tropic root). Verification only: no
+# secret key and no secret-dependent path runs here, so the inputs are public
+# certificates and the failure modes are correctness, not side-channel leakage.
+#
+# These are RELEASE CANDIDATES on purpose. The crate tree already sits on the
+# RustCrypto digest 0.11 / crypto-common 0.2 generation (sha2 0.11, hmac 0.13).
+# The matching p384/p521/ecdsa releases that speak that same generation are still
+# release candidates. the last STABLE curve releases (p384 0.13, ecdsa 0.16) speak the older
+# digest 0.10 generation and would pull a SECOND copy of sha2/digest into the
+# binary. Pinning the rc keeps a single crypto generation, which is the smaller
+# audit and flash surface. 
+# TODO: drop the -rc pins once p384/p521 0.14 and ecdsa 0.17 ship stable.
+ecdsa = { version = "0.17.0-rc.19", default-features = false }
+p384 = { version = "0.14.0-rc.11", default-features = false, features = ["ecdsa"] }
+p521 = { version = "0.14.0-rc.11", default-features = false, features = ["ecdsa"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

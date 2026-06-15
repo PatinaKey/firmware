@@ -33,6 +33,9 @@ x25519-dalek = { workspace = true }
 aes-gcm = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+ecdsa = { workspace = true }
+p384 = { workspace = true }
+p521 = { workspace = true }
 
 [lints]
 workspace = true

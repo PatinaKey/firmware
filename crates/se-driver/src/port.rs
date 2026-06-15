@@ -471,7 +471,7 @@ pub trait SeCommands
     ///
     /// SECURITY: an imported key is non-attestable (indistinguishable on-chip
     /// from a chip-generated one). FIDO2 credentials must use chip-generated
-    /// keys; confine import to the OpenPGP / PKCS#11 / imported-SSH path.
+    /// keys. Confine import to the OpenPGP / PKCS#11 / imported-SSH path.
     fn ecc_key_store
     (
         &mut self,
@@ -594,7 +594,7 @@ pub trait SeCommands
     /// Initializes monotonic counter `idx` to `value`.
     ///
     /// The anti-clone counters must be initialized before a decrement. The index
-    /// range (0..=15) is enforced by `MCounterIdx::new`; any 32-bit `value` is
+    /// range (0..=15) is enforced by `MCounterIdx::new`, any 32-bit `value` is
     /// accepted. A non-OK RESULT keeps the session live.
     ///
     /// PROVISIONING ONLY. Init can re-set a counter to a higher value and defeat
@@ -612,7 +612,7 @@ pub trait SeCommands
     ///
     /// The decrement is fixed at one. A counter already at zero surfaces as a
     /// recoverable `L3Error::Result(UpdateErr)`, and an uninitialized or locked
-    /// counter as `L3Error::Result(CounterInvalid)`; both keep the session live.
+    /// counter as `L3Error::Result(CounterInvalid)`, both keep the session live.
     /// The index range (0..=15) is enforced by `MCounterIdx::new`.
     fn mcounter_update
     (

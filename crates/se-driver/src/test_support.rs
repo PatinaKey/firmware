@@ -811,7 +811,7 @@ impl ChipMockSpi
     /// `SlotInvalid`/`HardwareFail` faults override the status. RMemDataErase,
     /// McounterInit, McounterUpdate, EccKeyStore, EccKeyErase, PairingKeyWrite,
     /// PairingKeyInvalidate, RConfigWrite, RConfigErase, and IConfigWrite carry no
-    /// RES_DATA, so they fall through to the default arm (status byte only); the
+    /// RES_DATA, so they fall through to the default arm (status byte only). The
     /// model integration tests cover their store/erase/decrement/provisioning
     /// semantics.
     fn build_result_pt(&mut self, pt: &[u8]) -> Vec<u8>

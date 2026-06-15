@@ -95,6 +95,35 @@ pub enum CertError
     Malformed,
 }
 
+/// X.509 certificate-chain signature-verification errors.
+///
+/// Raised while verifying the DEVICE -> ... -> pinned-root signature path of the
+/// `Get_Info` cert store. The certificates are attacker-influenced (they come
+/// from the chip), so every variant is a fail-closed rejection. The load-bearing
+/// trust step is verifying the product CA under the caller-PINNED root key, never
+/// under a key taken from the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainError
+{
+    /// The store header declared a certificate count other than the expected 4.
+    WrongCertCount,
+    /// A certificate's signatureAlgorithm OID was not one of the supported
+    /// ecdsa-with-SHA384 / ecdsa-with-SHA512.
+    UnsupportedSigAlg,
+    /// An issuer SubjectPublicKeyInfo did not hold a supported EC public key
+    /// (wrong algorithm OID, wrong curve, or a malformed point).
+    BadPublicKey,
+    /// A signature did not verify under the issuer (or pinned-root) public key.
+    /// This is the fail-closed result for any tampered or reordered certificate.
+    BadSignature,
+    /// A certificate's DER structure was malformed while locating the
+    /// tbsCertificate, signatureAlgorithm, or signatureValue.
+    Malformed,
+    /// A DER length used long-form over 2 bytes or indefinite form - the same
+    /// encoding the parser rejects elsewhere. Maps from the shared parse_der_len.
+    Unsupported,
+}
+
 /// Bounds-checked parser errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError
@@ -122,6 +151,8 @@ pub enum SeError
     Handshake(HandshakeError),
     /// Parsing the X.509 certificate store (STPUB extraction) failed.
     Cert(CertError),
+    /// Verifying the X.509 certificate chain up to the pinned root failed.
+    Chain(ChainError),
     /// The session was torn down. Re-handshake before any further L3 command.
     SessionLost,
     /// The AES-GCM nonce counter reached its maximum. Session is fatal.
@@ -212,6 +243,14 @@ impl From<CertError> for SeError
     }
 }
 
+impl From<ChainError> for SeError
+{
+    fn from(e: ChainError) -> Self
+    {
+        SeError::Chain(e)
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -263,6 +302,13 @@ mod tests
     {
         let e: SeError = CertError::KeyNotFound.into();
         assert_eq!(e, SeError::Cert(CertError::KeyNotFound));
+    }
+
+    #[test]
+    fn chain_folds_into_se_error()
+    {
+        let e: SeError = ChainError::BadSignature.into();
+        assert_eq!(e, SeError::Chain(ChainError::BadSignature));
     }
 
     #[test]
