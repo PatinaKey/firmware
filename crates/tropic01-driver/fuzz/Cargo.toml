@@ -1,0 +1,54 @@
+[package]
+name = "tropic01-driver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Detach from the firmware workspace: the fuzz crate is a standalone, nightly,
+# instrumented build and must not be a workspace member.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.tropic01-driver]
+path = ".."
+features = ["_fuzz"]
+
+[[bin]]
+name = "parse_l2_response"
+path = "fuzz_targets/parse_l2_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt_l3_result"
+path = "fuzz_targets/decrypt_l3_result.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_handshake_resp"
+path = "fuzz_targets/parse_handshake_resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_stpub"
+path = "fuzz_targets/parse_stpub.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_cert_chain"
+path = "fuzz_targets/verify_cert_chain.rs"
+test = false
+doc = false
+bench = false
