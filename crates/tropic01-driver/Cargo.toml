@@ -5,10 +5,10 @@ version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "A no_std, panic-free Rust driver for the TROPIC01 secure element (Noise KK1 secure channel over SPI)."
+description = "Unofficial no_std, panic-free Rust driver for the TROPIC01 secure element."
 readme = "README.md"
 documentation = "Not published to docs.rs yet."
-keywords = ["tropic01", "secure-element", "no-std", "embedded", "ecc"]
+keywords = ["tropic01", "secure-element", "no-std", "no_std", "embedded", "crypto"]
 categories = ["embedded", "no-std", "cryptography", "hardware-support"]
 # Dev/validation tooling kept out of the published package. The crate is the
 # library. The fuzz harness has its own detached workspace and the scripts need
