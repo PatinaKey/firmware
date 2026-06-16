@@ -13,9 +13,10 @@
 //! and the command-layout constants). The behaviour is split across child
 //! modules:
 //!
-//! - `nosession`: pre-session L2 ops (`reboot`, `Get_Info`) and `open_session`.
-//! - `commands`: the `ActiveSession` lifecycle, the `run` gate, and every L3
-//!   command.
+//! - `nosession`: pre-session L2 ops (`reboot`, `Get_Info`, `sleep`,
+//!   `chip_mode`, `get_log_into`) and `open_session`.
+//! - `commands`: the `ActiveSession` lifecycle (`close_session`,
+//!   `abort_session`), the `run` gate, and every L3 command.
 //! - `se_commands`: the `SeCommands` trait impl that delegates to those commands.
 //!
 //! Child modules import the shared definitions here by name from `super`.
@@ -145,6 +146,22 @@ impl FwBankId
             FwBankId::Spect2 => 0x12,
         }
     }
+}
+
+/// The operating mode the chip reports through CHIP_STATUS.
+///
+/// Decoded from the raw CHIP_STATUS byte (the raw byte is never exposed). The
+/// driver maps it like libtropic `lt_get_tr01_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipMode
+{
+    /// Application FW is running. L2 requests and L3 commands are available.
+    Application,
+    /// Start-up (Maintenance) Mode. Only Bootloader L2 requests are available.
+    Startup,
+    /// Alarm Mode. The chip rejects normal traffic until a power cycle or reset.
+    /// This is a terminal state: do not retry, reset the chip.
+    Alarm,
 }
 
 /// The TROPIC01 device handle.

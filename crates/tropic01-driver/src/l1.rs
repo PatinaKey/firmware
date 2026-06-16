@@ -21,9 +21,11 @@ use crate::ids::L2ReqId;
 use crate::wait::SeWait;
 
 /// CHIP_STATUS READY bit: the chip has a response ready.
-const CHIP_STATUS_READY: u8 = 0x01;
+pub(crate) const CHIP_STATUS_READY: u8 = 0x01;
 /// CHIP_STATUS ALARM bit: the chip is in alarm mode.
-const CHIP_STATUS_ALARM: u8 = 0x02;
+pub(crate) const CHIP_STATUS_ALARM: u8 = 0x02;
+/// CHIP_STATUS STARTUP bit: the chip is in Start-up (Maintenance) Mode.
+pub(crate) const CHIP_STATUS_STARTUP: u8 = 0x04;
 /// GET_RESPONSE request id (clocked out to fetch a response).
 const GET_RESPONSE_REQ_ID: u8 = L2ReqId::GetResponse as u8;
 /// RSP_LEN sentinel meaning "no response available yet".
@@ -107,6 +109,51 @@ where
                 }
                 return Ok(frame_len);
             }
+        }
+        wait.delay_ms(READ_RETRY_DELAY_MS).map_err(|_| L1Error::Bus)?;
+        tries += 1;
+    }
+    Err(L1Error::ChipBusy)
+}
+
+/// Polls GET_RESPONSE until the chip settles, returning the raw CHIP_STATUS byte.
+///
+/// Clocks 0xAA to read CHIP_STATUS using the same constants as `read_response`
+/// (`READ_MAX_TRIES`, `READ_RETRY_DELAY_MS`), but returns the byte UNINTERPRETED
+/// once the chip is settled (READY or ALARM
+/// set). Unlike `read_response`, ALARM is NOT mapped to an error here: the chip
+/// mode is a value the caller decodes, so it must survive to the caller. Exhausting
+/// the retry budget returns `L1Error::ChipBusy`. Mirrors libtropic
+/// `lt_get_tr01_mode`'s CHIP_STATUS poll.
+///
+/// # Errors
+///
+/// `L1Error::Bus` on a bus fault and `L1Error::ChipBusy` when the chip never
+/// settles within the retry budget.
+pub(crate) fn read_chip_status<SPI, W>
+(
+    spi: &mut SPI,
+    wait: &mut W,
+)
+-> Result<u8, L1Error>
+where
+    SPI: SpiDevice,
+    W: SeWait,
+{
+    let mut tries = 0u32;
+    while tries < READ_MAX_TRIES
+    {
+        // Clock 0xAA and read back CHIP_STATUS only. No frame follows: the mode
+        // poll needs the status byte alone.
+        let mut status = [GET_RESPONSE_REQ_ID];
+        spi.transaction(&mut [Operation::TransferInPlace(&mut status)])
+            .map_err(|_| L1Error::Bus)?;
+        let chip_status = status[0];
+        // ALARM short-circuits the poll like in libtropic: it is a settled mode,
+        // not a transient busy state. READY likewise means the chip has settled.
+        if chip_status & (CHIP_STATUS_ALARM | CHIP_STATUS_READY) != 0
+        {
+            return Ok(chip_status);
         }
         wait.delay_ms(READ_RETRY_DELAY_MS).map_err(|_| L1Error::Bus)?;
         tries += 1;

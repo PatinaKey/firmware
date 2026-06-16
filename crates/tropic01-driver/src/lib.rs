@@ -48,6 +48,7 @@ pub use crate::cert::verify_cert_chain;
 pub use crate::cert::RootAnchor;
 pub use crate::device::ActiveSession;
 pub use crate::device::Bootloader;
+pub use crate::device::ChipMode;
 pub use crate::device::FwBankId;
 pub use crate::device::NoSession;
 pub use crate::device::SessionConfig;

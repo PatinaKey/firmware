@@ -2,9 +2,10 @@
 //!
 //! Plain-L2 commands available before a secure channel exists: `reboot`, the
 //! `Get_Info` family (X.509 cert store, CHIP_ID, firmware versions, FW banks),
-//! and `open_session`, which runs the Noise KK1 handshake and transitions the
-//! handle to `ActiveSession`. No AES-GCM, no nonce, no session to poison: a
-//! non-OK chip status surfaces as an `L2Error` and is recoverable by nature.
+//! `sleep`, `chip_mode`, `get_log_into`, and `open_session`, which runs the
+//! Noise KK1 handshake and transitions the handle to `ActiveSession`. No
+//! AES-GCM, no nonce, no session to poison: a non-OK chip status surfaces as an
+//! `L2Error` and is recoverable by nature.
 
 use embedded_hal::spi::SpiDevice;
 use zeroize::Zeroize;
@@ -24,6 +25,7 @@ use crate::session::SessionKeys;
 use crate::wait::SeWait;
 
 use super::ActiveSession;
+use super::ChipMode;
 use super::FwBankId;
 use super::NoSession;
 use super::SessionConfig;
@@ -33,6 +35,12 @@ use super::parse_handshake_resp;
 use super::GET_INFO_BLOCK_LEN;
 use super::GET_INFO_CERT_STORE_BLOCKS;
 use super::GET_INFO_CERT_STORE_LEN;
+
+/// `Sleep_Req` SLEEP_KIND for normal Sleep Mode.
+///
+/// The only documented kind (Deep Sleep was removed). Source: libtropic
+/// `TR01_L2_SLEEP_KIND_SLEEP`.
+const SLEEP_KIND_SLEEP_MODE: u8 = 0x05;
 
 impl<SPI, W> Tropic01<SPI, W, NoSession>
 where
@@ -331,6 +339,118 @@ where
             return Err(SeError::L2(L2Error::BadFrame));
         }
         Ok(n)
+    }
+
+    /// Puts the chip into Sleep Mode.
+    ///
+    /// Sends a `Sleep_Req` (L2 0x20) with SLEEP_KIND = Sleep Mode. Returns
+    /// `Ok(())` on the empty success ack. Mirrors libtropic `lt_sleep`.
+    ///
+    /// SECURITY: entering sleep INVALIDATES any active L3 session chip-side. This
+    /// handle is `NoSession`, so there is no host session to tear down here. A
+    /// caller holding an `ActiveSession` must `close_session` or `abort_session`
+    /// BEFORE sleeping, or its session keys would outlive the channel the chip
+    /// has already dropped.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::L2(L2Error::Status(_))` when sleep is disabled (the chip replies
+    /// RespDisabled when CFG_SLEEP_MODE is off), recoverable since no session
+    /// exists. `SeError::L2(L2Error::BadFrame)` on an unexpected acknowledgement.
+    /// Otherwise `SeError` on a bus fault.
+    pub fn sleep(&mut self) -> Result<(), SeError>
+    {
+        // Sleep_Req body = SLEEP_KIND(1). REQ_LEN = 1, RSP carries no data.
+        let body = [SLEEP_KIND_SLEEP_MODE];
+        let n = frame::build_request(L2ReqId::Sleep as u8, &body, &mut self.l2)?;
+        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
+        let frame_len =
+            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
+        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        // A successful Sleep_Req is acknowledged with an empty RequestOk frame.
+        if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        Ok(())
+    }
+
+    /// Reads the chip's current operating mode from CHIP_STATUS.
+    ///
+    /// Polls GET_RESPONSE for the CHIP_STATUS byte and decodes it. Returns
+    /// `ChipMode`, never the raw byte. Mirrors libtropic `lt_get_tr01_mode`.
+    ///
+    /// `ChipMode::Alarm` is a TERMINAL state: the chip rejects normal traffic
+    /// until a reset, so the caller must stop issuing commands and reset rather
+    /// than retry.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::L1(L1Error::ChipBusy)` when the chip never settles within the
+    /// retry budget. Otherwise `SeError` on a bus fault.
+    pub fn chip_mode(&mut self) -> Result<ChipMode, SeError>
+    {
+        // A bus or busy fault surfaces directly as SeError::L1: this is a raw L1
+        // status poll, with no L2 frame, CRC, or status byte to interpret.
+        let status = l1::read_chip_status(&mut self.spi, &mut self.wait)?;
+        // Decode order matches libtropic lt_get_tr01_mode: ALARM wins, then
+        // STARTUP, else Application. Reserved bits 3..=7 are ignored.
+        let mode = if status & l1::CHIP_STATUS_ALARM != 0
+        {
+            ChipMode::Alarm
+        }
+        else if status & l1::CHIP_STATUS_STARTUP != 0
+        {
+            ChipMode::Startup
+        }
+        else
+        {
+            ChipMode::Application
+        };
+        Ok(mode)
+    }
+
+    /// Reads the chip's debug log into `out`, returning the RSP_DATA length.
+    ///
+    /// Sends a `Get_Log_Req` (L2 0xA2) with no body and copies the reply into
+    /// `out`. The log is the RAW RISC-V FW debug buffer (up to 252 bytes, the L2
+    /// frame data limit), passed through verbatim: the driver parses no internal
+    /// structure. Size `out` to 252 bytes to hold any reply. Mirrors libtropic
+    /// `lt_get_log_req`.
+    ///
+    /// In a PRODUCTION build the log is IRREVERSIBLY disabled (CFG_DEBUG's
+    /// FW_LOG_EN bit is burned off), so expect an empty reply or a disabled
+    /// status. This is a debug aid, never a security input.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `out` is shorter than the RSP_DATA.
+    /// `SeError::L2(L2Error::Status(_))` when logging is disabled (recoverable,
+    /// no session). `SeError::L2(L2Error::BadFrame)` on a continuation status,
+    /// which is anomalous for this single-frame reply. Otherwise `SeError` on a
+    /// bus fault.
+    pub fn get_log_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
+    {
+        // Get_Log_Req body is empty. REQ_LEN = 0.
+        let n = frame::build_request(L2ReqId::GetLog as u8, &[], &mut self.l2)?;
+        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
+        let frame_len =
+            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
+        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        // parse_response maps a non-OK chip status to L2Error::Status, but it
+        // still returns the data-bearing continuation statuses. A Get_Log reply
+        // is a single RequestOk frame, so a *Cont (or any other accepted status)
+        // is anomalous here and is rejected as BadFrame, like get_info_block.
+        if !matches!(resp.status, L2Status::RequestOk)
+        {
+            return Err(SeError::L2(L2Error::BadFrame));
+        }
+        if out.len() < resp.data.len()
+        {
+            return Err(SeError::BufferTooSmall);
+        }
+        out[..resp.data.len()].copy_from_slice(resp.data);
+        Ok(resp.data.len())
     }
 }
 

@@ -15,7 +15,7 @@ as a clean-room rewrite with the official C SDK
 > mock (incl. fault injection), a libtropic-derived handshake KAT, and a **live
 > end-to-end suite against the official `tropic01_model` emulator** (real
 > handshake + real AES-GCM, see [Validation](#validation-against-real-libtropic)).
-> Most of the chip's command surface is wired, including X.509 chain verification up to the pinned Tropic root. What remains is the firmware-update bootloader API and power/mode control (see [Roadmap](#roadmap)). It has not yet run on real silicon. Not production-grade yet.
+> Most of the chip's command surface is wired, including X.509 chain verification up to the pinned Tropic root and the power / mode / session-lifecycle L2 commands. What remains is the firmware-update bootloader API (see [Roadmap](#roadmap)). It has not yet run on real silicon. Not production-grade yet.
 
 ## What it does
 
@@ -41,12 +41,12 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | Area | What works |
 |------|------------|
 | Transport | L1 SPI, L2 framing + multi-chunk reassembly |
-| Secure channel | Noise KK1 handshake, `open_session` / `close_session`, session teardown gate |
-| Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW) |
+| Secure channel | Noise KK1 handshake, `open_session` / `close_session`, `abort_session` (Encrypted_Session_Abt_Req 0x08: notifies the chip to drop the session, wipes host secrets first), session teardown gate |
+| Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW), `sleep` (Sleep_Req 0x20), `chip_mode` (decodes CHIP_STATUS to Application / Startup / Alarm) |
 | Chip info (L2) | `Get_Info`: `x509_certificate_into` (raw cert store), `chip_id_into`, `riscv_fw_version`, `spect_fw_version`, `fw_bank_into` - read before a session, no secure channel |
 | Attestation (parse) | `parse_stpub` / `read_chip_stpub`: extract the chip static X25519 key (STPUB) from the X.509 cert store via a depth-bounded, panic-free DER walk |
 | Attestation (verify) | `verify_cert_chain` / `parse_verified_stpub` / `read_verified_chip_stpub`: verify the cert chain DEVICE -> XXXX CA -> product CA up to a caller-pinned Tropic root (ECDSA P-384/SHA-384 then P-521/SHA-512, mixed-algorithm dispatched per cert). The root is pinned out-of-band, never trusted from the store. Cryptographic path only - dates / revocation are left to the integrator |
-| Diagnostics | `ping` round-trip |
+| Diagnostics | `ping` round-trip, `get_log_into` (Get_Log_Req 0xA2: raw RISC-V FW debug log, disabled on production parts) |
 | TRNG | `random_into` (RandomValueGet, 0x50) |
 | ECC keys | `ecc_key_generate` (0x60), `ecc_public_key` (0x62, returns the chip-attested curve), `ecc_key_store` (0x61, import a private key), `ecc_key_erase` (0x63) |
 | Signing | `ecdsa_sign` (0x70, P-256), `eddsa_sign` (0x71, Ed25519) |
@@ -74,7 +74,11 @@ robustness.
 | Operation | Validated against the model |
 |-----------|:---:|
 | `reboot` (Startup_Req) | Yes - byte-exact frame KAT + live Start-up -> Application FW |
+| `sleep` (Sleep_Req) | Yes - byte-exact frame KAT + reachable live |
+| `chip_mode` (CHIP_STATUS) | Yes - reports Application after reboot (Start-up not modelled) |
+| `get_log_into` (Get_Log_Req) | Yes - byte-exact frame KAT + recoverable empty reply live |
 | `open_session` (handshake) | Yes - real Noise KK1, every live test depends on it |
+| `abort_session` (Encrypted_Session_Abt_Req) | Yes - the chip drops the session, a later L3 needs a fresh handshake |
 | `ping` | Yes - small + a 600-byte payload (live 3-chunk L2 SEND) |
 | `random_into` | Yes - fills the requested buffer |
 | `rmem_write` / `rmem_read_into` / `rmem_erase` | Yes - round-trips data. Re-write surfaces `SlotNotEmpty` (recoverable). Erase clears a slot for a fresh write |
@@ -103,7 +107,6 @@ requires (almost everything). The rest matters for a general-purpose driver.
 | Block | Commands | What it is for | Needed by PatinaKey |
 |-------|----------|----------------|:---:|
 | Firmware update | bootloader 0xB0 / 0xB1 | Update the chip's application / SPECT firmware | Yes (planned) |
-| Power / mode | sleep, get-mode (`reboot` done) | Low-power, bootloader vs application mode | Later |
 
 Non-command work toward a publishable crate: validate against silicon (the
 `tropic01_model` emulator is already wired, see

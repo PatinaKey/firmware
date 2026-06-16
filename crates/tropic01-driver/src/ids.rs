@@ -123,6 +123,7 @@ pub(crate) enum L2ReqId
     GetInfo = 0x01,
     Handshake = 0x02,
     EncryptedCmd = 0x04,
+    EncryptedSessionAbt = 0x08,
     Resend = 0x10,
     Sleep = 0x20,
     GetLog = 0xA2,
@@ -144,6 +145,7 @@ impl TryFrom<u8> for L2ReqId
             0x01 => L2ReqId::GetInfo,
             0x02 => L2ReqId::Handshake,
             0x04 => L2ReqId::EncryptedCmd,
+            0x08 => L2ReqId::EncryptedSessionAbt,
             0x10 => L2ReqId::Resend,
             0x20 => L2ReqId::Sleep,
             0xA2 => L2ReqId::GetLog,
@@ -311,7 +313,7 @@ mod tests
     #[test]
     fn l2_req_id_round_trips()
     {
-        for v in [0x01u8, 0x02, 0x04, 0x10, 0x20, 0xA2, 0xAA, 0xB0, 0xB1, 0xB2, 0xB3]
+        for v in [0x01u8, 0x02, 0x04, 0x08, 0x10, 0x20, 0xA2, 0xAA, 0xB0, 0xB1, 0xB2, 0xB3]
         {
             assert_eq!(L2ReqId::try_from(v).unwrap() as u8, v);
         }
