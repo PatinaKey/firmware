@@ -4,6 +4,8 @@ A `no_std`, heap-free, `unsafe-free` Rust driver for the **TROPIC01** secure
 element (Tropic Square, part `TR01-C2P-T301`), spoken over SPI through an
 authenticated, encrypted **Noise KK1** session.
 
+⚠️ Disclaimer: This is an unofficial, community-driven project. It is not affiliated with, endorsed by, or officially supported by Tropic Square. For the official SDK, please refer to Tropic Square's libtropic.
+
 It is the secure-element layer of the
 [PatinaKey](https://github.com/PatinaKey/firmware) hardware security key, written
 as a clean-room rewrite with the official C SDK
