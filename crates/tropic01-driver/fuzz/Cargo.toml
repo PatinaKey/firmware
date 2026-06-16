@@ -1,5 +1,5 @@
 [package]
-name = "se-driver-fuzz"
+name = "tropic01-driver-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -14,7 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.se-driver]
+[dependencies.tropic01-driver]
 path = ".."
 features = ["_fuzz"]
 

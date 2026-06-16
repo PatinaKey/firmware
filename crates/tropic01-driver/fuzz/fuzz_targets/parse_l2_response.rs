@@ -9,5 +9,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]|
 {
-    se_driver::fuzz::parse_l2_response(data);
+    tropic01_driver::fuzz::parse_l2_response(data);
 });

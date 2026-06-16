@@ -79,11 +79,11 @@ clippy_reports()
 {
     cargo clippy --workspace --locked --all-targets --all-features \
         --message-format=json > clippy-report.json || true
-    cargo clippy -p se-driver --locked --target thumbv8m.main-none-eabihf \
+    cargo clippy -p tropic01-driver --locked --target thumbv8m.main-none-eabihf \
         --message-format=json >> clippy-report.json || true
     RUSTFLAGS="-D warnings" cargo clippy --workspace --locked --all-targets --all-features -- -D warnings \
         || return 1
-    RUSTFLAGS="-D warnings" cargo clippy -p se-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
+    RUSTFLAGS="-D warnings" cargo clippy -p tropic01-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
 }
 
 audit_stage()
@@ -151,7 +151,7 @@ coverage_stage()
 fuzz_stage()
 {
     (
-        cd crates/se-driver || exit 1
+        cd crates/tropic01-driver || exit 1
         for t in parse_l2_response decrypt_l3_result parse_handshake_resp
         do
             cargo +nightly fuzz run "$t" -- -max_total_time="$FUZZ_SECS" -timeout=10 || exit 1
@@ -165,7 +165,7 @@ RUSTFLAGS="-D warnings" run "check (host)" cargo check --workspace --locked --al
 unset RUSTFLAGS
 
 RUSTFLAGS="-D warnings" run "check (thumbv8m)" \
-    cargo check -p se-driver --locked --target thumbv8m.main-none-eabihf
+    cargo check -p tropic01-driver --locked --target thumbv8m.main-none-eabihf
 unset RUSTFLAGS
 
 run "test (host)" cargo test --workspace --locked

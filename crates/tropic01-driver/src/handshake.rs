@@ -144,7 +144,7 @@ mod tests
     use crate::test_support::vectors::T_TAUTH;
 
     // Golden vectors come from the REAL libtropic (openssl backend) with pinned
-    // inputs. See crates/se-driver/tests/oracle/README.md. The Rust schedule
+    // inputs. See crates/tropic01-driver/tests/oracle/README.md. The Rust schedule
     // MUST reproduce these byte-for-byte.
 
     #[test]

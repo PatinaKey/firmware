@@ -12,5 +12,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]|
 {
-    se_driver::fuzz::verify_cert_chain(data);
+    tropic01_driver::fuzz::verify_cert_chain(data);
 });

@@ -1,4 +1,4 @@
-# se-driver - TROPIC01 secure-element driver (no_std)
+# tropic01-driver - TROPIC01 secure-element driver (no_std)
 
 A `no_std`, heap-free, `unsafe-free` Rust driver for the **TROPIC01** secure
 element (Tropic Square, part `TR01-C2P-T301`), spoken over SPI through an
@@ -138,9 +138,9 @@ response, the cert-store STPUB decoder, and the cert-chain verifier (behind the
 `_fuzz` feature). The build is proven `no_std` on `thumbv8m.main-none-eabihf`.
 
 ```sh
-cargo test -p se-driver
-cargo clippy -p se-driver --all-targets -- -D warnings
-cargo clippy -p se-driver --target thumbv8m.main-none-eabihf -- -D warnings
+cargo test -p tropic01-driver
+cargo clippy -p tropic01-driver --all-targets -- -D warnings
+cargo clippy -p tropic01-driver --target thumbv8m.main-none-eabihf -- -D warnings
 ```
 
 These run with no external dependencies. A separate **live** suite drives the

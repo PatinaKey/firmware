@@ -1,4 +1,4 @@
-# se-driver differential-test oracle
+# tropic01-driver differential-test oracle
 
 The official C `libtropic` is the protocol ground truth. It is NEVER linked into
 the firmware. It is used OFF-TARGET to generate golden vectors that the Rust

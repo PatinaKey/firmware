@@ -20,7 +20,7 @@ The MCU and the TROPIC01 communicate over SPI. All long-term private keys live i
 
 ## Status
 
-The project is under active development. Only the secure-element driver (`crates/se-driver`) exists so far. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started. See [`crates/se-driver/README.md`](crates/se-driver/README.md) for the driver's detailed status and command-coverage roadmap.
+The project is under active development. Only the secure-element driver (`crates/tropic01-driver`) exists so far. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started. See [`crates/tropic01-driver/README.md`](crates/tropic01-driver/README.md) for the driver's detailed status and command-coverage roadmap.
 
 **Secure-element driver - working**
 
@@ -36,15 +36,15 @@ The project is under active development. Only the secure-element driver (`crates
 - STPUB extraction: `parse_stpub` / `read_chip_stpub` walk the X.509 cert store's DER (depth-bounded, panic-free) to pull the chip static X25519 key for the handshake
 - X.509 chain verification: `verify_cert_chain` / `parse_verified_stpub` authenticate the chip identity by verifying the cert chain (ECDSA P-384/SHA-384 then P-521/SHA-512) up to a caller-pinned Tropic root, never trusting the store's own root. Cryptographic path only - validity dates and revocation are left to the integrator
 - Configuration objects: R-Config write / read / erase and I-Config write / read, gating per-command access by pairing key (CFG_UAP). The I-Config write is a documented irreversible OTP bit-burn
-- Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/se-driver/README.md#validation-against-real-libtropic))
+- Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic))
 - 352 host tests, five libFuzzer targets on parser entry points
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Part of the TROPIC01 command surface: the firmware-update bootloader API and remaining power/mode control (see the [driver roadmap](crates/se-driver/README.md#roadmap))
+- Part of the TROPIC01 command surface: the firmware-update bootloader API and remaining power/mode control (see the [driver roadmap](crates/tropic01-driver/README.md#roadmap))
 - SE firmware-update path (bootloader 0xB0/0xB1)
-- Validation against real silicon (the `tropic01_model` emulator is already wired up. See the [validation table](crates/se-driver/README.md#validation-against-real-libtropic))
+- Validation against real silicon (the `tropic01_model` emulator is already wired up. See the [validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic))
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
 
 ## Building
@@ -58,7 +58,7 @@ cargo test --workspace --locked
 
 # Firmware target (no_std proof - bare-metal has no test harness)
 rustup target add thumbv8m.main-none-eabihf
-cargo check -p se-driver --locked --target thumbv8m.main-none-eabihf
+cargo check -p tropic01-driver --locked --target thumbv8m.main-none-eabihf
 ```
 
 ## CI
@@ -90,10 +90,10 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full pipeline
 
 **Note:** rustfmt is intentionally absent. The project uses a strict Allman brace style that rustfmt cannot reproduce. Formatting is reviewed, not auto-applied.
 
-**Live model integration.** A suite drives `se-driver` end-to-end against the official TROPIC01 model (`ts-tvl`): the real Noise KK1 handshake and AES-GCM codec run against an independent implementation of the chip. The GitHub coverage job clones libtropic (pinned to a tag + commit), installs the model, and runs these under coverage, so the library paths they exercise count toward the line floor (the test-harness files are excluded from the report). Locally:
+**Live model integration.** A suite drives `tropic01-driver` end-to-end against the official TROPIC01 model (`ts-tvl`): the real Noise KK1 handshake and AES-GCM codec run against an independent implementation of the chip. The GitHub coverage job clones libtropic (pinned to a tag + commit), installs the model, and runs these under coverage, so the library paths they exercise count toward the line floor (the test-harness files are excluded from the report). Locally:
 
 ```sh
-crates/se-driver/scripts/model-itest.sh            # just the live tests
+crates/tropic01-driver/scripts/model-itest.sh            # just the live tests
 LIBTROPIC=/path/to/libtropic scripts/ci-local.sh   # coverage then includes them
 ```
 

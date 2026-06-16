@@ -467,21 +467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "se-driver"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "ecdsa",
- "embedded-hal",
- "hmac",
- "p384",
- "p521",
- "sha2",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "sec1"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -537,6 +522,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tropic01-driver"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ecdsa",
+ "embedded-hal",
+ "hmac",
+ "p384",
+ "p521",
+ "sha2",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

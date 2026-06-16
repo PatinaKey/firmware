@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief L2-frame transcript capture for the patina_key se-driver golden KAT.
+ * @brief L2-frame transcript capture for the patina_key tropic01-driver golden KAT.
  *
  * Runs a real libtropic session against the TROPIC01 model and, with
  * LT_PRINT_SPI_DATA on, dumps every L1 SPI frame. The sequence is chosen to

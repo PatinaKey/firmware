@@ -2,7 +2,7 @@
 # Live integration tests against the official TROPIC01 model (ts-tvl).
 #
 # Starts the model server, runs the feature-gated `model-itest` suite against
-# it (the se-driver public API driven over a TCP shim), then tears the server
+# it (the tropic01-driver public API driven over a TCP shim), then tears the server
 # down. These are NOT part of the normal `cargo test` or CI: they need Python,
 # the model wheel, and a TCP service, so they stay an on-demand local gate.
 #
@@ -13,7 +13,7 @@
 #
 #   "$LIBTROPIC/scripts/tropic01_model/install_linux.sh"
 #   export LIBTROPIC=/path/to/libtropic
-#   crates/se-driver/scripts/model-itest.sh
+#   crates/tropic01-driver/scripts/model-itest.sh
 #
 # The model server pins the chip secrets from model_cfg.yml (chip static key +
 # pairing slot 0 = the libtropic prod0 test keypair), which the tests hardcode.
@@ -34,7 +34,7 @@ if [[ ! -x "$MODEL_SERVER" ]]; then
 fi
 
 # Resolve the firmware crate root (this script lives in firmware/scripts).
-# This script lives in crates/se-driver/scripts; the crate manifest is one level up.
+# This script lives in crates/tropic01-driver/scripts; the crate manifest is one level up.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(dirname "$SCRIPT_DIR")"
 

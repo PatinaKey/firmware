@@ -8,7 +8,7 @@
 #   so the thumbv8m job proves the no_std build and lints it instead.
 #   On-hardware tests (probe-rs) become a separate job once boards exist.
 # - Live model integration: the coverage job clones the official TROPIC01 model
-#   (libtropic, pinned to a tag + commit) and drives se-driver against it
+#   (libtropic, pinned to a tag + commit) and drives tropic01-driver against it
 #   end-to-end (real handshake + AES-GCM). These run under coverage so the
 #   library paths they exercise count. The test-harness files are excluded.
 # - cargo audit BLOCKS on findings (no `|| true` on the gate): a known
@@ -69,7 +69,7 @@ jobs:
         run: cargo check --workspace --locked --all-targets
 
       - name: Cargo Check (Firmware target, no_std proof)
-        run: cargo check -p se-driver --locked --target thumbv8m.main-none-eabihf
+        run: cargo check -p tropic01-driver --locked --target thumbv8m.main-none-eabihf
 
       - name: Generate Clippy report
         run: |
@@ -82,7 +82,7 @@ jobs:
             > clippy-report.json || true
 
           cargo clippy \
-            -p se-driver \
+            -p tropic01-driver \
             --locked \
             --target thumbv8m.main-none-eabihf \
             --message-format=json \
@@ -91,7 +91,7 @@ jobs:
       - name: Run Clippy (strict)
         run: |
           cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
-          cargo clippy -p se-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
+          cargo clippy -p tropic01-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
 
       - name: Upload Clippy report
         if: always()
@@ -300,7 +300,7 @@ jobs:
       - name: Restore fuzz corpus
         uses: actions/cache@v4
         with:
-          path: crates/se-driver/fuzz/corpus
+          path: crates/tropic01-driver/fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-
@@ -310,7 +310,7 @@ jobs:
         run: |
           secs=60
           if [ "${{ github.event_name }}" = "schedule" ]; then secs=900; fi
-          cd crates/se-driver
+          cd crates/tropic01-driver
           for t in parse_l2_response decrypt_l3_result parse_handshake_resp; do
             cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- -max_total_time="$secs" -timeout=10
           done
@@ -320,7 +320,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
-          path: crates/se-driver/fuzz/artifacts
+          path: crates/tropic01-driver/fuzz/artifacts
 
   # Job 7: SonarQube Analysis
   sonarqube:

@@ -1,6 +1,6 @@
 //! Live integration tests against the official TROPIC01 model (ts-tvl).
 //!
-//! These drive the REAL se-driver public API over a TCP shim that speaks the
+//! These drive the REAL tropic01-driver public API over a TCP shim that speaks the
 //! model's wire protocol, so the driver runs its real Noise KK1 handshake and
 //! real AES-GCM L3 codec end to end against an INDEPENDENT implementation of the
 //! chip. No keys are pinned and nothing is mocked: if any byte of the protocol
@@ -31,19 +31,19 @@ use embedded_hal::spi::Operation;
 use embedded_hal::spi::SpiDevice;
 use zeroize::Zeroizing;
 
-use se_driver::EccCurve;
-use se_driver::EccSlot;
-use se_driver::FwBankId;
-use se_driver::MCounterIdx;
-use se_driver::MacDestroySlot;
-use se_driver::PairingKeySlot;
-use se_driver::RMemSlot;
-use se_driver::SeCommands;
-use se_driver::SeError;
-use se_driver::SeWait;
-use se_driver::SessionConfig;
-use se_driver::StartupId;
-use se_driver::Tropic01;
+use tropic01_driver::EccCurve;
+use tropic01_driver::EccSlot;
+use tropic01_driver::FwBankId;
+use tropic01_driver::MCounterIdx;
+use tropic01_driver::MacDestroySlot;
+use tropic01_driver::PairingKeySlot;
+use tropic01_driver::RMemSlot;
+use tropic01_driver::SeCommands;
+use tropic01_driver::SeError;
+use tropic01_driver::SeWait;
+use tropic01_driver::SessionConfig;
+use tropic01_driver::StartupId;
+use tropic01_driver::Tropic01;
 
 // Model wire protocol (libtropic hal/posix/tcp)
 //
@@ -235,7 +235,7 @@ impl SeWait for NoWait
 /// Get_Info is a plain L2 command that runs in `NoSession` (reading the device
 /// certificate to obtain STPUB happens this way, before any secure channel), so
 /// the Get_Info live tests use this rather than `fresh_session`.
-fn fresh_no_session() -> Tropic01<ModelSpi, NoWait, se_driver::NoSession>
+fn fresh_no_session() -> Tropic01<ModelSpi, NoWait, tropic01_driver::NoSession>
 {
     let mut spi = ModelSpi::connect();
     spi.reset_target();
@@ -246,7 +246,7 @@ fn fresh_no_session() -> Tropic01<ModelSpi, NoWait, se_driver::NoSession>
 }
 
 /// Opens a fresh, reset, app-mode secure session against the model.
-fn fresh_session() -> Tropic01<ModelSpi, NoWait, se_driver::ActiveSession>
+fn fresh_session() -> Tropic01<ModelSpi, NoWait, tropic01_driver::ActiveSession>
 {
     let dev = fresh_no_session();
     let ehpriv = Zeroizing::new(EHPRIV);
@@ -309,7 +309,7 @@ fn rmem_write_then_read_round_trips()
     let data = b"stored in encrypted R-memory";
     se.rmem_write(slot, data).expect("rmem write");
     // rmem_read_into requires the buffer sized to the protocol MAX up front
-    // (the result length is not known to the caller): see se-driver lesson 2b.2.
+    // (the result length is not known to the caller): see tropic01-driver lesson 2b.2.
     let mut out = [0u8; 512];
     let n = se.rmem_read_into(slot, &mut out).expect("rmem read");
     assert_eq!(&out[..n], data);
@@ -615,7 +615,7 @@ fn r_config_write_read_erase_round_trip()
     // pairing-key UAPs, any of which could lock the session out of its own
     // recovery / handshake path.
     let mut se = fresh_session();
-    let addr = se_driver::ConfigObjectAddr::CfgUapPing;
+    let addr = tropic01_driver::ConfigObjectAddr::CfgUapPing;
     se.r_config_write(addr, 0x0A0B_0C0D).expect("r-config write");
     assert_eq!(se.r_config_read(addr).expect("r-config read"), 0x0A0B_0C0D);
     se.r_config_erase().expect("r-config erase (whole config)");
@@ -641,7 +641,7 @@ fn i_config_read_returns_a_value()
     // byte_exact pins the ADDRESS || BIT_INDEX bytes, plus recoverable-status and
     // every teardown fault.
     let mut se = fresh_session();
-    let _ = se.i_config_read(se_driver::ConfigObjectAddr::CfgUapPing).expect("i-config read");
+    let _ = se.i_config_read(tropic01_driver::ConfigObjectAddr::CfgUapPing).expect("i-config read");
 }
 
 // Get_Info (L2, NoSession)
@@ -696,7 +696,7 @@ fn parse_stpub_extracts_pinned_stpub_from_model_cert_store()
     let mut store = [0u8; 3840];
     let n = dev.x509_certificate_into(&mut store).expect("x509 cert store");
     assert_eq!(n, 3840);
-    let stpub = se_driver::parse_stpub(&store).expect("parse STPUB from model cert store");
+    let stpub = tropic01_driver::parse_stpub(&store).expect("parse STPUB from model cert store");
     assert_eq!(stpub, STPUB, "extracted STPUB must match the model's pinned key");
 }
 
@@ -722,9 +722,9 @@ fn verify_cert_chain_accepts_the_model_chain()
     let mut store = [0u8; 3840];
     let n = dev.x509_certificate_into(&mut store).expect("x509 cert store");
     assert_eq!(n, 3840);
-    let anchor = se_driver::RootAnchor::from_sec1_p521(&MODEL_TEST_ROOT_PUBKEY)
+    let anchor = tropic01_driver::RootAnchor::from_sec1_p521(&MODEL_TEST_ROOT_PUBKEY)
         .expect("pinned root is well-formed");
-    se_driver::verify_cert_chain(&store, &anchor).expect("model chain verifies under pinned root");
+    tropic01_driver::verify_cert_chain(&store, &anchor).expect("model chain verifies under pinned root");
 }
 
 #[test]
@@ -737,9 +737,9 @@ fn verify_cert_chain_rejects_a_wrong_anchor()
     let mut store = [0u8; 3840];
     dev.x509_certificate_into(&mut store).expect("x509 cert store");
     let point = other_valid_p521_point();
-    let anchor = se_driver::RootAnchor::from_sec1_p521(&point).expect("valid P-521 point");
+    let anchor = tropic01_driver::RootAnchor::from_sec1_p521(&point).expect("valid P-521 point");
     assert!(
-        se_driver::verify_cert_chain(&store, &anchor).is_err(),
+        tropic01_driver::verify_cert_chain(&store, &anchor).is_err(),
         "a wrong pinned anchor must reject the chain"
     );
 }
@@ -751,7 +751,7 @@ fn read_verified_chip_stpub_returns_pinned_stpub()
     // root, and returns STPUB only through that trusted path.
     let mut dev = fresh_no_session();
     let mut scratch = [0u8; 3840];
-    let anchor = se_driver::RootAnchor::from_sec1_p521(&MODEL_TEST_ROOT_PUBKEY)
+    let anchor = tropic01_driver::RootAnchor::from_sec1_p521(&MODEL_TEST_ROOT_PUBKEY)
         .expect("pinned root is well-formed");
     let stpub = dev
         .read_verified_chip_stpub(&mut scratch, &anchor)

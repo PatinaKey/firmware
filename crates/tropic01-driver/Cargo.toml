@@ -1,5 +1,5 @@
 [package]
-name = "se-driver"
+name = "tropic01-driver"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
