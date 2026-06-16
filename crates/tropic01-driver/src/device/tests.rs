@@ -5,6 +5,7 @@
 //! Crate-internal items and the chip mock are imported explicitly.
 
 use super::ActiveSession;
+use super::ChipMode;
 use super::FwBankId;
 use super::NoSession;
 use super::SessionConfig;
@@ -46,6 +47,7 @@ use crate::test_support::GetInfoFault;
 use crate::test_support::MockSpi;
 use crate::test_support::MockWait;
 use crate::test_support::RecordingSpi;
+use crate::test_support::StatusSpi;
 
 use zeroize::Zeroizing;
 
@@ -85,6 +87,158 @@ fn reboot_rejects_a_continuation_status()
     let acks = std::vec![l2_frame(L2Status::RequestCont as u8, &[])];
     let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
     assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::BadFrame)));
+}
+
+// Sleep (L2, NoSession)
+
+#[test]
+fn sleep_request_frame_matches_libtropic_golden()
+{
+    // Byte-exact Sleep_Req: REQ_ID 0x20, REQ_LEN 1, SLEEP_KIND 0x05, CRC 0x9E04.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert!(dev.sleep().is_ok());
+    assert_eq!(dev.spi_ref().writes()[0], std::vec![0x20, 0x01, 0x05, 0x9E, 0x04]);
+}
+
+#[test]
+fn sleep_succeeds_on_empty_request_ok_ack()
+{
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert_eq!(dev.sleep(), Ok(()));
+}
+
+#[test]
+fn sleep_disabled_is_recoverable()
+{
+    // CFG_SLEEP_MODE off: the chip replies RespDisabled. No session exists, so
+    // this surfaces via parse_response as a recoverable L2 status error.
+    let acks = std::vec![l2_frame(L2Status::RespDisabled as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert_eq!(dev.sleep(), Err(SeError::L2(L2Error::Status(L2Status::RespDisabled))));
+}
+
+#[test]
+fn sleep_rejects_a_nonempty_ack()
+{
+    // A Sleep ack must carry no data. A non-empty one is a malformed reply.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[0xAA])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert_eq!(dev.sleep(), Err(SeError::L2(L2Error::BadFrame)));
+}
+
+#[test]
+fn sleep_rejects_a_continuation_status()
+{
+    // Only RequestOk acknowledges a Sleep_Req. A *Cont status is anomalous.
+    let acks = std::vec![l2_frame(L2Status::RequestCont as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert_eq!(dev.sleep(), Err(SeError::L2(L2Error::BadFrame)));
+}
+
+// Get_Log (L2, NoSession)
+
+#[test]
+fn get_log_request_frame_matches_libtropic_golden()
+{
+    // Byte-exact Get_Log_Req: REQ_ID 0xA2, REQ_LEN 0, CRC 0x094C.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    let mut out = [0u8; 8];
+    assert_eq!(dev.get_log_into(&mut out), Ok(0));
+    assert_eq!(dev.spi_ref().writes()[0], std::vec![0xA2, 0x00, 0x09, 0x4C]);
+}
+
+#[test]
+fn get_log_empty_returns_zero()
+{
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    let mut out = [0u8; 64];
+    assert_eq!(dev.get_log_into(&mut out), Ok(0));
+}
+
+#[test]
+fn get_log_copies_the_payload()
+{
+    let log = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &log)];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    let mut out = [0u8; 64];
+    let n = dev.get_log_into(&mut out).unwrap();
+    assert_eq!(n, log.len());
+    assert_eq!(&out[..n], &log);
+}
+
+#[test]
+fn get_log_rejects_a_too_small_buffer()
+{
+    let log = [0xAAu8; 10];
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &log)];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    let mut out = [0u8; 4];
+    assert_eq!(dev.get_log_into(&mut out), Err(SeError::BufferTooSmall));
+}
+
+#[test]
+fn get_log_rejects_a_continuation_status()
+{
+    // A single-frame Get_Log reply must be RequestOk. A *Cont status is anomalous.
+    let acks = std::vec![l2_frame(L2Status::RequestCont as u8, &[0x01])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    let mut out = [0u8; 64];
+    assert_eq!(dev.get_log_into(&mut out), Err(SeError::L2(L2Error::BadFrame)));
+}
+
+#[test]
+fn get_log_disabled_is_recoverable()
+{
+    // With FW_LOG_EN burned off the chip replies RespDisabled. It surfaces as a
+    // recoverable L2 status: no session exists, nothing to tear down.
+    let acks = std::vec![l2_frame(L2Status::RespDisabled as u8, &[])];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    let mut out = [0u8; 64];
+    assert_eq!
+    (
+        dev.get_log_into(&mut out),
+        Err(SeError::L2(L2Error::Status(L2Status::RespDisabled))),
+    );
+}
+
+// Chip mode (L2, NoSession)
+
+#[test]
+fn chip_mode_ready_only_is_application()
+{
+    // CHIP_STATUS = READY (0x01): Application Mode.
+    let mut dev = Tropic01::new(StatusSpi::new(0x01), MockWait::new());
+    assert_eq!(dev.chip_mode(), Ok(ChipMode::Application));
+}
+
+#[test]
+fn chip_mode_startup_bit_is_startup()
+{
+    // CHIP_STATUS = READY | STARTUP (0x05): Start-up (Maintenance) Mode.
+    let mut dev = Tropic01::new(StatusSpi::new(0x05), MockWait::new());
+    assert_eq!(dev.chip_mode(), Ok(ChipMode::Startup));
+}
+
+#[test]
+fn chip_mode_alarm_bit_is_alarm()
+{
+    // CHIP_STATUS = READY | ALARM (0x03): Alarm Mode.
+    let mut dev = Tropic01::new(StatusSpi::new(0x03), MockWait::new());
+    assert_eq!(dev.chip_mode(), Ok(ChipMode::Alarm));
+}
+
+#[test]
+fn chip_mode_alarm_wins_over_startup()
+{
+    // CHIP_STATUS = READY | ALARM | STARTUP (0x07): ALARM takes priority, exactly
+    // as libtropic lt_get_tr01_mode decodes it.
+    let mut dev = Tropic01::new(StatusSpi::new(0x07), MockWait::new());
+    assert_eq!(dev.chip_mode(), Ok(ChipMode::Alarm));
 }
 
 /// Opens a session over a chip mock configured with `fault`.
@@ -1922,6 +2076,74 @@ fn close_session_returns_no_session_handle()
     // Back to NoSession: buffers wiped, ready to re-open.
     assert!(dev.l2.iter().all(|&b| b == 0));
     assert!(dev.l3.as_slice().iter().all(|&b| b == 0));
+}
+
+/// Builds an `ActiveSession` handle over `spi` with fixed dummy keys.
+///
+/// Used by the `abort_session` teardown tests, which need an active handle but
+/// not a full handshake: the notify is a plain L2 round-trip and the keys only
+/// need to exist so the teardown can be observed to wipe the buffers.
+fn active_over<SPI>(spi: SPI) -> Tropic01<SPI, MockWait, ActiveSession>
+{
+    Tropic01
+    {
+        spi,
+        wait: MockWait::new(),
+        l2: [0xABu8; L2_FRAME_MAX],
+        l3: crate::buf::L3Buf::new(),
+        state: ActiveSession::new(SessionKeys::new([0x11u8; 32], [0x22u8; 32])),
+    }
+}
+
+#[test]
+fn abort_session_request_frame_matches_libtropic_golden()
+{
+    // Byte-exact Encrypted_Session_Abt_Req: REQ_ID 0x08, REQ_LEN 0, CRC 0x03B0.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let dev = active_over(RecordingSpi::new(acks));
+    let (dev, result) = dev.abort_session();
+    assert_eq!(result, Ok(()));
+    assert_eq!(dev.spi_ref().writes()[0], std::vec![0x08, 0x00, 0x03, 0xB0]);
+}
+
+#[test]
+fn abort_session_ok_returns_no_session_and_wipes_buffers()
+{
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let dev = active_over(RecordingSpi::new(acks));
+    let (dev, result): (Tropic01<_, _, NoSession>, _) = dev.abort_session();
+    assert_eq!(result, Ok(()));
+    // Back to NoSession: the local teardown wiped both buffers.
+    assert!(dev.l2.iter().all(|&b| b == 0));
+    assert!(dev.l3.as_slice().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn abort_session_bad_ack_still_wipes_and_returns_no_session()
+{
+    // A non-empty ack is a malformed reply: the notify reports BadFrame, but the
+    // teardown still runs. The keys are wiped on this path too, proven by the
+    // NoSession buffers all reading zero.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[0xAA])];
+    let dev = active_over(RecordingSpi::new(acks));
+    let (dev, result): (Tropic01<_, _, NoSession>, _) = dev.abort_session();
+    assert_eq!(result, Err(SeError::L2(L2Error::BadFrame)));
+    assert!(dev.l2.iter().all(|&b| b == 0), "l2 wiped even on a failed notify");
+    assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "l3 wiped even on a failed notify");
+}
+
+#[test]
+fn abort_session_chip_status_error_still_wipes_and_returns_no_session()
+{
+    // The chip replies a non-OK status: parse_response returns Err via `?`, a
+    // different failure path than the explicit ack check. The teardown still runs
+    // (it precedes the notify), so the buffers all read zero.
+    let acks = std::vec![l2_frame(L2Status::GenErr as u8, &[])];
+    let dev = active_over(RecordingSpi::new(acks));
+    let (dev, result): (Tropic01<_, _, NoSession>, _) = dev.abort_session();
+    assert_eq!(result, Err(SeError::L2(L2Error::Status(L2Status::GenErr))));
+    assert!(dev.l2.iter().all(|&b| b == 0), "l2 wiped on a chip status error");
+    assert!(dev.l3.as_slice().iter().all(|&b| b == 0), "l3 wiped on a chip status error");
 }
 
 /// Builds a pairing key slot index, panicking only in test code on a bad

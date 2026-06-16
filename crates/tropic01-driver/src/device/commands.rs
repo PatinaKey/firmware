@@ -1,6 +1,7 @@
 //! The `ActiveSession` command surface and the shared `run` gate.
 //!
-//! Holds the session lifecycle (`close_session`), the `ping_into` diagnostic,
+//! Holds the session lifecycle (`close_session`, `abort_session`), the
+//! `ping_into` diagnostic,
 //! the fail-closed `run`/`run_gated` template that owns the session teardown
 //! duties, and every L3 command (random, counters, R-memory, ECC, sign,
 //! MAC-and-Destroy, pairing keys, config objects). The result parsers shared by
@@ -12,11 +13,16 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use crate::crypto;
+use crate::error::L2Error;
 use crate::error::L3Error;
 use crate::error::ParseError;
 use crate::error::SeError;
 use crate::ids::CmdId;
+use crate::ids::L2ReqId;
+use crate::ids::L2Status;
 use crate::ids::L3Status;
+use crate::l1;
+use crate::l2::frame;
 use crate::l3;
 use crate::parse::take;
 use crate::parse::take_array;
@@ -89,6 +95,57 @@ where
             l3,
             state: NoSession,
         }
+    }
+
+    /// Aborts the session, NOTIFYING the chip, and returns a `NoSession` handle.
+    ///
+    /// Unlike `close_session` (a LOCAL, infallible teardown), this first sends an
+    /// `Encrypted_Session_Abt_Req` (L2 0x08) so the chip forgets the session at
+    /// once. That round-trip CAN fail, so the result reports the chip's ack while
+    /// the handle still transitions to `NoSession`. Defense in depth: the local
+    /// teardown and the chip-side notify together. Mirrors libtropic
+    /// `lt_session_abort`, which invalidates host session data before sending.
+    ///
+    /// SECURITY: the session secrets are wiped BEFORE the notify, mirroring
+    /// libtropic `lt_session_abort` (which invalidates host session data first).
+    /// Dropping the `ActiveSession` state zeroizes the keys and the L3 plaintext
+    /// buffer is cleared, so neither outlives the channel across the notify
+    /// round-trip. The wipe is unconditional: the returned `Result` only reports
+    /// the chip ack, it never gates the teardown.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::L2(L2Error::BadFrame)` on an unexpected acknowledgement, or
+    /// `SeError` on a bus or framing fault during the notify. The secrets are
+    /// already wiped when any such error is returned.
+    pub fn abort_session(self) -> (Tropic01<SPI, W, NoSession>, Result<(), SeError>)
+    {
+        let Tropic01
+        {
+            mut spi,
+            mut wait,
+            mut l2,
+            mut l3,
+            state,
+        } = self;
+        // Tear down the host secrets FIRST, like libtropic lt_session_abort: drop
+        // the session keys and clear the L3 plaintext (a prior result may hold a
+        // private key, signature, or MAC-and-Destroy secret) so nothing sensitive
+        // survives the notify round-trip. l2 stays as the notify's frame buffer
+        // and is wiped right after.
+        drop(state);
+        l3.as_mut_slice().zeroize();
+        let result = notify_session_abort(&mut spi, &mut wait, &mut l2);
+        l2.zeroize();
+        let handle = Tropic01
+        {
+            spi,
+            wait,
+            l2,
+            l3,
+            state: NoSession,
+        };
+        (handle, result)
     }
 
     /// Returns the CMD plaintext region, indexed from 0 like the spec tables.
@@ -1288,4 +1345,39 @@ fn parse_config_value(res_data: &[u8]) -> Result<u32, L3Error>
         return Err(L3Error::Oversize);
     }
     Ok(u32::from_le_bytes(value))
+}
+
+/// Sends an `Encrypted_Session_Abt_Req` and checks the chip's ack.
+///
+/// Builds the empty-body request into `l2`, sends it, reads the reply, and
+/// requires an empty `RequestOk` ack. Split out from `abort_session` so the
+/// teardown caller stays linear. The session secrets are wiped by the caller on
+/// every path. This only reports the chip ack.
+///
+/// # Errors
+///
+/// `SeError::L2(L2Error::BadFrame)` on an unexpected acknowledgement, or
+/// `SeError` on a bus or framing fault.
+fn notify_session_abort<SPI, W>
+(
+    spi: &mut SPI,
+    wait: &mut W,
+    l2: &mut [u8],
+)
+-> Result<(), SeError>
+where
+    SPI: SpiDevice,
+    W: SeWait,
+{
+    // Encrypted_Session_Abt_Req body is empty. REQ_LEN = 0, RSP carries no data.
+    let n = frame::build_request(L2ReqId::EncryptedSessionAbt as u8, &[], l2)?;
+    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
+    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
+    let resp = frame::parse_response(&l2[..frame_len])?;
+    // A successful abort is acknowledged with an empty RequestOk frame.
+    if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+    {
+        return Err(SeError::L2(L2Error::BadFrame));
+    }
+    Ok(())
 }

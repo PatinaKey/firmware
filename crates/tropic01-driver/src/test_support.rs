@@ -1145,6 +1145,53 @@ impl SpiDevice for RecordingSpi
     }
 }
 
+/// A `SpiDevice` that answers a CHIP_STATUS poll with a fixed status byte.
+///
+/// `read_chip_status` issues a single-operation `TransferInPlace` transaction to
+/// clock 0xAA and read CHIP_STATUS back. This mock writes the configured byte
+/// into that buffer, letting a `chip_mode` test drive any CHIP_STATUS pattern
+/// (READY / ALARM / STARTUP and their combinations) without the full chip
+/// simulation. Other transaction shapes are ignored.
+pub(crate) struct StatusSpi
+{
+    status: u8,
+}
+
+impl StatusSpi
+{
+    /// Builds a mock that reports `status` as the CHIP_STATUS byte.
+    pub(crate) fn new(status: u8) -> Self
+    {
+        StatusSpi
+        {
+            status,
+        }
+    }
+}
+
+impl ErrorType for StatusSpi
+{
+    type Error = MockSpiError;
+}
+
+impl SpiDevice for StatusSpi
+{
+    fn transaction
+    (
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    )
+    -> Result<(), Self::Error>
+    {
+        if let [Operation::TransferInPlace(buf)] = operations
+            && let Some(b) = buf.first_mut()
+        {
+            *b = self.status;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests
 {

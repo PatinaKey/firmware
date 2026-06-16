@@ -32,12 +32,15 @@ The project is under active development. Only the secure-element driver (`crates
 - The MAC-and-Destroy output is returned in a zeroize-on-drop secret type
 - Range-checked slot types: an out-of-range key/counter/memory/PIN/pairing index cannot be constructed
 - `reboot` (Startup_Req) to enter Application FW before a session
+- `sleep` (Sleep_Req) for low power, and `chip_mode` decoding CHIP_STATUS to Application / Startup / Alarm
+- `abort_session` notifies the chip to drop the secure session, wiping the host session keys and the L3 plaintext before the round-trip
+- `get_log_into` (Get_Log_Req) reads the raw RISC-V FW debug log, disabled on production parts
 - `Get_Info` (L2, no session): reads the raw X.509 certificate store, CHIP_ID, and RISCV/SPECT firmware versions
 - STPUB extraction: `parse_stpub` / `read_chip_stpub` walk the X.509 cert store's DER (depth-bounded, panic-free) to pull the chip static X25519 key for the handshake
 - X.509 chain verification: `verify_cert_chain` / `parse_verified_stpub` authenticate the chip identity by verifying the cert chain (ECDSA P-384/SHA-384 then P-521/SHA-512) up to a caller-pinned Tropic root, never trusting the store's own root. Cryptographic path only - validity dates and revocation are left to the integrator
 - Configuration objects: R-Config write / read / erase and I-Config write / read, gating per-command access by pairing key (CFG_UAP). The I-Config write is a documented irreversible OTP bit-burn
 - Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic))
-- 352 host tests, five libFuzzer targets on parser entry points
+- 371 host tests, five libFuzzer targets on parser entry points, 39 live-model tests
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**

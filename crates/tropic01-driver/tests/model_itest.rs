@@ -31,6 +31,7 @@ use embedded_hal::spi::Operation;
 use embedded_hal::spi::SpiDevice;
 use zeroize::Zeroizing;
 
+use tropic01_driver::ChipMode;
 use tropic01_driver::EccCurve;
 use tropic01_driver::EccSlot;
 use tropic01_driver::FwBankId;
@@ -778,6 +779,87 @@ fn get_info_fw_bank_needs_maintenance_mode()
         matches!(res, Err(SeError::L2(_))),
         "FW_BANK in Application FW mode must fail with an L2 error, got {res:?}"
     );
+}
+
+// Power / mode / session lifecycle (L2)
+
+#[test]
+fn chip_mode_reports_application_after_reboot()
+{
+    // fresh_no_session reboots into Application FW, so the chip must report
+    // Application Mode (CHIP_STATUS READY, no ALARM, no STARTUP).
+    let mut dev = fresh_no_session();
+    assert_eq!(dev.chip_mode().expect("chip mode"), ChipMode::Application);
+}
+
+#[test]
+fn get_log_returns_a_recoverable_result()
+{
+    // Logging is typically disabled, so the log is empty or the chip replies a
+    // disabled status. Either way the call must not hang or panic, and any error
+    // is recoverable (no session). On success the returned length fits the buffer.
+    let mut dev = fresh_no_session();
+    let mut out = [0u8; 255];
+    match dev.get_log_into(&mut out)
+    {
+        Ok(n) => assert!(n <= out.len(), "log length must fit the buffer"),
+        Err(SeError::L2(_)) =>
+        {
+            // A disabled log surfaces as a recoverable L2 status. Acceptable.
+        }
+        Err(other) => panic!("get_log produced an unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn abort_session_notifies_the_chip_and_returns_no_session()
+{
+    // Open a real session, then abort it. The chip acknowledges the notify and
+    // the handle transitions to NoSession. A fresh handshake must succeed after,
+    // proving the abort left the chip in a clean state.
+    let se = fresh_session();
+    let (dev, result) = se.abort_session();
+    result.expect("chip acknowledges the session abort");
+    // The handle is back to NoSession: re-open a session to confirm the channel
+    // can be rebuilt.
+    let ehpriv = Zeroizing::new(EHPRIV);
+    let shipriv = Zeroizing::new(SHIPRIV);
+    let cfg = SessionConfig
+    {
+        ehpriv: &ehpriv,
+        shipriv: &shipriv,
+        shipub: &SHIPUB,
+        stpub: &STPUB,
+        pkey_index: 0,
+    };
+    let mut se = match dev.open_session(cfg)
+    {
+        Ok(active) => active,
+        Err((_, e)) => panic!("re-open after abort failed: {e:?}"),
+    };
+    let mut out = [0u8; 4];
+    se.ping_into(b"live", &mut out).expect("session usable after re-open");
+    assert_eq!(&out, b"live");
+}
+
+#[test]
+fn sleep_is_reachable()
+{
+    // Sleep may be disabled by config (RespDisabled) or accepted. Either outcome
+    // is valid here: the test proves the L2 request is byte-correct and the reply
+    // is handled without a hang or panic. A success or a recoverable L2 status
+    // both pass. Only a transport-shaped failure is unexpected.
+    let mut dev = fresh_no_session();
+    match dev.sleep()
+    {
+        Ok(()) =>
+        {}
+        Err(SeError::L2(_)) =>
+        {
+            // Sleep disabled by CFG_SLEEP_MODE: a recoverable L2 status.
+        }
+        Err(other) => panic!("sleep produced an unexpected error: {other:?}"),
+    }
 }
 
 // helpers
