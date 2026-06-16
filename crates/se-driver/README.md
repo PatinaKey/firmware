@@ -36,7 +36,7 @@ crate is the host's mouth and ears for that chip:
 All key material (host pairing keys, chip static public key, per-session ephemeral,
 pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardcodes no secrets.
 
-## Implemented today
+## Implemented
 
 | Area | What works |
 |------|------------|
@@ -45,7 +45,7 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW) |
 | Chip info (L2) | `Get_Info`: `x509_certificate_into` (raw cert store), `chip_id_into`, `riscv_fw_version`, `spect_fw_version`, `fw_bank_into` - read before a session, no secure channel |
 | Attestation (parse) | `parse_stpub` / `read_chip_stpub`: extract the chip static X25519 key (STPUB) from the X.509 cert store via a depth-bounded, panic-free DER walk |
-| Attestation (verify) | `verify_cert_chain` / `parse_verified_stpub` / `read_verified_chip_stpub`: verify the cert chain DEVICE -> XXXX CA -> product CA up to a caller-pinned Tropic root (ECDSA P-384/SHA-384 then P-521/SHA-512, mixed-algorithm dispatched per cert). The root is pinned out-of-band, never trusted from the store. Cryptographic path only - dates / revocation are deferred to the integrator |
+| Attestation (verify) | `verify_cert_chain` / `parse_verified_stpub` / `read_verified_chip_stpub`: verify the cert chain DEVICE -> XXXX CA -> product CA up to a caller-pinned Tropic root (ECDSA P-384/SHA-384 then P-521/SHA-512, mixed-algorithm dispatched per cert). The root is pinned out-of-band, never trusted from the store. Cryptographic path only - dates / revocation are left to the integrator |
 | Diagnostics | `ping` round-trip |
 | TRNG | `random_into` (RandomValueGet, 0x50) |
 | ECC keys | `ecc_key_generate` (0x60), `ecc_public_key` (0x62, returns the chip-attested curve), `ecc_key_store` (0x61, import a private key), `ecc_key_erase` (0x63) |
@@ -84,7 +84,7 @@ robustness.
 | `ecdsa_sign` / `eddsa_sign` | Yes - returns a 64-byte signature |
 | `mac_and_destroy` | Yes - returns the 32-byte secret output |
 | `pairing_key_write` / `pairing_key_read` / `pairing_key_invalidate` | Yes - slot 0 reads back the prod0 host pairing pubkey (byte-exact). Write-read-invalidate round-trip on a spare slot. Reading an unprovisioned slot is recoverable |
-| `Get_Info`: cert store / chip id / fw versions | Yes - reads the full 3840-byte cert store, the 128-byte CHIP_ID, and the 4-byte RISCV/SPECT versions. FW_BANK is rejected outside Maintenance Mode (deferred to the FW-update slice) |
+| `Get_Info`: cert store / chip id / fw versions | Yes - reads the full 3840-byte cert store, the 128-byte CHIP_ID, and the 4-byte RISCV/SPECT versions. FW_BANK is rejected outside Maintenance Mode (the full read is not yet wired) |
 | `parse_stpub` / `read_chip_stpub` (STPUB) | Yes - extracts STPUB from the live model's real device certificate and asserts it byte-exact against the model's pinned `s_t_pub`. A golden-constant proof that the DER walk is byte-faithful to an independent implementation |
 | `verify_cert_chain` / `read_verified_chip_stpub` | Yes - reads the live store and verifies the full chain up to the pinned model TEST root, end-to-end through the RustCrypto P-384 / P-521 ECDSA stack. A deliberately wrong anchor is rejected. The same chain independently verifies under openssl |
 | `r_config_write` / `r_config_read` / `r_config_erase` | Yes - write a CO value to a safe register, read it back byte-exact, erase the whole R-Config and read back all-ones. I-Config read live. The irreversible I-Config write is mock-only (a real burn is one-way) |
@@ -109,7 +109,7 @@ Non-command work toward a publishable crate: validate against silicon (the
 `tropic01_model` emulator is already wired, see
 [Validation](#validation-against-real-libtropic)), crate-level docs / examples on
 docs.rs, and an optional `embedded-hal`-based port so external users can plug
-their own HAL (today the ports are the crate's own `SpiDevice` / `SeWait` traits).
+their own HAL (currently the ports are the crate's own `SpiDevice` / `SeWait` traits).
 
 ## Design principles
 
@@ -125,7 +125,7 @@ their own HAL (today the ports are the crate's own `SpiDevice` / `SeWait` traits
   aes-gcm, sha2, hmac, zeroize, and ecdsa / p384 / p521 for chain verification).
   A small rewrite is preferred over a non-essential dependency. The ECDSA curve
   crates are pinned to RustCrypto release candidates to keep a single `digest`
-  generation in the tree; the `Cargo.toml` comment tracks moving to stable.
+  generation in the tree. The `Cargo.toml` comment tracks moving to stable.
 
 ## Testing
 

@@ -241,10 +241,15 @@ where
     /// A diagnostic round-trip (not part of `SeCommands`). Returns the echoed
     /// byte count, which equals `payload.len()`.
     ///
-    /// The shared `run` gate governs the session. The parse closure enforces
-    /// the ping RES_SIZE check: a wrong-size echo on an OK result returns
-    /// `L3Error::Oversize`, which `run` turns into a session poison, mirroring
-    /// libtropic's `lt_in__ping`.
+    /// The shared `run` gate governs the session.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` or `SeError::BufferTooSmall` when `payload` or
+    /// `out` does not fit the L3 buffer. A wrong-size echo on an OK result
+    /// returns `L3Error::Oversize`, which `run` turns into a session poison,
+    /// mirroring libtropic's `lt_in__ping`. Otherwise `SeError` on a transport or
+    /// crypto fault.
     pub fn ping_into(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, SeError>
     {
         // Argument checks come first: no nonce, no crypto, no chip traffic, so

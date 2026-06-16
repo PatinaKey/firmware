@@ -28,8 +28,8 @@ pub(crate) struct SessionKeys
     /// AES-256-GCM key for the result (chip -> host) direction.
     k_res: [u8; 32],
     // The nonce counters are NOT key material, so `ZeroizeOnDrop` skips them.
-    // They are still reset to 0 in `wipe()` (design sec 3.1: wipe both IVs) so
-    // a re-handshake on the same holder cannot resume a stale counter.
+    // They are still reset to 0 in `wipe()` so a re-handshake on the same holder
+    // cannot resume a stale counter.
     /// Command-direction nonce counter.
     #[zeroize(skip)]
     cmd_nonce: NonceCounter,
@@ -59,8 +59,8 @@ impl SessionKeys
     /// Idempotent.
     ///
     /// The teardown path calls this on a session-fatal error, in addition to
-    /// the `ZeroizeOnDrop` that runs on a normal return. Design sec 3.1
-    /// requires wiping both IVs, so the two counters are reset to 0 here.
+    /// the `ZeroizeOnDrop` that runs on a normal return. Both IVs are wiped too,
+    /// so the two counters are reset to 0 here and a re-handshake starts clean.
     pub(crate) fn wipe(&mut self)
     {
         self.k_cmd.zeroize();

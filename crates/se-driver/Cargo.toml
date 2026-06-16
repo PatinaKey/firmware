@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 description = "A no_std, panic-free Rust driver for the TROPIC01 secure element (Noise KK1 secure channel over SPI)."
 readme = "README.md"
-documentation = "to be done"
+documentation = "Not published to docs.rs yet."
 keywords = ["tropic01", "secure-element", "no-std", "embedded", "ecc"]
 categories = ["embedded", "no-std", "cryptography", "hardware-support"]
 # Dev/validation tooling kept out of the published package. The crate is the

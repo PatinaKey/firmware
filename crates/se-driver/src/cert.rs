@@ -1,9 +1,12 @@
-//! X.509 certificate-store parsing to extract STPUB.
+//! X.509 certificate-store parsing and chain verification.
 //!
-//! STPUB is the chip static X25519 public key (32 bytes) carried in the DEVICE
-//! certificate of the `Get_Info` X.509 store. It seeds the Noise KK1 handshake.
+//! Two layers live here. [`parse_stpub`] extracts STPUB, the chip static X25519
+//! public key (32 bytes) carried in the DEVICE certificate of the `Get_Info`
+//! X.509 store, which seeds the Noise KK1 handshake. [`verify_cert_chain`] and
+//! [`parse_verified_stpub`] authenticate that store by verifying its signature
+//! chain up to a caller-pinned [`RootAnchor`].
 //!
-//! This is an ATTACKER-FACING decoder: the DER comes from the chip and is
+//! These are ATTACKER-FACING decoders: the DER comes from the chip and is
 //! untrusted. Every read goes through the bounds-checked combinators in
 //! `parse`. There is no raw indexing, no unwrap, no panic. The DER walk is a
 //! depth-bounded recursive descent: each nested object is bounded to its
@@ -12,14 +15,14 @@
 //! exhaust the stack. (libtropic recurses without a depth cap. This is
 //! stricter.)
 //!
-//! SECURITY: this extracts STPUB ONLY. It does NOT verify the certificate-chain
-//! signatures up to the Tropic root. libtropic `lt_get_st_pub` likewise only
-//! parses. Chain verification is a separate deferred concern (an external X.509
-//! verifier consumes the four DER blobs). A wrong or substituted STPUB cannot
-//! silently open a session: STPUB is bound into BOTH the handshake transcript
-//! hash and the static-key DH, so a bad value breaks the auth tag. The parser is
-//! therefore not a standalone trust boundary, the handshake is. Full chain
-//! validation is a future slice.
+//! SECURITY: [`parse_stpub`] extracts STPUB without checking the chain, exactly
+//! as libtropic `lt_get_st_pub`. That alone is not a trust boundary, because a
+//! wrong or substituted STPUB cannot silently open a session: STPUB is bound into
+//! BOTH the handshake transcript hash and the static-key DH, so a bad value
+//! breaks the auth tag. The handshake is the boundary. [`verify_cert_chain`] adds
+//! attestation, proving the store comes from a genuine TROPIC01 under the pinned
+//! root. It covers the cryptographic path only. Validity dates and revocation are
+//! left to the integrator.
 
 use crate::crypto;
 use crate::error::CertError;
@@ -84,13 +87,15 @@ const CHAIN_CERT_COUNT: usize = 4;
 /// to the X25519 public key and returns the 32 STPUB bytes by value (STPUB is
 /// PUBLIC). Trailing store bytes after the certificates are PADDING and ignored.
 ///
-/// Errors: `BadStore` (wrong version/num_certs, truncated header or cert),
-/// `Unsupported` (DER length long-form over 2 bytes or nesting past the depth
-/// cap), `KeyNotFound` (no X25519 key object), `Malformed` (any other DER
-/// bounds/structure fault).
-///
 /// SECURITY: extracts STPUB only. Does NOT validate the certificate chain (see
 /// the module note).
+///
+/// # Errors
+///
+/// `SeError::Cert` wrapping one of: `BadStore` (wrong version/num_certs,
+/// truncated header or cert), `Unsupported` (DER length long-form over 2 bytes
+/// or nesting past the depth cap), `KeyNotFound` (no X25519 key object), or
+/// `Malformed` (any other DER bounds/structure fault).
 pub fn parse_stpub(cert_store: &[u8]) -> Result<[u8; 32], SeError>
 {
     let device_cert = device_cert_body(cert_store)?;
@@ -287,7 +292,7 @@ fn crop_x25519_key(content: &[u8]) -> Result<[u8; 32], CertError>
 }
 
 // ===========================================================================
-// Certificate-chain signature verification (slice 2c.7).
+// Certificate-chain signature verification.
 // ===========================================================================
 
 /// A pinned X.509 trust anchor: the root CA P-521 public key.
@@ -317,6 +322,11 @@ impl RootAnchor
     ///
     /// TROPIC01's root CA is ALWAYS P-521, so this P-521-specific constructor is
     /// intentional: there is deliberately no from_sec1_p384 sibling.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::Chain(ChainError::BadPublicKey)` when the leading tag is not
+    /// 0x04 or the point is not on the P-521 curve.
     pub fn from_sec1_p521(point: &[u8; P521_POINT_LEN]) -> Result<Self, SeError>
     {
         if point[0] != 0x04
@@ -374,24 +384,30 @@ struct CertParts<'a>
 /// Verifies the certificate chain up to the PINNED root anchor.
 ///
 /// Parses the 4-certificate `Get_Info` store (leaf-first: DEVICE, XXXX CA,
-/// product CA, root) and verifies the three signature links. Link 1: cert[0]
-/// (DEVICE) under cert[1]'s P-384 key (ecdsa-with-SHA384). Link 2: cert[1] under
-/// cert[2]'s P-384 key (ecdsa-with-SHA384). Link 3: cert[2] (product CA) under
-/// the PINNED root P-521 key (ecdsa-with-SHA512). The signature algorithm is
-/// dispatched per certificate from its own signatureAlgorithm OID, never
-/// hardcoded by index. Returns `Ok(())` only when all three links verify.
+/// product CA, root) and verifies the three signature links. Link 1: `cert[0]`
+/// (DEVICE) under `cert[1]`'s P-384 key (ecdsa-with-SHA384). Link 2: `cert[1]`
+/// under `cert[2]`'s P-384 key (ecdsa-with-SHA384). Link 3: `cert[2]` (product
+/// CA) under the PINNED root P-521 key (ecdsa-with-SHA512). The signature
+/// algorithm is dispatched per certificate from its own signatureAlgorithm OID,
+/// never hardcoded by index. Returns `Ok(())` only when all three links verify.
 ///
 /// SECURITY: link 3 anchors trust in `anchor`, NOT in the store's self-signed
-/// cert[3]. The store cert[3] is not consulted. An attacker who reorders or
+/// `cert[3]`. The store `cert[3]` is not consulted. An attacker who reorders or
 /// tampers with any certificate makes a signature fail to verify. No Distinguished
 /// Name parsing is needed for security. This relies on the fixed store index
 /// order, which the chip's `Get_Info` guarantees.
 ///
-/// SECURITY: this slice does the CRYPTOGRAPHIC path validation only. It does NOT
+/// SECURITY: this verifier does the CRYPTOGRAPHIC path validation only. It does NOT
 /// check notBefore/notAfter validity (needs an RTC), CRL/OCSP revocation,
 /// basicConstraints CA:TRUE / pathLenConstraint, keyUsage, SubjectKeyId /
 /// AuthorityKeyId, or Distinguished-Name chaining. An integrator MUST add date
 /// and revocation checks before relying on a certificate for production trust.
+///
+/// # Errors
+///
+/// `SeError::Chain` when a signature link fails to verify under the expected
+/// key, or when the store header, a certificate, or a key is malformed,
+/// unsupported, or carries an unexpected signature algorithm.
 pub fn verify_cert_chain(cert_store: &[u8], anchor: &RootAnchor) -> Result<(), SeError>
 {
     let mut bodies: [&[u8]; CHAIN_CERT_COUNT] = [&[]; CHAIN_CERT_COUNT];
@@ -414,6 +430,11 @@ pub fn verify_cert_chain(cert_store: &[u8], anchor: &RootAnchor) -> Result<(), S
 ///
 /// This parses the store TWICE (once to verify, once to extract STPUB). Both
 /// passes are bounded and cheap.
+///
+/// # Errors
+///
+/// `SeError::Chain` when the chain does not verify under `anchor`, or
+/// `SeError::Cert` when the DEVICE certificate does not parse.
 pub fn parse_verified_stpub
 (
     cert_store: &[u8],
@@ -1472,7 +1493,7 @@ mod tests
     {
         // A synthetic store whose cert[0] uses a 3-byte long-form length (0x83)
         // that the chain parser reaches. der_len must surface ChainError::
-        // Unsupported (not Malformed), mirroring the 2c.6 STPUB-path test.
+        // Unsupported (not Malformed), mirroring the STPUB-path test.
         //
         // cert[0] = outer SEQUENCE whose first element (the tbsCertificate slot)
         // is a SEQUENCE using a 3-byte length. parse_cert_parts reaches der_len on

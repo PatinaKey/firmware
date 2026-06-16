@@ -60,8 +60,11 @@ where
     /// Sends a `Startup_Req` (L2 0xB3). The chip boots into Start-up Mode after a
     /// power cycle. `StartupId::Reboot` loads the Application FW (required before
     /// `open_session`, since the secure channel and L3 commands live there).
-    /// Returns `Ok(())` on the empty success ack. Errors on a bus fault or an
-    /// unexpected acknowledgement. Mirrors libtropic `lt_reboot`.
+    /// Returns `Ok(())` on the empty success ack. Mirrors libtropic `lt_reboot`.
+    ///
+    /// # Errors
+    ///
+    /// `SeError` on a bus fault or an unexpected acknowledgement.
     pub fn reboot(&mut self, startup_id: StartupId) -> Result<(), SeError>
     {
         // Startup_Req body = STARTUP_ID(1). REQ_LEN = 1, RSP carries no data.
@@ -126,19 +129,24 @@ where
     /// Reads the full raw X.509 certificate store into `out`.
     ///
     /// The store is a fixed `GET_INFO_CERT_STORE_LEN` (3840) DER bytes across
-    /// `GET_INFO_CERT_STORE_BLOCKS` (30) `Get_Info` blocks. `out` must hold the
-    /// whole store: a shorter buffer is rejected with `BufferTooSmall` up front,
-    /// before any chip traffic. Returns `GET_INFO_CERT_STORE_LEN`.
+    /// `GET_INFO_CERT_STORE_BLOCKS` (30) `Get_Info` blocks. Returns
+    /// `GET_INFO_CERT_STORE_LEN`.
     ///
-    /// This returns the RAW store. Extracting STPUB by walking the ASN.1 is a
-    /// separate deferred layer (libtropic `lt_get_st_pub`), kept out of this slice
-    /// so no new attacker-facing decoder is introduced here. Requires Application
-    /// FW mode.
+    /// This returns the RAW store. Extracting STPUB by walking the ASN.1 is done
+    /// separately by `read_chip_stpub` (mirrors libtropic `lt_get_st_pub`), so a
+    /// caller that only needs the raw bytes pays no parser cost. Requires
+    /// Application FW mode.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `out` is shorter than the whole store,
+    /// rejected up front before any chip traffic. Otherwise `SeError` on a bus
+    /// fault or a malformed reply.
     pub fn x509_certificate_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
     {
         // The store length is fixed and known to the caller, so require the full
         // buffer up front, before any chip traffic, mirroring rmem_read_into's
-        // protocol-MAX check (se-driver lesson 2b.2). Recoverable: no session.
+        // protocol-MAX check. Recoverable: no session.
         if out.len() < GET_INFO_CERT_STORE_LEN
         {
             return Err(SeError::BufferTooSmall);
@@ -173,8 +181,15 @@ where
     ///
     /// SECURITY: this extracts STPUB only. It does NOT verify the certificate
     /// chain up to the Tropic root (mirrors libtropic `lt_get_st_pub`). The
-    /// handshake auth tag binds STPUB, but full chain validation is a future
-    /// slice. See `cert::parse_stpub`.
+    /// handshake auth tag already binds STPUB. To also attest the chip identity,
+    /// use `read_verified_chip_stpub`. See `cert::parse_stpub`.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `scratch` is shorter than the whole store,
+    /// rejected up front before any chip traffic. `SeError::Cert(_)` when the
+    /// DEVICE certificate does not parse. Otherwise `SeError` on a bus fault or a
+    /// malformed reply.
     pub fn read_chip_stpub(&mut self, scratch: &mut [u8]) -> Result<[u8; 32], SeError>
     {
         // Require the full store buffer up front, before any traffic, mirroring
@@ -201,13 +216,21 @@ where
     /// SECURITY: the trust anchor is supplied OUT-OF-BAND, never read from the
     /// store. The PROD root differs from any TEST root. The integrator compiles
     /// in the correct production root point. This verifies the cryptographic
-    /// chain only. date-validity and revocation are deferred (see
+    /// chain only. Date-validity and revocation are left to the integrator (see
     /// `cert::verify_cert_chain`).
     ///
     /// SEAM: `open_session` currently takes STPUB via `SessionConfig`. To make a
     /// session depend on a VERIFIED STPUB, the caller obtains it here and passes
     /// it to `open_session`. Wiring verification into `open_session` directly is
     /// a follow-up. The verified-STPUB value already flows through this method.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `scratch` is shorter than the whole store,
+    /// rejected up front before any chip traffic. `SeError::Chain(_)` when the
+    /// chain does not verify under `anchor`, or `SeError::Cert(_)` when a
+    /// certificate does not parse. Otherwise `SeError` on a bus fault or a
+    /// malformed reply.
     pub fn read_verified_chip_stpub
     (
         &mut self,
@@ -231,8 +254,11 @@ where
     /// CHIP_ID is one fixed 128-byte `Get_Info` block. It uses `_into` rather
     /// than a by-value return (unlike the 4-byte versions) so the caller controls
     /// placement of the larger payload. BLOCK_INDEX is a don't-care, so 0 is sent.
-    /// `out` shorter than 128 bytes is rejected by `get_info_block` with
-    /// `BufferTooSmall`. A reply not exactly 128 bytes is a malformed frame.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `out` is shorter than 128 bytes. Otherwise
+    /// `SeError` on a bus fault or a reply not exactly 128 bytes.
     pub fn chip_id_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
     {
         let n = self.get_info_block(ObjectId::ChipId, 0, out)?;
@@ -248,6 +274,10 @@ where
     /// Returns the RAW 4 bytes. In Start-up Mode the version's high bit is set
     /// (the sentinel `0x80000000`, no Application FW loaded). The caller must
     /// interpret it. The driver is a faithful transport and does not mask it.
+    ///
+    /// # Errors
+    ///
+    /// `SeError` on a bus fault or a reply not exactly 4 bytes.
     pub fn riscv_fw_version(&mut self) -> Result<[u8; 4], SeError>
     {
         let mut buf = [0u8; 4];
@@ -264,6 +294,10 @@ where
     /// Returns the RAW 4 bytes. In Start-up Mode SPECT returns the sentinel
     /// `0x80000000` (high bit set, no SPECT FW running). The driver does not mask
     /// it. The caller interprets the value.
+    ///
+    /// # Errors
+    ///
+    /// `SeError` on a bus fault or a reply not exactly 4 bytes.
     pub fn spect_fw_version(&mut self) -> Result<[u8; 4], SeError>
     {
         let mut buf = [0u8; 4];
@@ -277,10 +311,14 @@ where
 
     /// Reads the FW_BANK header for `bank` into `out`, returning its length.
     ///
-    /// The bank header is variable length: 0 (empty bank), 20, or 52 bytes. Any
-    /// other length is a malformed reply. `out` shorter than the returned data is
-    /// rejected by `get_info_block` with `BufferTooSmall`. Returns the byte
-    /// count. Supported only in Start-up (Maintenance) Mode.
+    /// The bank header is variable length: 0 (empty bank), 20, or 52 bytes.
+    /// Returns the byte count. Supported only in Start-up (Maintenance) Mode.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `out` is shorter than the returned data.
+    /// Otherwise `SeError` on a bus fault or a header whose length is not 0, 20,
+    /// or 52 bytes.
     pub fn fw_bank_into(&mut self, bank: FwBankId, out: &mut [u8]) -> Result<usize, SeError>
     {
         let n = self.get_info_block(ObjectId::FwBank, bank.wire_byte(), out)?;
@@ -304,8 +342,13 @@ where
     /// Opens a secure channel via the Noise KK1 handshake.
     ///
     /// Consumes the handle. On success returns an `ActiveSession` handle ready
-    /// for L3 commands. On failure returns the `NoSession` handle plus the
-    /// error, so the caller can retry without rebuilding the device.
+    /// for L3 commands.
+    ///
+    /// # Errors
+    ///
+    /// On failure returns the `NoSession` handle plus the error (a handshake,
+    /// transport, or crypto fault), so the caller can retry without rebuilding
+    /// the device.
     #[expect(
         clippy::result_large_err,
         reason = "the handle is a large static singleton moved by value through \

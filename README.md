@@ -20,9 +20,9 @@ The MCU and the TROPIC01 communicate over SPI. All long-term private keys live i
 
 ## Status
 
-The project is under active development. Only the secure-element driver (`crates/se-driver`) exists today. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started. See [`crates/se-driver/README.md`](crates/se-driver/README.md) for the driver's detailed status and command-coverage roadmap.
+The project is under active development. Only the secure-element driver (`crates/se-driver`) exists so far. The USB stack and the FIDO2/OpenPGP/PKCS#11 layers are not yet started. See [`crates/se-driver/README.md`](crates/se-driver/README.md) for the driver's detailed status and command-coverage roadmap.
 
-**Secure-element driver - working today**
+**Secure-element driver - working**
 
 - Noise KK1 handshake: authenticated key agreement with the TROPIC01
 - AES-256-GCM command/response codec with advance-after-verify nonces

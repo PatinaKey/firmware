@@ -11,6 +11,13 @@
 //! golden KAT) and runs encrypted L3 commands over it: crypto adapters, the
 //! L1 poll/read, chunked L2 transport, L3 AES-GCM seal/open, and the session
 //! teardown gate that wipes keys on any crypto fault.
+//!
+//! # Crate features
+//!
+//! There is no user-facing feature. Both Cargo features are development-only and
+//! a consumer leaves them off. `_fuzz` exposes the attacker-facing parsers to
+//! the libFuzzer harnesses. `model-itest` compiles the live integration tests
+//! that run against the official TROPIC01 emulator.
 
 #![cfg_attr(not(test), no_std)]
 

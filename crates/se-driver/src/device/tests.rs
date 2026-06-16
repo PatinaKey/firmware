@@ -1,9 +1,8 @@
 //! Host unit tests for the device handle and its commands.
 //!
-//! Moved verbatim from `device.rs` and de-indented. Device-local types,
-//! constants, and the test-only accessors (`spi_ref`, `spi_mut`, `seed_nonces`)
-//! are imported by name from the parent module. Crate-internal items and the
-//! chip mock are imported explicitly.
+//! Device-local types, constants, and the test-only accessors (`spi_ref`,
+//! `spi_mut`, `seed_nonces`) are imported by name from the parent module.
+//! Crate-internal items and the chip mock are imported explicitly.
 
 use super::ActiveSession;
 use super::FwBankId;

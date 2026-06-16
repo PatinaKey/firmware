@@ -23,7 +23,9 @@ impl EccSlot
 {
     /// Builds a slot index, rejecting any value above 31.
     ///
-    /// Errors with `InvalidArgument` outside 0..=31.
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` if `value` is outside 0..=31.
     pub const fn new(value: u8) -> Result<Self, SeError>
     {
         if value > 31
@@ -101,7 +103,9 @@ impl RMemSlot
 {
     /// Builds a slot index, rejecting any value above 511.
     ///
-    /// Errors with `InvalidArgument` outside 0..=511.
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` if `value` is outside 0..=511.
     pub const fn new(value: u16) -> Result<Self, SeError>
     {
         if value > 511
@@ -129,7 +133,9 @@ impl MCounterIdx
 {
     /// Builds a counter index, rejecting any value above 15.
     ///
-    /// Errors with `InvalidArgument` outside 0..=15.
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` if `value` is outside 0..=15.
     pub const fn new(value: u8) -> Result<Self, SeError>
     {
         if value > 15
@@ -157,7 +163,9 @@ impl PairingKeySlot
 {
     /// Builds a slot index, rejecting any value above 3.
     ///
-    /// Errors with `InvalidArgument` outside 0..=3.
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` if `value` is outside 0..=3.
     pub const fn new(value: u8) -> Result<Self, SeError>
     {
         if value > 3
@@ -185,7 +193,9 @@ impl MacDestroySlot
 {
     /// Builds a slot index, rejecting any value above 127.
     ///
-    /// Errors with `InvalidArgument` outside 0..=127.
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` if `value` is outside 0..=127.
     pub const fn new(value: u8) -> Result<Self, SeError>
     {
         if value > 127
@@ -327,7 +337,9 @@ impl ConfigBitIndex
 {
     /// Builds a bit index, rejecting any value above 31.
     ///
-    /// Errors with `InvalidArgument` outside 0..=31.
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` if `value` is outside 0..=31.
     pub const fn new(value: u8) -> Result<Self, SeError>
     {
         if value > 31
@@ -433,14 +445,20 @@ impl MacAndDestroyOutput
 
 /// The high-level secure-element command port.
 ///
-/// Implemented by an active session handle. Every method returns `SeError` on
-/// failure, keeping transport and crypto detail out of the upper layers.
+/// Implemented by an active session handle. Methods never panic. Every failure
+/// is a typed `SeError`, keeping transport and crypto detail out of the upper
+/// layers. A crypto, structural, or parse fault tears the session down and
+/// zeroizes the keys. An authenticated non-OK chip status is recoverable and
+/// keeps the session live, mirroring libtropic.
 pub trait SeCommands
 {
     /// Generates an ECC key pair on the chip in `slot` for `curve`.
     ///
-    /// The private key never leaves the chip. Errors on a busy/locked slot or
-    /// a session fault.
+    /// The private key never leaves the chip.
+    ///
+    /// # Errors
+    ///
+    /// `SeError` on a busy or locked slot, or a session fault.
     fn ecc_key_generate
     (
         &mut self,
@@ -451,8 +469,11 @@ pub trait SeCommands
 
     /// Reads the public key for `slot`.
     ///
-    /// Returns the key by value, carrying its curve. Errors with `SeError` on a
-    /// session fault.
+    /// Returns the key by value, carrying its curve.
+    ///
+    /// # Errors
+    ///
+    /// `SeError` on a session fault.
     fn ecc_public_key
     (
         &mut self,
@@ -465,13 +486,17 @@ pub trait SeCommands
     /// `private_key` is the raw 32-byte scalar (P-256 private integer or Ed25519
     /// seed). It is sent inside the AES-GCM-encrypted channel and the L3
     /// plaintext is zeroized after use. The slot range (0..=31) is enforced by
-    /// `EccSlot::new`. A non-OK RESULT (SlotNotEmpty, InvalidKey, Unauthorized,
-    /// Fail, HardwareFail) keeps the session live and surfaces as a recoverable
-    /// `SeError`.
+    /// `EccSlot::new`.
     ///
     /// SECURITY: an imported key is non-attestable (indistinguishable on-chip
     /// from a chip-generated one). FIDO2 credentials must use chip-generated
     /// keys. Confine import to the OpenPGP / PKCS#11 / imported-SSH path.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT (SlotNotEmpty, InvalidKey, Unauthorized, Fail,
+    /// HardwareFail) keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn ecc_key_store
     (
         &mut self,
@@ -483,9 +508,12 @@ pub trait SeCommands
 
     /// Erases ECC `slot`, removing any stored key.
     ///
-    /// The slot range (0..=31) is enforced by `EccSlot::new`. Erasing an empty
-    /// slot surfaces a recoverable non-OK RESULT (SlotEmpty) and keeps the
-    /// session live.
+    /// The slot range (0..=31) is enforced by `EccSlot::new`.
+    ///
+    /// # Errors
+    ///
+    /// Erasing an empty slot surfaces a recoverable non-OK RESULT (SlotEmpty)
+    /// and keeps the session live.
     fn ecc_key_erase
     (
         &mut self,
@@ -496,6 +524,11 @@ pub trait SeCommands
     /// Signs a 32-byte digest with the P-256 key in `slot` (ECDSA).
     ///
     /// Returns the 64-byte signature. The host must pre-hash with SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// `SeError` on a session fault or a recoverable non-OK chip status (for
+    /// example an empty or wrong-curve slot).
     fn ecdsa_sign
     (
         &mut self,
@@ -508,6 +541,12 @@ pub trait SeCommands
     ///
     /// The chip hashes the message internally (RFC 8032). Returns the 64-byte
     /// signature.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` on an oversize message. Otherwise `SeError` on
+    /// a session fault or a recoverable non-OK chip status (for example an empty
+    /// or wrong-curve slot).
     fn eddsa_sign
     (
         &mut self,
@@ -519,9 +558,12 @@ pub trait SeCommands
     /// Fills `out` with TRNG bytes.
     ///
     /// Returns the number of bytes written, which equals `out.len()`. An empty
-    /// `out` returns `Ok(0)` with no chip traffic. Rejects `out.len() > 255`
-    /// with `InvalidArgument` (chunking is a caller concern). Errors on a
-    /// session fault.
+    /// `out` returns `Ok(0)` with no chip traffic.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` when `out.len() > 255` (chunking is a caller
+    /// concern). Otherwise `SeError` on a session fault.
     fn random_into
     (
         &mut self,
@@ -532,8 +574,12 @@ pub trait SeCommands
     /// Reads R-Memory `slot` into `out`.
     ///
     /// Returns the number of bytes written. 0 means empty: a stored slot is
-    /// never zero-length (write enforces a 1-byte minimum). Errors with
-    /// `BufferTooSmall` when `out` is too short.
+    /// never zero-length (write enforces a 1-byte minimum).
+    ///
+    /// # Errors
+    ///
+    /// `SeError::BufferTooSmall` when `out` is shorter than the protocol maximum.
+    /// Otherwise `SeError` on a session fault.
     fn rmem_read_into
     (
         &mut self,
@@ -544,8 +590,13 @@ pub trait SeCommands
 
     /// Writes `data` to R-Memory `slot`.
     ///
-    /// The slot must be erased first. Errors with `InvalidArgument` on an
-    /// oversize payload.
+    /// The slot must be erased first.
+    ///
+    /// # Errors
+    ///
+    /// `SeError::InvalidArgument` on an oversize payload. A non-OK chip status
+    /// (for example a non-empty slot) keeps the session live and surfaces as a
+    /// recoverable `SeError`.
     fn rmem_write
     (
         &mut self,
@@ -556,9 +607,14 @@ pub trait SeCommands
 
     /// Reads monotonic counter `idx`.
     ///
-    /// Returns the current 32-bit value. A disabled counter surfaces as a
-    /// recoverable `L3Error::Result(CounterInvalid)` that keeps the session
-    /// live. The index range (0..=15) is enforced by `MCounterIdx::new`.
+    /// Returns the current 32-bit value. The index range (0..=15) is enforced by
+    /// `MCounterIdx::new`.
+    ///
+    /// # Errors
+    ///
+    /// A disabled counter surfaces as a recoverable
+    /// `L3Error::Result(CounterInvalid)` that keeps the session live. Otherwise
+    /// `SeError` on a session fault.
     fn mcounter_get
     (
         &mut self,
@@ -569,8 +625,12 @@ pub trait SeCommands
     /// Runs MAC-and-Destroy on `slot` with `input`.
     ///
     /// Returns the secret 32-byte output derived from the pre-overwrite slot
-    /// value, wrapped so it zeroizes on drop. A non-OK RESULT keeps the session
-    /// live and surfaces as a recoverable `SeError`.
+    /// value, wrapped so it zeroizes on drop.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn mac_and_destroy
     (
         &mut self,
@@ -582,8 +642,12 @@ pub trait SeCommands
     /// Erases R-Memory `slot`, clearing it for a fresh write.
     ///
     /// A write requires an empty slot, so a rewrite is erase-then-write. The
-    /// slot range (0..=511) is enforced by `RMemSlot::new`. A non-OK RESULT
-    /// keeps the session live and surfaces as a recoverable `SeError`.
+    /// slot range (0..=511) is enforced by `RMemSlot::new`.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn rmem_erase
     (
         &mut self,
@@ -595,11 +659,16 @@ pub trait SeCommands
     ///
     /// The anti-clone counters must be initialized before a decrement. The index
     /// range (0..=15) is enforced by `MCounterIdx::new`, any 32-bit `value` is
-    /// accepted. A non-OK RESULT keeps the session live.
+    /// accepted.
     ///
     /// PROVISIONING ONLY. Init can re-set a counter to a higher value and defeat
     /// the anti-rollback guarantee, so the caller must invoke it only during
     /// provisioning, never in normal operation. The driver enforces no policy.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn mcounter_init
     (
         &mut self,
@@ -610,10 +679,14 @@ pub trait SeCommands
 
     /// Decrements monotonic counter `idx` by one.
     ///
-    /// The decrement is fixed at one. A counter already at zero surfaces as a
-    /// recoverable `L3Error::Result(UpdateErr)`, and an uninitialized or locked
-    /// counter as `L3Error::Result(CounterInvalid)`, both keep the session live.
-    /// The index range (0..=15) is enforced by `MCounterIdx::new`.
+    /// The decrement is fixed at one. The index range (0..=15) is enforced by
+    /// `MCounterIdx::new`.
+    ///
+    /// # Errors
+    ///
+    /// A counter already at zero surfaces as a recoverable
+    /// `L3Error::Result(UpdateErr)`, and an uninitialized or locked counter as
+    /// `L3Error::Result(CounterInvalid)`. Both keep the session live.
     fn mcounter_update
     (
         &mut self,
@@ -627,13 +700,16 @@ pub trait SeCommands
     /// against (`SessionConfig.shipub` / `pkey_index` select the slot chip-side).
     /// `public_key` is the 32-byte host static pairing PUBLIC key (`S_HiPub`),
     /// not a secret. The slot range (0..=3) is enforced by `PairingKeySlot::new`.
-    /// A non-OK RESULT (HardwareFail on an OTP write error that permanently
-    /// invalidates the slot, plus Unauthorized / Fail) keeps the session live and
-    /// surfaces as a recoverable `SeError`.
     ///
     /// PROVISIONING ONLY. Overwriting the slot named by the session `pkey_index`
     /// (the active handshake key) can permanently prevent re-establishing a secure
     /// channel.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT (HardwareFail on an OTP write error that permanently
+    /// invalidates the slot, plus Unauthorized / Fail) keeps the session live and
+    /// surfaces as a recoverable `SeError`.
     fn pairing_key_write
     (
         &mut self,
@@ -645,10 +721,13 @@ pub trait SeCommands
     /// Reads the host pairing public key stored in pairing `slot`.
     ///
     /// Returns the slot's 32-byte public pairing key (`S_HiPub`) by value. The
-    /// slot range (0..=3) is enforced by `PairingKeySlot::new`. A non-OK RESULT
-    /// (SlotEmpty on an unprovisioned slot, SlotInvalid on an invalidated one,
-    /// plus Unauthorized / Fail) keeps the session live and surfaces as a
-    /// recoverable `SeError`.
+    /// slot range (0..=3) is enforced by `PairingKeySlot::new`.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT (SlotEmpty on an unprovisioned slot, SlotInvalid on an
+    /// invalidated one, plus Unauthorized / Fail) keeps the session live and
+    /// surfaces as a recoverable `SeError`.
     fn pairing_key_read
     (
         &mut self,
@@ -658,13 +737,16 @@ pub trait SeCommands
 
     /// Invalidates pairing `slot`, blocking future handshakes against it.
     ///
-    /// The slot range (0..=3) is enforced by `PairingKeySlot::new`. A non-OK
-    /// RESULT (HardwareFail on an OTP write error, plus Unauthorized / Fail)
-    /// keeps the session live and surfaces as a recoverable `SeError`.
+    /// The slot range (0..=3) is enforced by `PairingKeySlot::new`.
     ///
     /// PROVISIONING ONLY. Invalidating the slot named by the session `pkey_index`
     /// (the active handshake key) can permanently prevent re-establishing a secure
     /// channel.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT (HardwareFail on an OTP write error, plus Unauthorized /
+    /// Fail) keeps the session live and surfaces as a recoverable `SeError`.
     fn pairing_key_invalidate
     (
         &mut self,
@@ -675,13 +757,16 @@ pub trait SeCommands
     /// Writes the 32-bit `value` to R-Config object `addr`.
     ///
     /// R-Config is the reversible working copy of the chip configuration. A
-    /// write here can be undone by an erase, unlike I-Config. A non-OK RESULT
-    /// (Unauthorized, Fail, ...) keeps the session live and surfaces as a
-    /// recoverable `SeError`.
+    /// write here can be undone by an erase, unlike I-Config.
     ///
     /// The final configuration the chip enforces is the bitwise AND of I-Config
     /// and R-Config, applied AFTER the next boot. `CfgUapRConfigWriteErase` gates
     /// both this write and `r_config_erase` (one UAP register for both).
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT (Unauthorized, Fail, ...) keeps the session live and
+    /// surfaces as a recoverable `SeError`.
     fn r_config_write
     (
         &mut self,
@@ -692,8 +777,12 @@ pub trait SeCommands
 
     /// Reads the 32-bit value of R-Config object `addr`.
     ///
-    /// Returns the reversible working-copy value. A non-OK RESULT keeps the
-    /// session live and surfaces as a recoverable `SeError`.
+    /// Returns the reversible working-copy value.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn r_config_read
     (
         &mut self,
@@ -707,6 +796,11 @@ pub trait SeCommands
     /// configuration objects to all-1s) in one command. A caller expecting to
     /// clear a single object will instead reset the entire reversible config.
     /// `CfgUapRConfigWriteErase` gates both this erase and `r_config_write`.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn r_config_erase
     (
         &mut self,
@@ -724,10 +818,13 @@ pub trait SeCommands
     /// caller must not rely on a particular status.
     ///
     /// PROVISIONING ONLY. The bit range (0..=31) is enforced by
-    /// `ConfigBitIndex::new`. A non-OK RESULT keeps the session live and surfaces
-    /// as a recoverable `SeError`, EXCEPT that a HardwareFail on an I-Config write
-    /// is fatal on real silicon (the chip enters ALARM). The driver enforces no
-    /// policy on when this runs.
+    /// `ConfigBitIndex::new`. The driver enforces no policy on when this runs.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`, EXCEPT that a HardwareFail on an I-Config write is fatal on
+    /// real silicon (the chip enters ALARM).
     fn i_config_write
     (
         &mut self,
@@ -738,8 +835,12 @@ pub trait SeCommands
 
     /// Reads the 32-bit value of I-Config object `addr`.
     ///
-    /// Returns the irreversible-config value. A non-OK RESULT keeps the session
-    /// live and surfaces as a recoverable `SeError`.
+    /// Returns the irreversible-config value.
+    ///
+    /// # Errors
+    ///
+    /// A non-OK RESULT keeps the session live and surfaces as a recoverable
+    /// `SeError`.
     fn i_config_read
     (
         &mut self,

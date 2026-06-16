@@ -3,7 +3,7 @@
 //! Compiled only under `cfg(test)`. These satisfy the `SpiDevice` and `SeWait`
 //! bounds, so you can exercise the device handle and its generics without
 //! hardware. `ChipMockSpi` simulates the chip side of the wire protocol for
-//! the ping vertical slice, including injectable faults for the teardown
+//! the driver's commands, including injectable faults for the teardown
 //! gate tests. The `vectors` module carries the golden handshake KAT.
 
 extern crate std;
@@ -375,7 +375,7 @@ fn open(key: &[u8; 32], n: u32, ct_tag: &[u8]) -> Vec<u8>
 
 /// A transcript-faithful chip-side simulator over the `SpiDevice` seam.
 ///
-/// Mirrors the TROPIC01 wire protocol for the ping vertical slice: it answers a
+/// Mirrors the TROPIC01 wire protocol for the driver's commands: it answers a
 /// Handshake_Req with the golden ETPUB||T_TAUTH, acknowledges encrypted-command
 /// chunks, and for a Ping decrypts with kCMD, echoes the payload, and re-seals
 /// the result with kRES. Both nonces start at 0 and advance one step per

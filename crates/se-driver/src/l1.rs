@@ -9,8 +9,8 @@
 //! The response read over-clocks a fixed maximum (the full L2 frame) in one
 //! transaction, because `SpiDevice` fixes each operation length before the call
 //! and releases CS between transactions. Bytes clocked past the declared frame
-//! are ignored. The parser sees only `out[..frame_len]`. Revisit this over-read
-//! for byte-exact transcript replay against the libtropic oracle.
+//! are clocked out but discarded. The parser sees only `out[..frame_len]`, so
+//! the extra bus bytes never reach any layer above.
 
 use embedded_hal::spi::Operation;
 use embedded_hal::spi::SpiDevice;
@@ -35,7 +35,7 @@ const READ_RETRY_DELAY_MS: u32 = 25;
 
 /// Sends a built L2 request frame in a single SPI transaction.
 ///
-/// `frame` is the complete `[id | len | data | crc]` request. 
+/// `frame` is the complete `[id | len | data | crc]` request.
 /// Maps any bus fault to `L1Error::Bus`.
 pub(crate) fn send_request<SPI>
 (
@@ -56,7 +56,7 @@ where
 /// least one full L2 frame) and returns its byte length. ALARM maps to
 /// `L1Error::Alarm`, a bus fault to `L1Error::Bus`, and exhausting the retry
 /// budget to `L1Error::ChipBusy`. The returned length is bounded by the
-/// declared RSP_LEN and validated against `out`, so no later slice can overrun.
+/// declared RSP_LEN and validated against `out`, so no downstream read can overrun.
 pub(crate) fn read_response<SPI, W>
 (
     spi: &mut SPI,

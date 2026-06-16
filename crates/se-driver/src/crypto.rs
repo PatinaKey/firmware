@@ -171,7 +171,7 @@ pub(crate) fn ecdsa_p384_sha384_verify
 /// Verifies an ECDSA/P-521 signature over `msg` with SHA-512.
 ///
 /// `pubkey_sec1` is the SEC1 uncompressed point (0x04 || X || Y, 133 bytes).
-/// `msg` is the raw message (the tbsCertificate bytes); the curve default digest
+/// `msg` is the raw message (the tbsCertificate bytes). The curve default digest
 /// hashes it with SHA-512 internally, matching ecdsa-with-SHA512. `sig_der` is
 /// the ECDSA-Sig-Value DER (SEQUENCE { INTEGER r, INTEGER s }). Any parse or
 /// verification failure maps to `CryptoError`.
