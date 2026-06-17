@@ -75,19 +75,7 @@ where
     /// `SeError` on a bus fault or an unexpected acknowledgement.
     pub fn reboot(&mut self, startup_id: StartupId) -> Result<(), SeError>
     {
-        // Startup_Req body = STARTUP_ID(1). REQ_LEN = 1, RSP carries no data.
-        let body = [startup_id.wire_byte()];
-        let n = frame::build_request(L2ReqId::Startup as u8, &body, &mut self.l2)?;
-        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
-        let frame_len =
-            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
-        let resp = frame::parse_response(&self.l2[..frame_len])?;
-        // A successful Startup_Req is acknowledged with an empty RequestOk frame.
-        if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
-        {
-            return Err(SeError::L2(L2Error::BadFrame));
-        }
-        Ok(())
+        send_startup(&mut self.spi, &mut self.wait, &mut self.l2, startup_id)
     }
 
     /// Reads one `Get_Info` block into `out`, returning the RSP_DATA length.
@@ -112,26 +100,7 @@ where
     )
     -> Result<usize, SeError>
     {
-        // Get_Info_Req body = OBJECT_ID(1) || BLOCK_INDEX(1). REQ_LEN = 2.
-        let body = [object_id as u8, block_index];
-        let n = frame::build_request(L2ReqId::GetInfo as u8, &body, &mut self.l2)?;
-        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
-        let frame_len =
-            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
-        let resp = frame::parse_response(&self.l2[..frame_len])?;
-        // A Get_Info reply fits one L2 chunk (RSP_DATA <= 128), so only a single
-        // RequestOk frame is expected. *Cont (or any other accepted status) is a
-        // malformed reply for this command.
-        if !matches!(resp.status, L2Status::RequestOk)
-        {
-            return Err(SeError::L2(L2Error::BadFrame));
-        }
-        if out.len() < resp.data.len()
-        {
-            return Err(SeError::BufferTooSmall);
-        }
-        out[..resp.data.len()].copy_from_slice(resp.data);
-        Ok(resp.data.len())
+        get_info_block_raw(&mut self.spi, &mut self.wait, &mut self.l2, object_id, block_index, out)
     }
 
     /// Reads the full raw X.509 certificate store into `out`.
@@ -329,16 +298,7 @@ where
     /// or 52 bytes.
     pub fn fw_bank_into(&mut self, bank: FwBankId, out: &mut [u8]) -> Result<usize, SeError>
     {
-        let n = self.get_info_block(ObjectId::FwBank, bank.wire_byte(), out)?;
-        // A FW_BANK header is empty, or a 20- or 52-byte record. Any other length
-        // is a structural anomaly. Sizes from libtropic
-        // TR01_L2_GET_INFO_FW_HEADER_SIZE_BOOT_V2_EMPTY_BANK (0) / _BOOT_V1 (20) /
-        // _BOOT_V2 (52).
-        if n != 0 && n != 20 && n != 52
-        {
-            return Err(SeError::L2(L2Error::BadFrame));
-        }
-        Ok(n)
+        super::bootloader::fw_bank_validated(&mut self.spi, &mut self.wait, &mut self.l2, bank, out)
     }
 
     /// Puts the chip into Sleep Mode.
@@ -562,4 +522,91 @@ where
         &t_tauth,
     )?;
     Ok(keys)
+}
+
+/// Sends a `Startup_Req` (L2 0xB3) and checks the empty success ack.
+///
+/// Shared by `reboot`, `enter_bootloader`, `exit_to_application`, and the
+/// anti-downgrade reboot inside `update_firmware`. Builds the one-byte
+/// `STARTUP_ID` body, sends it, reads the reply, and requires an empty
+/// `RequestOk` frame. Mirrors libtropic `lt_reboot`.
+///
+/// # Errors
+///
+/// `SeError` on a bus fault, and `SeError::L2(L2Error::BadFrame)` on any reply
+/// that is not an empty `RequestOk` ack.
+pub(crate) fn send_startup<SPI, W>
+(
+    spi: &mut SPI,
+    wait: &mut W,
+    l2: &mut [u8],
+    startup_id: StartupId,
+)
+-> Result<(), SeError>
+where
+    SPI: SpiDevice,
+    W: SeWait,
+{
+    // Startup_Req body = STARTUP_ID(1). REQ_LEN = 1, RSP carries no data.
+    let body = [startup_id.wire_byte()];
+    let n = frame::build_request(L2ReqId::Startup as u8, &body, l2)?;
+    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
+    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
+    let resp = frame::parse_response(&l2[..frame_len])?;
+    // A successful Startup_Req is acknowledged with an empty RequestOk frame.
+    if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+    {
+        return Err(SeError::L2(L2Error::BadFrame));
+    }
+    Ok(())
+}
+
+/// Reads one `Get_Info` block into `out`, returning the RSP_DATA length.
+///
+/// The shared L2 body for every `Get_Info` object: sends a `Get_Info_Req`
+/// (L2 0x01) with REQ_DATA = OBJECT_ID || BLOCK_INDEX and copies the response
+/// RSP_DATA into `out`. Reused by the `NoSession` object wrappers and by
+/// `Bootloader::fw_bank_into`, since FW_BANK is readable only in Start-up Mode.
+///
+/// # Errors
+///
+/// A non-OK chip status surfaces as `SeError::L2(L2Error::Status(_))` via
+/// `parse_response` and is recoverable by nature (no session state). A
+/// continuation status (`*Cont`) is anomalous for a single-frame `Get_Info`
+/// reply and is rejected as `L2Error::BadFrame`. `out` too small for the
+/// RSP_DATA returns `SeError::BufferTooSmall`. Otherwise `SeError` on a bus
+/// fault.
+pub(crate) fn get_info_block_raw<SPI, W>
+(
+    spi: &mut SPI,
+    wait: &mut W,
+    l2: &mut [u8],
+    object_id: ObjectId,
+    block_index: u8,
+    out: &mut [u8],
+)
+-> Result<usize, SeError>
+where
+    SPI: SpiDevice,
+    W: SeWait,
+{
+    // Get_Info_Req body = OBJECT_ID(1) || BLOCK_INDEX(1). REQ_LEN = 2.
+    let body = [object_id as u8, block_index];
+    let n = frame::build_request(L2ReqId::GetInfo as u8, &body, l2)?;
+    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
+    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
+    let resp = frame::parse_response(&l2[..frame_len])?;
+    // A Get_Info reply fits one L2 chunk (RSP_DATA <= 128), so only a single
+    // RequestOk frame is expected. *Cont (or any other accepted status) is a
+    // malformed reply for this command.
+    if !matches!(resp.status, L2Status::RequestOk)
+    {
+        return Err(SeError::L2(L2Error::BadFrame));
+    }
+    if out.len() < resp.data.len()
+    {
+        return Err(SeError::BufferTooSmall);
+    }
+    out[..resp.data.len()].copy_from_slice(resp.data);
+    Ok(resp.data.len())
 }

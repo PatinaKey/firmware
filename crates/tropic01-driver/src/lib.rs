@@ -1,6 +1,6 @@
-//! TROPIC01 secure element driver for patina_key.
+//! TROPIC01 secure element driver.
 //!
-//! A `no_std`, no-heap, panic-free Rust driver for the TROPIC01 secure
+//! Unofficial `no_std`, no-heap, panic-free Rust driver for the TROPIC01 secure
 //! element over SPI. The crate is internally layered (L1 transport, L2 framing,
 //! L3 encrypted commands, the Noise session). Transport and crypto detail stay
 //! `pub(crate)`. The public surface is the device handle, the type-state
@@ -50,12 +50,14 @@ pub use crate::device::ActiveSession;
 pub use crate::device::Bootloader;
 pub use crate::device::ChipMode;
 pub use crate::device::FwBankId;
+pub use crate::device::FwImageChunks;
 pub use crate::device::NoSession;
 pub use crate::device::SessionConfig;
 pub use crate::device::StartupId;
 pub use crate::device::Tropic01;
 pub use crate::error::CertError;
 pub use crate::error::ChainError;
+pub use crate::error::FwImageError;
 pub use crate::error::HandshakeError;
 pub use crate::error::L1Error;
 pub use crate::error::L2Error;
@@ -118,6 +120,27 @@ pub mod fuzz
     pub fn parse_stpub(data: &[u8])
     {
         let _ = crate::cert::parse_stpub(data);
+    }
+
+    /// Drives the firmware-image blob decoder over arbitrary bytes. Must never
+    /// panic.
+    ///
+    /// The update blob is attacker-influenced. `FwImageChunks::new` then a full
+    /// drain of the iterator exercises every length-prefix bound: a constructor
+    /// reject, a clean chunk walk, and the fuse-on-truncation path. It then
+    /// drives `image_version` on the same bytes, exercising the chunk-0 version
+    /// extraction (the const-offset `take` + `take_le_u32` reads). Both share the
+    /// blob as their attacker surface. Any panic is a finding.
+    pub fn fw_image_chunks(data: &[u8])
+    {
+        if let Ok(chunks) = crate::device::FwImageChunks::new(data)
+        {
+            for chunk in chunks
+            {
+                let _ = chunk;
+            }
+        }
+        let _ = crate::device::image_version(data);
     }
 
     /// Drives the certificate-chain verifier over arbitrary bytes with a fixed

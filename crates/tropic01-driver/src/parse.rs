@@ -49,6 +49,16 @@ pub(crate) fn take_be_u16(input: &[u8]) -> Result<(&[u8], u16), ParseError>
     Ok((rest, u16::from_be_bytes(bytes)))
 }
 
+/// Reads a little-endian `u32` from the front of `input`.
+///
+/// Returns `(rest, value)`. Errors when fewer than 4 bytes remain. The firmware
+/// version fields (image chunk-0 and FW_BANK header) are little-endian u32s.
+pub(crate) fn take_le_u32(input: &[u8]) -> Result<(&[u8], u32), ParseError>
+{
+    let (rest, bytes) = take_array::<4>(input)?;
+    Ok((rest, u32::from_le_bytes(bytes)))
+}
+
 /// Reads exactly `N` bytes and returns them as a fixed-size array.
 ///
 /// The array type carries the length proof, so callers avoid a second
@@ -136,6 +146,20 @@ mod tests
     }
 
     #[test]
+    fn take_le_u32_is_little_endian()
+    {
+        let (rest, v) = take_le_u32(&[0x78, 0x56, 0x34, 0x12, 0x99]).unwrap();
+        assert_eq!(v, 0x1234_5678);
+        assert_eq!(rest, &[0x99]);
+    }
+
+    #[test]
+    fn take_le_u32_short_errors()
+    {
+        assert_eq!(take_le_u32(&[0x01, 0x02, 0x03]), Err(ParseError::UnexpectedEnd));
+    }
+
+    #[test]
     fn take_array_reads_fixed()
     {
         let (rest, arr): (&[u8], [u8; 3]) = take_array(&[1, 2, 3, 4]).unwrap();
@@ -161,6 +185,7 @@ mod tests
             let _ = take(s, 3);
             let _ = take_u8(s);
             let _ = take_le_u16(s);
+            let _ = take_le_u32(s);
             let _: Result<(&[u8], [u8; 4]), ParseError> = take_array(s);
         }
     }

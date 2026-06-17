@@ -1,4 +1,4 @@
-// Handshake KAT oracle for the patina_key tropic01-driver.
+// Handshake KAT oracle for the tropic01-driver.
 // Reproduces libtropic's lt_in__session_start key derivation byte-for-byte
 // using the REAL libtropic functions (lt_X25519, lt_hkdf, lt_sha256) with the
 // openssl crypto backend, over PINNED test inputs. Emits golden kCMD/kRES/

@@ -52,3 +52,10 @@ path = "fuzz_targets/verify_cert_chain.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fw_image_chunks"
+path = "fuzz_targets/fw_image_chunks.rs"
+test = false
+doc = false
+bench = false
