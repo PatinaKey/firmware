@@ -311,7 +311,8 @@ jobs:
           secs=60
           if [ "${{ github.event_name }}" = "schedule" ]; then secs=900; fi
           cd crates/tropic01-driver
-          for t in parse_l2_response decrypt_l3_result parse_handshake_resp; do
+          # Enumerate the targets so a newly added one is fuzzed automatically.
+          for t in $(cargo +nightly fuzz list); do
             cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- -max_total_time="$secs" -timeout=10
           done
 
