@@ -152,7 +152,8 @@ fuzz_stage()
 {
     (
         cd crates/tropic01-driver || exit 1
-        for t in parse_l2_response decrypt_l3_result parse_handshake_resp
+        # Enumerate the targets so a newly added one is fuzzed automatically.
+        for t in $(cargo +nightly fuzz list)
         do
             cargo +nightly fuzz run "$t" -- -max_total_time="$FUZZ_SECS" -timeout=10 || exit 1
         done
