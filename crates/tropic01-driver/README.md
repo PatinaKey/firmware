@@ -6,9 +6,7 @@ authenticated, encrypted **Noise KK1** session.
 
 ⚠️ Disclaimer: This is an unofficial, community-driven project. It is not affiliated with, endorsed by, or officially supported by Tropic Square. For the official SDK, please refer to Tropic Square's libtropic.
 
-It is the secure-element layer of the
-[PatinaKey](https://github.com/PatinaKey/firmware) hardware security key, written
-as a clean-room rewrite with the official C SDK
+Written as a clean-room rewrite with the official C SDK
 [`libtropic`](https://github.com/tropicsquare/libtropic) used as a differential
 **test oracle** (never linked : no C, no mbedTLS in the trusted computing base).
 
@@ -17,7 +15,7 @@ as a clean-room rewrite with the official C SDK
 > mock (incl. fault injection), a libtropic-derived handshake KAT, and a **live
 > end-to-end suite against the official `tropic01_model` emulator** (real
 > handshake + real AES-GCM, see [Validation](#validation-against-real-libtropic)).
-> Most of the chip's command surface is wired, including X.509 chain verification up to the pinned Tropic root and the power / mode / session-lifecycle L2 commands. What remains is the firmware-update bootloader API (see [Roadmap](#roadmap)). It has not yet run on real silicon. Not production-grade yet.
+> The chip's whole command surface is wired, including X.509 chain verification up to the pinned Tropic root, the power / mode / session-lifecycle L2 commands, and the firmware-update bootloader API. None of it has run on real silicon, and the bootloader in particular is golden-byte-tested only (the emulator models none of it) - a hardware power-fault test is a hard gate before any production firmware update. Not production-grade yet.
 
 ## What it does
 
@@ -57,9 +55,11 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | PIN primitive | `mac_and_destroy` (0x90), output wrapped in a zeroize-on-drop secret type |
 | Pairing keys | `pairing_key_write` (0x10), `pairing_key_read` (0x11), `pairing_key_invalidate` (0x12) - provision the chip's 4 host-pairing slots |
 | Config objects | `r_config_write` (0x20), `r_config_read` (0x21), `r_config_erase` (0x22, whole R-Config), `i_config_write` (0x30, irreversible OTP bit-burn), `i_config_read` (0x31) - per-command access privileges (CFG_UAP) and chip behaviour |
+| Firmware update | `enter_bootloader` / `exit_to_application` (type-state transitions via Startup_Req), `mutable_fw_update` (0xB0) / `mutable_fw_update_data` (0xB1), the bounded `FwImageChunks` blob decoder, and the `update_firmware` orchestrator (both bank pairs, the anti-downgrade reboot, and the post-update per-bank and running-firmware version-equality checks - full parity with libtropic `lt_do_mutable_fw_update`). The host is a pure transport: the chip verifies the EdDSA firmware signature. **Golden-byte tested only, not silicon-validated** |
 
-These twenty-two commands are exposed through the public `SeCommands` trait, the only
-surface the FIDO2 / OpenPGP / PKCS#11 layers consume.
+The twenty-two L3 commands are exposed through the public `SeCommands` trait, the only
+surface the FIDO2 / OpenPGP / PKCS#11 layers consume. The bootloader primitives are
+reached through the `Bootloader` type-state, which firmware update gates at compile time.
 
 ## Validation against real libtropic
 
@@ -94,6 +94,7 @@ robustness.
 | `parse_stpub` / `read_chip_stpub` (STPUB) | Yes - extracts STPUB from the live model's real device certificate and asserts it byte-exact against the model's pinned `s_t_pub`. A golden-constant proof that the DER walk is byte-faithful to an independent implementation |
 | `verify_cert_chain` / `read_verified_chip_stpub` | Yes - reads the live store and verifies the full chain up to the pinned model TEST root, end-to-end through the RustCrypto P-384 / P-521 ECDSA stack. A deliberately wrong anchor is rejected. The same chain independently verifies under openssl |
 | `r_config_write` / `r_config_read` / `r_config_erase` | Yes - write a CO value to a safe register, read it back byte-exact, erase the whole R-Config and read back all-ones. I-Config read live. The irreversible I-Config write is mock-only (a real burn is one-way) |
+| Firmware update (`enter_bootloader` / `mutable_fw_update` 0xB0 / `mutable_fw_update_data` 0xB1 / `update_firmware`) | **No - the emulator models none of the bootloader.** Validated by byte-exact golden REQUEST-frame assertions + the bounded blob decoder fuzzed + orchestration-sequence review only. A real-silicon power-fault test is a HARD gate before production |
 
 The L2 multi-chunk SEND path additionally has a **byte-exact golden KAT**: real
 libtropic frames captured from the model are asserted byte-for-byte against the
@@ -102,18 +103,13 @@ This runs in the normal hermetic test suite.
 
 ## Roadmap
 
-The table below tracks the TROPIC01 command surface still to wire to reach a
-complete, reusable driver. "Needed by PatinaKey" marks what the product itself
-requires (almost everything). The rest matters for a general-purpose driver.
-
-| Block | Commands | What it is for | Needed by PatinaKey |
-|-------|----------|----------------|:---:|
-| Firmware update | bootloader 0xB0 / 0xB1 | Update the chip's application / SPECT firmware | Yes (planned) |
+The TROPIC01 command surface is fully wired: every L2 request and L3 command,
+attestation, and the firmware-update bootloader are implemented.
 
 Non-command work toward a publishable crate: validate against silicon (the
 `tropic01_model` emulator is already wired, see
-[Validation](#validation-against-real-libtropic)), crate-level docs / examples on
-docs.rs, and an optional `embedded-hal`-based port so external users can plug
+[Validation](#validation-against-real-libtropic)), examples on docs.rs, 
+and an optional `embedded-hal`-based port so external users can plug
 their own HAL (currently the ports are the crate's own `SpiDevice` / `SeWait` traits).
 
 ## Design principles
@@ -137,10 +133,11 @@ their own HAL (currently the ports are the crate's own `SpiDevice` / `SeWait` tr
 Host tests drive the driver through mock SPI / wait ports and an in-repo chip mock
 (with fault injection). The Noise KK1 key schedule and the L2 multi-chunk SEND
 frames are checked against golden KATs generated from real libtropic, and the
-X.509 STPUB walk against the real device certificate. Five libFuzzer targets
+X.509 STPUB walk against the real device certificate. Six libFuzzer targets
 cover the attacker-facing parsers - L2 response, L3 result decrypt, handshake
-response, the cert-store STPUB decoder, and the cert-chain verifier (behind the
-`_fuzz` feature). The build is proven `no_std` on `thumbv8m.main-none-eabihf`.
+response, the cert-store STPUB decoder, the cert-chain verifier, and the
+firmware-image blob decoder (behind the `_fuzz` feature). The build is proven
+`no_std` on `thumbv8m.main-none-eabihf`.
 
 ```sh
 cargo test -p tropic01-driver

@@ -1145,6 +1145,265 @@ impl SpiDevice for RecordingSpi
     }
 }
 
+/// The default firmware version the fw-update mock reports everywhere.
+///
+/// Matches the `golden_b0_reqdata` chunk-0 version bytes `[00,00,00,02]` (LE
+/// `0x02000000`), so the happy-path orchestration tests find every bank `ver`
+/// and every running version equal to the image version.
+pub(crate) const FW_UPDATE_DEFAULT_VERSION: [u8; 4] = [0x00, 0x00, 0x00, 0x02];
+
+/// A purpose-built chip mock for the firmware-update orchestrator tests.
+///
+/// Acks every `Startup_Req` (0xB3), `Mutable_FW_Update` (0xB0), and
+/// `Mutable_FW_Update_Data` (0xB1) with an empty `RequestOk` frame, answers a
+/// `Get_Info` FW_BANK read with a 52-byte BOOT_V2 header whose `ver` (offset 4)
+/// defaults to the image version, and answers the post-reboot RISC-V / SPECT
+/// version reads with the same image version by default. It records the
+/// `(req_id, REQ_DATA)` of every request so a test can assert the exact
+/// orchestration sequence. An optional `gen_err_on_nth_b0` makes the nth
+/// (1-based) 0xB0 reply a `GenErr`, to drive the failure-stop path. The bank
+/// header `ver`, its size, and the running version are configurable so a test
+/// can force a version mismatch or a wrong-size header.
+pub(crate) struct FwUpdateSpi
+{
+    requests: Vec<(u8, Vec<u8>)>,
+    pending: VecDeque<Vec<u8>>,
+    b0_count: u32,
+    b3_count: u32,
+    gen_err_on_nth_b0: Option<u32>,
+    gen_err_on_nth_b3: Option<u32>,
+    version_response: [u8; 4],
+    bank_version: [u8; 4],
+    bank_header_len: usize,
+}
+
+impl FwUpdateSpi
+{
+    /// Builds a mock that acks the full update sequence faithfully.
+    pub(crate) fn new() -> Self
+    {
+        FwUpdateSpi
+        {
+            requests: Vec::new(),
+            pending: VecDeque::new(),
+            b0_count: 0,
+            b3_count: 0,
+            gen_err_on_nth_b0: None,
+            gen_err_on_nth_b3: None,
+            // By default every reported version equals the golden image version,
+            // so the happy-path orchestration succeeds under exact equality.
+            version_response: FW_UPDATE_DEFAULT_VERSION,
+            bank_version: FW_UPDATE_DEFAULT_VERSION,
+            // A populated 52-byte BOOT_V2 header by default.
+            bank_header_len: 52,
+        }
+    }
+
+    /// Makes the nth (1-based) `Mutable_FW_Update` (0xB0) reply a `GenErr`.
+    pub(crate) fn fail_nth_b0(&mut self, n: u32)
+    {
+        self.gen_err_on_nth_b0 = Some(n);
+    }
+
+    /// Makes the nth (1-based) `Startup_Req` (0xB3) reply a `GenErr`.
+    ///
+    /// Drives the reboot-failure paths: a failed `exit_to_application` on the
+    /// success path, and a failed best-effort exit after an update failure.
+    pub(crate) fn fail_nth_b3(&mut self, n: u32)
+    {
+        self.gen_err_on_nth_b3 = Some(n);
+    }
+
+    /// Sets the 4-byte value returned for the post-reboot version reads.
+    ///
+    /// A value that differs from the image version drives the update-incomplete
+    /// path in the one-call orchestrator's post-reboot equality check.
+    pub(crate) fn set_version_response(&mut self, version: [u8; 4])
+    {
+        self.version_response = version;
+    }
+
+    /// Sets the `ver` u32 (LE, offset 4) carried by the 52-byte FW_BANK header.
+    ///
+    /// A value that differs from the image version drives the bootloader-side
+    /// per-bank version-equality failure.
+    pub(crate) fn set_bank_version(&mut self, version: [u8; 4])
+    {
+        self.bank_version = version;
+    }
+
+    /// Sets the byte length of the FW_BANK header the mock returns.
+    ///
+    /// Defaults to 52 (BOOT_V2). A test sets 20 (BOOT_V1) or 0 (empty) to drive
+    /// the wrong-header-size failure: the version check requires exactly 52.
+    pub(crate) fn set_bank_header_len(&mut self, len: usize)
+    {
+        self.bank_header_len = len;
+    }
+
+    /// The recorded `(req_id, REQ_DATA)` of every request, in send order.
+    pub(crate) fn requests(&self) -> &[(u8, Vec<u8>)]
+    {
+        &self.requests
+    }
+
+    /// The ordered list of recorded request ids.
+    pub(crate) fn req_ids(&self) -> Vec<u8>
+    {
+        self.requests.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// Frames `data` into a full L2 response frame `[STATUS|LEN|DATA|CRC]`.
+    fn frame(status: u8, data: &[u8]) -> Vec<u8>
+    {
+        let mut f = Vec::with_capacity(2 + data.len() + 2);
+        f.push(status);
+        f.push(u8::try_from(data.len()).expect("fw-update mock frame data exceeds 255 bytes"));
+        f.extend_from_slice(data);
+        let crc = crc16_bytes(&f);
+        f.extend_from_slice(&crc);
+        f
+    }
+
+    /// Queues a `GenErr` reply on the `fail_on` nth request, else `RequestOk`.
+    ///
+    /// Single-sources the ack-or-fail logic shared by the 0xB3 and 0xB0
+    /// branches: both push an empty-data frame, only the status byte differs.
+    fn ack_or_fail(&mut self, count: u32, fail_on: Option<u32>)
+    {
+        if fail_on == Some(count)
+        {
+            self.pending
+                .push_back(Self::frame(L2Status::GenErr as u8, &[]));
+        }
+        else
+        {
+            self.pending
+                .push_back(Self::frame(L2Status::RequestOk as u8, &[]));
+        }
+    }
+
+    /// Answers a `Get_Info` read from the recorded REQ_DATA.
+    ///
+    /// REQ_DATA = OBJECT_ID(1) || BLOCK_INDEX(1). A FW_BANK read returns a
+    /// configured-length BOOT_V2 header. Any other object returns the 4-byte
+    /// running-version value.
+    fn handle_get_info(&mut self, data: &[u8])
+    {
+        let object_id = data.first().copied().unwrap_or(0);
+        if object_id == crate::ids::ObjectId::FwBank as u8
+        {
+            // A BOOT_V2 header of the configured length, carrying `ver` at
+            // offset 4 (LE) when the header is long enough to hold it.
+            let mut header = std::vec![0xABu8; self.bank_header_len];
+            if header.len() >= 8
+            {
+                header[4..8].copy_from_slice(&self.bank_version);
+            }
+            self.pending
+                .push_back(Self::frame(L2Status::RequestOk as u8, &header));
+        }
+        else
+        {
+            // RISC-V / SPECT version reads: the configured 4-byte value
+            // (non-sentinel by default).
+            self.pending.push_back(Self::frame(
+                L2Status::RequestOk as u8,
+                &self.version_response,
+            ));
+        }
+    }
+
+    /// Handles a request frame, recording it and queuing the reply.
+    fn handle_write(&mut self, frame: &[u8])
+    {
+        if frame.len() < 2
+        {
+            return;
+        }
+        let id = frame[0];
+        let len = frame[1] as usize;
+        let end = (2 + len).min(frame.len());
+        let data = frame[2..end].to_vec();
+        self.requests.push((id, data.clone()));
+
+        match L2ReqId::try_from(id)
+        {
+            Ok(L2ReqId::Startup) =>
+            {
+                self.b3_count += 1;
+                self.ack_or_fail(self.b3_count, self.gen_err_on_nth_b3);
+            }
+            Ok(L2ReqId::MutableFwUpdate) =>
+            {
+                self.b0_count += 1;
+                self.ack_or_fail(self.b0_count, self.gen_err_on_nth_b0);
+            }
+            Ok(L2ReqId::MutableFwUpdateData) =>
+            {
+                self.pending
+                    .push_back(Self::frame(L2Status::RequestOk as u8, &[]));
+            }
+            Ok(L2ReqId::GetInfo) =>
+            {
+                self.handle_get_info(&data);
+            }
+            _ =>
+            {}
+        }
+    }
+
+    /// Handles a GET_RESPONSE read: pops the next queued frame.
+    fn handle_read(&mut self, status: &mut [u8], out: &mut [u8])
+    {
+        match self.pending.pop_front()
+        {
+            Some(f) =>
+            {
+                status[0] = 0x01; // READY
+                out[..f.len()].copy_from_slice(&f);
+            }
+            None =>
+            {
+                // Nothing queued: report READY with RSP_LEN = 0xFF.
+                status[0] = 0x01;
+                out[1] = 0xFF;
+            }
+        }
+    }
+}
+
+impl ErrorType for FwUpdateSpi
+{
+    type Error = MockSpiError;
+}
+
+impl SpiDevice for FwUpdateSpi
+{
+    fn transaction
+    (
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    )
+    -> Result<(), Self::Error>
+    {
+        match operations
+        {
+            [Operation::Write(frame)] =>
+            {
+                self.handle_write(frame);
+            }
+            [Operation::TransferInPlace(status), Operation::Read(out)] =>
+            {
+                self.handle_read(status, out);
+            }
+            _ =>
+            {}
+        }
+        Ok(())
+    }
+}
+
 /// A `SpiDevice` that answers a CHIP_STATUS poll with a fixed status byte.
 ///
 /// `read_chip_status` issues a single-operation `TransferInPlace` transaction to

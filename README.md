@@ -39,15 +39,14 @@ The project is under active development. Only the secure-element driver (`crates
 - STPUB extraction: `parse_stpub` / `read_chip_stpub` walk the X.509 cert store's DER (depth-bounded, panic-free) to pull the chip static X25519 key for the handshake
 - X.509 chain verification: `verify_cert_chain` / `parse_verified_stpub` authenticate the chip identity by verifying the cert chain (ECDSA P-384/SHA-384 then P-521/SHA-512) up to a caller-pinned Tropic root, never trusting the store's own root. Cryptographic path only - validity dates and revocation are left to the integrator
 - Configuration objects: R-Config write / read / erase and I-Config write / read, gating per-command access by pairing key (CFG_UAP). The I-Config write is a documented irreversible OTP bit-burn
-- Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic))
-- 371 host tests, five libFuzzer targets on parser entry points, 39 live-model tests
+- Firmware-update bootloader (0xB0 / 0xB1): the `Bootloader` type-state, the bounded `FwImageChunks` blob decoder, and the `update_firmware` orchestrator. The host is a pure transport (the chip verifies the EdDSA signature). Golden-byte tested only - the emulator models none of the bootloader, so a real-silicon power-fault test is a hard gate before production
+- Validated end-to-end against the official `tropic01_model` emulator: real handshake + real AES-GCM, every command's success path plus protocol-reachable failures (see the [driver's validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic)). The bootloader is the exception: golden-byte tested, not model-backed
+- 407 host tests, six libFuzzer targets on parser entry points, 39 live-model tests
 - Clean `thumbv8m.main-none-eabihf` build (no_std proven on the target)
 
 **Not yet implemented**
 
-- Part of the TROPIC01 command surface: the firmware-update bootloader API and remaining power/mode control (see the [driver roadmap](crates/tropic01-driver/README.md#roadmap))
-- SE firmware-update path (bootloader 0xB0/0xB1)
-- Validation against real silicon (the `tropic01_model` emulator is already wired up. See the [validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic))
+- Validation against real silicon (the `tropic01_model` emulator is already wired up. See the [validation table](crates/tropic01-driver/README.md#validation-against-real-libtropic)). The firmware-update bootloader especially: it is golden-byte tested only and needs a hardware power-fault test before any production use
 - MCU firmware: USB stack, FIDO2/CTAP2, OpenPGP card, PKCS#11, TrustZone partition
 
 ## Building

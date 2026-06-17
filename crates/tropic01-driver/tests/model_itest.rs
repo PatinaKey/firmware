@@ -273,7 +273,7 @@ fn fresh_session() -> Tropic01<ModelSpi, NoWait, tropic01_driver::ActiveSession>
 fn open_session_and_ping_small_echoes_payload()
 {
     let mut se = fresh_session();
-    let msg = b"patina_key vs TROPIC01 model";
+    let msg = b"driver vs TROPIC01 model";
     let mut out = [0u8; 28];
     let n = se.ping_into(msg, &mut out).expect("ping");
     assert_eq!(n, msg.len());

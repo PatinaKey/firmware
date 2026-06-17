@@ -124,6 +124,24 @@ pub enum ChainError
     Unsupported,
 }
 
+/// Firmware-image blob decoding errors.
+///
+/// Raised by `FwImageChunks` while splitting a length-prefixed signed firmware
+/// image into its on-wire chunks. The blob is attacker-influenced (it is the
+/// update payload handed to the driver), so every variant is a fail-closed
+/// rejection. The driver is a faithful transport: it validates only the framing
+/// LENGTH bounds, never the image's internal type/offset/version fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FwImageError
+{
+    /// The blob exceeded the maximum firmware-update size.
+    TooLong,
+    /// The blob was shorter than the minimum (the 0xB0 header chunk).
+    TooShort,
+    /// A length prefix ran past the end of the blob (a truncated chunk).
+    Truncated,
+}
+
 /// Bounds-checked parser errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError
@@ -161,6 +179,17 @@ pub enum SeError
     InvalidArgument,
     /// A caller-supplied output buffer was too small for the result.
     BufferTooSmall,
+    /// Decoding a firmware-image update blob failed.
+    Image(FwImageError),
+    /// A firmware update finished writing but the bank did not take the BOOT_V2
+    /// form: a bank read back with a header whose size is not the 52-byte BOOT_V2
+    /// record (it stayed empty or a BOOT_V1 record), so it was not promoted. The
+    /// chip is dual-bank and recoverable, but the new firmware is not installed.
+    FwUpdateIncomplete,
+    /// An installed firmware bank or running firmware reported a version that
+    /// does not match the supplied image. The bank was written but holds an
+    /// unexpected version.
+    FwVersionMismatch,
 }
 
 impl From<L1Error> for L2Error
@@ -251,6 +280,14 @@ impl From<ChainError> for SeError
     }
 }
 
+impl From<FwImageError> for SeError
+{
+    fn from(e: FwImageError) -> Self
+    {
+        SeError::Image(e)
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -309,6 +346,13 @@ mod tests
     {
         let e: SeError = ChainError::BadSignature.into();
         assert_eq!(e, SeError::Chain(ChainError::BadSignature));
+    }
+
+    #[test]
+    fn fw_image_folds_into_se_error()
+    {
+        let e: SeError = FwImageError::Truncated.into();
+        assert_eq!(e, SeError::Image(FwImageError::Truncated));
     }
 
     #[test]

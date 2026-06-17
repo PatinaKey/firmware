@@ -29,9 +29,14 @@ use crate::parse::take_array;
 use crate::session::SessionKeys;
 use zeroize::Zeroizing;
 
+mod bootloader;
 mod commands;
 mod nosession;
 mod se_commands;
+
+pub use bootloader::FwImageChunks;
+#[cfg(feature = "_fuzz")]
+pub(crate) use bootloader::image_version;
 
 #[cfg(test)]
 mod tests;

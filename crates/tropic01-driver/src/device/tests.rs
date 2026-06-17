@@ -269,7 +269,7 @@ fn open(fault: ChipFault) -> Tropic01<ChipMockSpi, MockWait, ActiveSession>
 fn open_session_then_ping_echoes_payload()
 {
     let mut dev = open(ChipFault::None);
-    let payload = b"patina ping";
+    let payload = b"test ping";
     let mut out = [0u8; 32];
     let n = dev.ping_into(payload, &mut out).unwrap();
     assert_eq!(&out[..n], payload);
@@ -562,7 +562,7 @@ fn rslot(value: u16) -> RMemSlot
 fn rmem_read_round_trips_known_bytes()
 {
     let mut dev = open(ChipFault::None);
-    let stored = b"patina rmem payload";
+    let stored = b"test rmem payload";
     dev.spi_mut().set_rmem_slot(7, stored);
     let mut out = [0u8; R_MEM_DATA_MAX];
     let n = dev.rmem_read_into(rslot(7), &mut out).unwrap();
@@ -1488,7 +1488,7 @@ fn eddsa_sign_small_message_round_trips()
     let mut dev = open(ChipFault::None);
     let sig = sample_sig();
     dev.spi_mut().set_signature(sig);
-    let out = dev.eddsa_sign(eslot(7), b"patina eddsa").unwrap();
+    let out = dev.eddsa_sign(eslot(7), b"test eddsa").unwrap();
     assert_eq!(out, Signature(sig));
     assert_eq!(dev.spi_ref().nonces(), (1, 1));
 }
