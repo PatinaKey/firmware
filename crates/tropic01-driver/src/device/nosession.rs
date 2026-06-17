@@ -156,10 +156,15 @@ where
     /// static handle does not grow a 3840-byte stack frame. Requires Application
     /// FW mode.
     ///
-    /// SECURITY: this extracts STPUB only. It does NOT verify the certificate
-    /// chain up to the Tropic root (mirrors libtropic `lt_get_st_pub`). The
-    /// handshake auth tag already binds STPUB. To also attest the chip identity,
-    /// use `read_verified_chip_stpub`. See `cert::parse_stpub`.
+    /// SECURITY: this DOES NOT ATTEST that the chip is a genuine TROPIC01. It
+    /// extracts STPUB only and does NOT verify the certificate chain up to the
+    /// Tropic root (mirrors libtropic `lt_get_st_pub`). A counterfeit or swapped
+    /// chip can serve any STPUB here, and this call will return it. The handshake
+    /// auth tag binds STPUB into the session, so a wrong STPUB cannot silently
+    /// open a channel, but that is integrity, NOT authenticity. For the
+    /// true-TROPIC01 guarantee, use `read_verified_chip_stpub` with a
+    /// `RootAnchor` pinned OUT-OF-BAND (compiled in, never read from the chip).
+    /// See `cert::parse_stpub`.
     ///
     /// # Errors
     ///
@@ -208,6 +213,7 @@ where
     /// chain does not verify under `anchor`, or `SeError::Cert(_)` when a
     /// certificate does not parse. Otherwise `SeError` on a bus fault or a
     /// malformed reply.
+    #[cfg(feature = "attestation")]
     pub fn read_verified_chip_stpub
     (
         &mut self,
@@ -423,6 +429,50 @@ where
     ///
     /// Consumes the handle. On success returns an `ActiveSession` handle ready
     /// for L3 commands.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
+    /// # use core::convert::Infallible;
+    /// # struct Spi;
+    /// # impl ErrorType for Spi { type Error = Infallible; }
+    /// # impl SpiDevice for Spi {
+    /// #     fn transaction(&mut self, _ops: &mut [Operation<'_, u8>]) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// # struct Wait;
+    /// # impl tropic01_driver::SeWait for Wait {
+    /// #     type Error = Infallible;
+    /// #     fn wait_ready(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+    /// #     fn delay_ms(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// use tropic01_driver::{SessionConfig, StartupId, Tropic01};
+    /// use zeroize::Zeroizing;
+    ///
+    /// fn open() -> Result<(), tropic01_driver::SeError>
+    /// {
+    ///     let mut dev = Tropic01::new(Spi, Wait);
+    ///     // The secure channel lives in Application FW: reboot into it first.
+    ///     dev.reboot(StartupId::Reboot)?;
+    ///     // Placeholder keys: real ones come from a TRNG / provisioning, and
+    ///     // `stpub` from the chip certificate (verified via read_verified_chip_stpub).
+    ///     let ehpriv = Zeroizing::new([0u8; 32]);
+    ///     let shipriv = Zeroizing::new([0u8; 32]);
+    ///     let shipub = [0u8; 32];
+    ///     let stpub = [0u8; 32];
+    ///     let cfg = SessionConfig
+    ///     {
+    ///         ehpriv: &ehpriv,
+    ///         shipriv: &shipriv,
+    ///         shipub: &shipub,
+    ///         stpub: &stpub,
+    ///         pkey_index: 0,
+    ///     };
+    ///     // The error path returns the handle too. Keep only the SeError here.
+    ///     let _session = dev.open_session(cfg).map_err(|(_dev, e)| e)?;
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// # Errors
     ///

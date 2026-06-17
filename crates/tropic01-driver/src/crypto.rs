@@ -18,10 +18,15 @@ use x25519_dalek::PublicKey;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "attestation")]
 use p384::ecdsa::signature::Verifier;
+#[cfg(feature = "attestation")]
 use p384::ecdsa::Signature as P384Signature;
+#[cfg(feature = "attestation")]
 use p384::ecdsa::VerifyingKey as P384VerifyingKey;
+#[cfg(feature = "attestation")]
 use p521::ecdsa::Signature as P521Signature;
+#[cfg(feature = "attestation")]
 use p521::ecdsa::VerifyingKey as P521VerifyingKey;
 
 /// AES-GCM authentication tag length, in bytes.
@@ -154,6 +159,7 @@ pub(crate) fn aes256gcm_open
 /// verification failure maps to `CryptoError`.
 ///
 /// This operates on PUBLIC certificate data, so constant time is not required.
+#[cfg(feature = "attestation")]
 pub(crate) fn ecdsa_p384_sha384_verify
 (
     pubkey_sec1: &[u8],
@@ -177,6 +183,7 @@ pub(crate) fn ecdsa_p384_sha384_verify
 /// verification failure maps to `CryptoError`.
 ///
 /// This operates on PUBLIC certificate data, so constant time is not required.
+#[cfg(feature = "attestation")]
 pub(crate) fn ecdsa_p521_sha512_verify
 (
     pubkey_sec1: &[u8],
@@ -198,6 +205,7 @@ pub(crate) fn ecdsa_p521_sha512_verify
 /// a malformed pinned anchor fails at construction rather than at first verify.
 ///
 /// This operates on PUBLIC key data, so constant time is not required.
+#[cfg(feature = "attestation")]
 pub(crate) fn p521_validate_point(point: &[u8]) -> Result<(), CryptoError>
 {
     P521VerifyingKey::from_sec1_bytes(point).map_err(|_| CryptoError)?;

@@ -24,8 +24,10 @@
 //! root. It covers the cryptographic path only. Validity dates and revocation are
 //! left to the integrator.
 
+#[cfg(feature = "attestation")]
 use crate::crypto;
 use crate::error::CertError;
+#[cfg(feature = "attestation")]
 use crate::error::ChainError;
 use crate::error::SeError;
 use crate::parse::take;
@@ -59,28 +61,38 @@ const TAG_OID: u8 = 0x06;
 const TAG_BIT_STRING: u8 = 0x03;
 
 /// ecdsa-with-SHA384 OID content bytes (1.2.840.10045.4.3.3).
+#[cfg(feature = "attestation")]
 const OID_ECDSA_SHA384: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 /// ecdsa-with-SHA512 OID content bytes (1.2.840.10045.4.3.4).
+#[cfg(feature = "attestation")]
 const OID_ECDSA_SHA512: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
 /// id-ecPublicKey OID content bytes (1.2.840.10045.2.1).
+#[cfg(feature = "attestation")]
 const OID_EC_PUBLIC_KEY: [u8; 7] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 /// secp384r1 (P-384) named-curve OID content bytes (1.3.132.0.34).
+#[cfg(feature = "attestation")]
 const OID_SECP384R1: [u8; 5] = [0x2b, 0x81, 0x04, 0x00, 0x22];
 /// secp521r1 (P-521) named-curve OID content bytes (1.3.132.0.35).
+#[cfg(feature = "attestation")]
 const OID_SECP521R1: [u8; 5] = [0x2b, 0x81, 0x04, 0x00, 0x23];
 
 /// SEC1 uncompressed point length for P-384: 0x04 || X(48) || Y(48).
+#[cfg(feature = "attestation")]
 const P384_POINT_LEN: usize = 97;
 /// SEC1 uncompressed point length for P-521: 0x04 || X(66) || Y(66).
+#[cfg(feature = "attestation")]
 const P521_POINT_LEN: usize = 133;
 
 /// Number of certificates the chain expects in the store.
+#[cfg(feature = "attestation")]
 const CHAIN_CERT_COUNT: usize = 4;
 
 /// Extracts STPUB from a raw `Get_Info` X.509 certificate store.
 ///
-/// WARNING: this does NOT verify the certificate chain. For any trust decision
-/// use `parse_verified_stpub`.
+/// WARNING: this does NOT attest TROPIC01 authenticity. It does NOT verify the
+/// certificate chain up to the Tropic root, so a counterfeit chip can serve any
+/// STPUB here. For the genuine-chip guarantee, use `parse_verified_stpub` with a
+/// `RootAnchor` pinned out-of-band.
 ///
 /// Parses the 10-byte store header (version 0x01, num_certs 0x04, four big-endian
 /// u16 per-cert lengths), takes the DEVICE certificate body, then walks its DER
@@ -261,6 +273,7 @@ fn parse_der_len(input: &[u8]) -> Result<(&[u8], usize), CertError>
 /// bytes or indefinite) becomes `ChainError::Unsupported`, every other fault
 /// becomes `ChainError::Malformed`. This keeps the chain path's error taxonomy
 /// aligned with the STPUB path while reusing the one length parser.
+#[cfg(feature = "attestation")]
 fn der_len(input: &[u8]) -> Result<(&[u8], usize), ChainError>
 {
     parse_der_len(input).map_err(|e| match e
@@ -306,12 +319,14 @@ fn crop_x25519_key(content: &[u8]) -> Result<[u8; 32], CertError>
 /// The wrapped bytes are the SEC1 uncompressed point (0x04 || X || Y, 133 bytes).
 /// The TEST root here differs from PROD: the integrator compiles in the correct
 /// production root point.
+#[cfg(feature = "attestation")]
 #[derive(Clone, Copy)]
 pub struct RootAnchor
 {
     point: [u8; P521_POINT_LEN],
 }
 
+#[cfg(feature = "attestation")]
 impl RootAnchor
 {
     /// Builds an anchor from a P-521 SEC1 uncompressed point.
@@ -348,6 +363,7 @@ impl RootAnchor
 }
 
 /// A certificate's signatureAlgorithm: the ECDSA curve+digest it was signed with.
+#[cfg(feature = "attestation")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SigAlg
 {
@@ -358,6 +374,7 @@ enum SigAlg
 }
 
 /// A key's elliptic curve, taken from its SubjectPublicKeyInfo named-curve OID.
+#[cfg(feature = "attestation")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Curve
 {
@@ -371,6 +388,7 @@ enum Curve
 ///
 /// All three are sub-slices of the cert body, never copies. `tbs` is the exact
 /// signed byte range (the first inner SEQUENCE INCLUDING its tag+length header).
+#[cfg(feature = "attestation")]
 struct CertParts<'a>
 {
     /// The tbsCertificate bytes that were signed (SEQUENCE header included).
@@ -408,6 +426,7 @@ struct CertParts<'a>
 /// `SeError::Chain` when a signature link fails to verify under the expected
 /// key, or when the store header, a certificate, or a key is malformed,
 /// unsupported, or carries an unexpected signature algorithm.
+#[cfg(feature = "attestation")]
 pub fn verify_cert_chain(cert_store: &[u8], anchor: &RootAnchor) -> Result<(), SeError>
 {
     let mut bodies: [&[u8]; CHAIN_CERT_COUNT] = [&[]; CHAIN_CERT_COUNT];
@@ -435,6 +454,7 @@ pub fn verify_cert_chain(cert_store: &[u8], anchor: &RootAnchor) -> Result<(), S
 ///
 /// `SeError::Chain` when the chain does not verify under `anchor`, or
 /// `SeError::Cert` when the DEVICE certificate does not parse.
+#[cfg(feature = "attestation")]
 pub fn parse_verified_stpub
 (
     cert_store: &[u8],
@@ -451,6 +471,7 @@ pub fn parse_verified_stpub
 /// Reads the subject's tbsCertificate, signatureAlgorithm, and signatureValue,
 /// reads the issuer's SubjectPublicKeyInfo point, then dispatches the verify by
 /// the subject's algorithm. The issuer key's curve must match the algorithm.
+#[cfg(feature = "attestation")]
 fn verify_link(subject: &[u8], issuer: &[u8]) -> Result<(), ChainError>
 {
     let parts = parse_cert_parts(subject)?;
@@ -462,6 +483,7 @@ fn verify_link(subject: &[u8], issuer: &[u8]) -> Result<(), ChainError>
 ///
 /// SECURITY: the load-bearing trust step. The anchor is the caller's pinned key,
 /// not store bytes. The subject's signatureAlgorithm must be ecdsa-with-SHA512.
+#[cfg(feature = "attestation")]
 fn verify_under_anchor(subject: &[u8], anchor: &RootAnchor) -> Result<(), ChainError>
 {
     let parts = parse_cert_parts(subject)?;
@@ -479,6 +501,7 @@ fn verify_under_anchor(subject: &[u8], anchor: &RootAnchor) -> Result<(), ChainE
 /// be the matching one (SHA-384 with P-384, SHA-512 with P-521). Any other pairing
 /// is rejected as `BadPublicKey` before any crypto runs. This names the
 /// curve<->digest constraint instead of comparing two signatureAlgorithm values.
+#[cfg(feature = "attestation")]
 fn verify_with_curve
 (
     sig_alg: SigAlg,
@@ -511,6 +534,7 @@ fn verify_with_curve
 /// VERSION == 0x01 and NUM_CERTS == 4. Each cert body is `LEN[i]` bytes, taken in
 /// order, `take` rejects any length that overruns the store. Trailing padding is
 /// ignored.
+#[cfg(feature = "attestation")]
 fn split_cert_bodies<'a>
 (
     store: &'a [u8],
@@ -558,6 +582,7 @@ fn split_cert_bodies<'a>
 /// SEQUENCE, its first OID selects the algorithm. The signatureValue is the
 /// trailing BIT STRING. Its content is one 0x00 unused-bits byte then the
 /// ECDSA-Sig-Value DER.
+#[cfg(feature = "attestation")]
 fn parse_cert_parts(cert: &[u8]) -> Result<CertParts<'_>, ChainError>
 {
     // Outer cert SEQUENCE must span the whole body.
@@ -597,6 +622,7 @@ fn parse_cert_parts(cert: &[u8]) -> Result<CertParts<'_>, ChainError>
 ///
 /// The first object is the algorithm OID. It must equal ecdsa-with-SHA384 or
 /// ecdsa-with-SHA512. Trailing params (if any) are ignored.
+#[cfg(feature = "attestation")]
 fn parse_sig_alg(alg_seq: &[u8]) -> Result<SigAlg, ChainError>
 {
     let (oid, _rest) = der_oid(alg_seq)?;
@@ -618,6 +644,7 @@ fn parse_sig_alg(alg_seq: &[u8]) -> Result<SigAlg, ChainError>
 ///
 /// The BIT STRING content is one 0x00 unused-bits byte then SEQUENCE { r, s }.
 /// Returns `(sig_der, trailing)` where `sig_der` is the bytes after the 0x00.
+#[cfg(feature = "attestation")]
 fn parse_signature_value(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 {
     let (after_tag, tag) = take_u8(input).map_err(|_| ChainError::Malformed)?;
@@ -643,6 +670,7 @@ fn parse_signature_value(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 /// returned point is the 0x04 || X || Y SEC1 form (the BIT STRING content minus
 /// its leading 0x00 unused-bits byte). The curve is derived from the curve OID
 /// (secp384r1 -> P-384, secp521r1 -> P-521).
+#[cfg(feature = "attestation")]
 fn parse_spki_point(cert: &[u8]) -> Result<(Curve, &[u8]), ChainError>
 {
     let (inner, _trailing) = der_sequence_content(cert)?;
@@ -667,6 +695,7 @@ fn parse_spki_point(cert: &[u8]) -> Result<(Curve, &[u8]), ChainError>
 /// Returns `Ok(Some(..))` when `elem` is `SEQUENCE { SEQUENCE { OID
 /// id-ecPublicKey, OID curve }, BIT STRING }`, `Ok(None)` when it is not an SPKI
 /// (so scanning continues), and `Err` only on a structurally broken SPKI.
+#[cfg(feature = "attestation")]
 fn try_spki(elem: &[u8]) -> Result<Option<(Curve, &[u8])>, ChainError>
 {
     let (after_tag, tag) = take_u8(elem).map_err(|_| ChainError::Malformed)?;
@@ -719,6 +748,7 @@ fn try_spki(elem: &[u8]) -> Result<Option<(Curve, &[u8])>, ChainError>
 }
 
 /// Maps a named-curve OID to the matching curve.
+#[cfg(feature = "attestation")]
 fn curve_from_oid(curve_oid: &[u8]) -> Result<Curve, ChainError>
 {
     if curve_oid == OID_SECP384R1
@@ -740,6 +770,7 @@ fn curve_from_oid(curve_oid: &[u8]) -> Result<Curve, ChainError>
 /// The BIT STRING content is one 0x00 unused-bits byte then 0x04 || X || Y. The
 /// returned slice is the 0x04 || X || Y part and must be exactly `expected_len`
 /// bytes with a leading 0x04, else the key is rejected.
+#[cfg(feature = "attestation")]
 fn parse_ec_point(input: &[u8], expected_len: usize) -> Result<&[u8], ChainError>
 {
     let (after_tag, tag) = take_u8(input).map_err(|_| ChainError::BadPublicKey)?;
@@ -772,6 +803,7 @@ fn parse_ec_point(input: &[u8], expected_len: usize) -> Result<&[u8], ChainError
 ///
 /// The leading tag must be 0x30. The content is bounded to the declared length,
 /// `trailing` is whatever follows the SEQUENCE in `input`.
+#[cfg(feature = "attestation")]
 fn der_sequence_content(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 {
     let (after_tag, tag) = take_u8(input).map_err(|_| ChainError::Malformed)?;
@@ -788,6 +820,7 @@ fn der_sequence_content(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 /// Returns `(element, rest)` where `element` is the contiguous tag || length ||
 /// content byte range and `rest` is what follows. This is how the exact signed
 /// tbsCertificate byte range is captured.
+#[cfg(feature = "attestation")]
 fn der_element_with_header(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 {
     let (after_tag, _tag) = take_u8(input).map_err(|_| ChainError::Malformed)?;
@@ -802,6 +835,7 @@ fn der_element_with_header(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 }
 
 /// Reads a DER OBJECT IDENTIFIER, returning its `(content, rest)`.
+#[cfg(feature = "attestation")]
 fn der_oid(input: &[u8]) -> Result<(&[u8], &[u8]), ChainError>
 {
     let (after_tag, tag) = take_u8(input).map_err(|_| ChainError::Malformed)?;
@@ -1187,6 +1221,7 @@ mod tests
     // and cross-checked with openssl (the full TEST chain verifies, the root is
     // self-signed, cert[0] STPUB == model s_t_pub). See golden_chain module.
 
+    #[cfg(feature = "attestation")]
     fn test_anchor() -> RootAnchor
     {
         RootAnchor::from_sec1_p521(&golden_chain::MODEL_TEST_ROOT_PUBKEY)
@@ -1194,6 +1229,7 @@ mod tests
     }
 
     /// Embeds the un-padded store into a 3840-byte buffer like the chip serves.
+    #[cfg(feature = "attestation")]
     fn store_padded_3840() -> [u8; 3840]
     {
         let mut padded = [0u8; 3840];
@@ -1202,18 +1238,21 @@ mod tests
         padded
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn verify_cert_chain_accepts_the_model_chain()
     {
         assert_eq!(verify_cert_chain(&golden_chain::MODEL_CERT_STORE, &test_anchor()), Ok(()));
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn verify_cert_chain_accepts_block_padded_store()
     {
         assert_eq!(verify_cert_chain(&store_padded_3840(), &test_anchor()), Ok(()));
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn parse_verified_stpub_returns_model_stpub()
     {
@@ -1223,6 +1262,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn parse_verified_stpub_matches_unverified_on_good_chain()
     {
@@ -1236,12 +1276,14 @@ mod tests
     ///
     /// Computed from the pointer offset, so the test byte to flip is DERIVED from
     /// the parsed structure rather than a hard-coded magic number.
+    #[cfg(feature = "attestation")]
     fn abs_offset(outer: &[u8], inner: &[u8]) -> usize
     {
         (inner.as_ptr() as usize) - (outer.as_ptr() as usize)
     }
 
     /// Returns the absolute store index of a byte inside cert[i]'s sig_der.
+    #[cfg(feature = "attestation")]
     fn sig_byte_index(store: &[u8], cert_index: usize) -> usize
     {
         let mut bodies: [&[u8]; CHAIN_CERT_COUNT] = [&[]; CHAIN_CERT_COUNT];
@@ -1251,6 +1293,7 @@ mod tests
         abs_offset(store, parts.sig_der) + parts.sig_der.len() / 2
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn flipping_a_signature_byte_fails_bad_signature()
     {
@@ -1265,6 +1308,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn flipping_a_tbs_byte_fails()
     {
@@ -1286,6 +1330,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn flipping_cert1_signature_fails_bad_signature()
     {
@@ -1300,6 +1345,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn flipping_cert2_signature_fails_bad_signature()
     {
@@ -1315,6 +1361,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn wrong_anchor_fails_bad_signature()
     {
@@ -1335,6 +1382,7 @@ mod tests
     /// Derived from a fixed non-trivial scalar so it is a real on-curve point and
     /// is accepted by the eagerly-validating anchor constructor, yet differs from
     /// the model TEST root, so signatures fail to verify under it.
+    #[cfg(feature = "attestation")]
     fn other_valid_p521_point() -> [u8; P521_POINT_LEN]
     {
         use p521::ecdsa::SigningKey;
@@ -1347,6 +1395,7 @@ mod tests
         out
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn anchor_without_uncompressed_tag_rejected()
     {
@@ -1358,6 +1407,7 @@ mod tests
         ));
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn wrong_num_certs_in_header_rejected()
     {
@@ -1369,6 +1419,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn bad_version_in_header_rejected()
     {
@@ -1380,6 +1431,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn empty_store_rejected()
     {
@@ -1387,6 +1439,7 @@ mod tests
         assert!(matches!(r, Err(SeError::Chain(_))));
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn verify_cert_chain_never_panics_on_any_truncation()
     {
@@ -1400,6 +1453,7 @@ mod tests
         }
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn verify_cert_chain_never_panics_on_single_byte_flips_across_store()
     {
@@ -1415,6 +1469,7 @@ mod tests
         }
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn parse_spki_point_reads_the_xxxx_ca_p384_key()
     {
@@ -1428,6 +1483,7 @@ mod tests
         assert_eq!(point[0], 0x04);
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn parse_spki_point_reads_the_root_p521_key()
     {
@@ -1441,6 +1497,7 @@ mod tests
         assert_eq!(point, &golden_chain::MODEL_TEST_ROOT_PUBKEY[..]);
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn each_leaf_sig_alg_is_dispatched_from_its_own_oid()
     {
@@ -1454,6 +1511,7 @@ mod tests
         assert!(matches!(parse_cert_parts(bodies[3]).unwrap().sig_alg, SigAlg::EcdsaSha512));
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn algorithm_confusion_in_leaf_is_rejected_bad_public_key()
     {
@@ -1488,6 +1546,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn chain_der_length_long_form_over_two_bytes_unsupported()
     {
@@ -1514,6 +1573,7 @@ mod tests
         );
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn parse_spki_point_without_ec_public_key_is_bad_public_key()
     {
@@ -1532,7 +1592,7 @@ mod tests
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "attestation"))]
 mod golden_chain
 {
     // HERMETIC GOLDEN for chain verification

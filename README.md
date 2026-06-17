@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/PatinaKey/firmware/actions/workflows/ci.yml/badge.svg)](https://github.com/PatinaKey/firmware/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
-[![Rust 1.95+](https://img.shields.io/badge/Rust-1.95%2B%20edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/)
+[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B%20edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/)
 [![no_std](https://img.shields.io/badge/no__std-bare--metal-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
 
 Open-source Rust firmware for **PatinaKey**, a USB hardware security key implementing FIDO2, OpenPGP card, and PKCS#11.
@@ -51,7 +51,7 @@ The project is under active development. Only the secure-element driver (`crates
 
 ## Building
 
-Developed using rustc 1.95. No guarantee is provided that the code will work with an earlier version.
+Minimum supported Rust version (MSRV): 1.88 (edition 2024), verified to build. Developed on a newer stable. No guarantee is provided below 1.88.
 
 ```sh
 # Host check and tests

@@ -78,6 +78,7 @@ const EHPRIV: [u8; 32] = hex32("0102030405060708090a0b0c0d0e0f101112131415161718
 // This is the model's TEST root, captured from model_cfg.yml and cross-checked
 // with openssl. PROD differs: the integrator compiles in the real root. The
 // chain verifier anchors trust HERE, never in the store's self-signed root.
+#[cfg(feature = "attestation")]
 const MODEL_TEST_ROOT_PUBKEY: [u8; 133] = hex_arr::<133>(
     "040135c7a24d16b374b207ade8fe50f503ad34e0e596c83fc98adb4c4388ca0ad9b24e\
      77e984b8978253a8e0d6fd68eaa8d9c9a9a6c8835a138cccff51130da109868000cdf7f\
@@ -712,6 +713,7 @@ fn read_chip_stpub_returns_pinned_stpub()
     assert_eq!(stpub, STPUB, "read_chip_stpub must match the model's pinned key");
 }
 
+#[cfg(feature = "attestation")]
 #[test]
 fn verify_cert_chain_accepts_the_model_chain()
 {
@@ -728,6 +730,7 @@ fn verify_cert_chain_accepts_the_model_chain()
     tropic01_driver::verify_cert_chain(&store, &anchor).expect("model chain verifies under pinned root");
 }
 
+#[cfg(feature = "attestation")]
 #[test]
 fn verify_cert_chain_rejects_a_wrong_anchor()
 {
@@ -745,6 +748,7 @@ fn verify_cert_chain_rejects_a_wrong_anchor()
     );
 }
 
+#[cfg(feature = "attestation")]
 #[test]
 fn read_verified_chip_stpub_returns_pinned_stpub()
 {
@@ -869,6 +873,7 @@ fn sleep_is_reachable()
 /// Derived from a fixed non-trivial scalar so it is a real on-curve point that
 /// the eagerly-validating anchor constructor accepts, yet differs from the model
 /// TEST root, so the chain fails to verify under it.
+#[cfg(feature = "attestation")]
 fn other_valid_p521_point() -> [u8; 133]
 {
     use p521::ecdsa::SigningKey;
@@ -898,6 +903,7 @@ const fn hex32(s: &str) -> [u8; 32]
 /// Decodes a hex string (whitespace allowed) to `N` bytes at compile time.
 ///
 /// Skips ASCII whitespace, so the literal may be wrapped across lines.
+#[cfg(feature = "attestation")]
 const fn hex_arr<const N: usize>(s: &str) -> [u8; N]
 {
     let b = s.as_bytes();

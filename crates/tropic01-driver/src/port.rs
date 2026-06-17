@@ -560,6 +560,51 @@ pub trait SeCommands
     /// Returns the number of bytes written, which equals `out.len()`. An empty
     /// `out` returns `Ok(0)` with no chip traffic.
     ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
+    /// # use core::convert::Infallible;
+    /// # struct Spi;
+    /// # impl ErrorType for Spi { type Error = Infallible; }
+    /// # impl SpiDevice for Spi {
+    /// #     fn transaction(&mut self, _ops: &mut [Operation<'_, u8>]) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// # struct Wait;
+    /// # impl tropic01_driver::SeWait for Wait {
+    /// #     type Error = Infallible;
+    /// #     fn wait_ready(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+    /// #     fn delay_ms(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// # use tropic01_driver::{SessionConfig, StartupId, Tropic01};
+    /// # use zeroize::Zeroizing;
+    /// use tropic01_driver::SeCommands;
+    ///
+    /// # fn demo() -> Result<(), tropic01_driver::SeError>
+    /// # {
+    /// #     let mut dev = Tropic01::new(Spi, Wait);
+    /// #     dev.reboot(StartupId::Reboot)?;
+    /// #     let ehpriv = Zeroizing::new([0u8; 32]);
+    /// #     let shipriv = Zeroizing::new([0u8; 32]);
+    /// #     let shipub = [0u8; 32];
+    /// #     let stpub = [0u8; 32];
+    /// #     let cfg = SessionConfig
+    /// #     {
+    /// #         ehpriv: &ehpriv,
+    /// #         shipriv: &shipriv,
+    /// #         shipub: &shipub,
+    /// #         stpub: &stpub,
+    /// #         pkey_index: 0,
+    /// #     };
+    /// #     let mut session = dev.open_session(cfg).map_err(|(_d, e)| e)?;
+    /// // `session` is a Tropic01<_, _, ActiveSession>, which implements SeCommands.
+    /// let mut buf = [0u8; 16];
+    /// let n = session.random_into(&mut buf)?;
+    /// assert_eq!(n, buf.len());
+    /// #     Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// `SeError::InvalidArgument` when `out.len() > 255` (chunking is a caller

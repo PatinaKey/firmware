@@ -199,6 +199,38 @@ where
     /// the returned `Bootloader` handle gates the 0xB0/0xB1 update primitives.
     /// Mirrors the maintenance-reboot step of libtropic `lt_do_mutable_fw_update`.
     ///
+    /// # Example
+    ///
+    /// The full update flow: enter the bootloader, drive both bank pairs, then
+    /// reboot back to the Application firmware. (For a single call that does all
+    /// of this, see `NoSession::update_firmware`.)
+    ///
+    /// ```no_run
+    /// # use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
+    /// # use core::convert::Infallible;
+    /// # struct Spi;
+    /// # impl ErrorType for Spi { type Error = Infallible; }
+    /// # impl SpiDevice for Spi {
+    /// #     fn transaction(&mut self, _ops: &mut [Operation<'_, u8>]) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// # struct Wait;
+    /// # impl tropic01_driver::SeWait for Wait {
+    /// #     type Error = Infallible;
+    /// #     fn wait_ready(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+    /// #     fn delay_ms(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// use tropic01_driver::Tropic01;
+    ///
+    /// fn update(cpu_image: &[u8], spect_image: &[u8]) -> Result<(), tropic01_driver::SeError>
+    /// {
+    ///     let dev = Tropic01::new(Spi, Wait);
+    ///     let mut bl = dev.enter_bootloader().map_err(|(_dev, e)| e)?;
+    ///     bl.update_firmware(cpu_image, spect_image)?;
+    ///     let _dev = bl.exit_to_application().map_err(|(_bl, e)| e)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
     /// # Errors
     ///
     /// On failure returns the `NoSession` handle plus the error (a bus fault or
