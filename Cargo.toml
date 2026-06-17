@@ -4,7 +4,8 @@ members = ["crates/tropic01-driver"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.0.1"
+rust-version = "1.88"
 authors = ["PatinaKey <contact@patinakey.fr>"]
 repository = "https://github.com/PatinaKey/firmware"
 license = "GPL-3.0-or-later"
@@ -28,7 +29,7 @@ hmac = { version = "0.13", default-features = false }
 # release candidates. the last STABLE curve releases (p384 0.13, ecdsa 0.16) speak the older
 # digest 0.10 generation and would pull a SECOND copy of sha2/digest into the
 # binary. Pinning the rc keeps a single crypto generation, which is the smaller
-# audit and flash surface. 
+# audit and flash surface.
 # TODO: drop the -rc pins once p384/p521 0.14 and ecdsa 0.17 ship stable.
 ecdsa = { version = "0.17.0-rc.19", default-features = false }
 p384 = { version = "0.14.0-rc.11", default-features = false, features = ["ecdsa"] }

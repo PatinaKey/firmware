@@ -14,10 +14,74 @@
 //!
 //! # Crate features
 //!
-//! There is no user-facing feature. Both Cargo features are development-only and
-//! a consumer leaves them off. `_fuzz` exposes the attacker-facing parsers to
+//! The user-facing feature is `attestation` (ON by default): it enables X.509
+//! chain verification and pulls the ECDSA curve crates (`ecdsa`, `p384`,
+//! `p521`). Those are PRE-RELEASE (`-rc`) crates today, pinned to keep one
+//! `digest` generation in the tree, so a default build drags in release-candidate
+//! crypto. Disable the feature via `default-features = false` to drop them when
+//! only STPUB extraction is needed. The other two features are development-only
+//! and a consumer leaves them off. `_fuzz` exposes the attacker-facing parsers to
 //! the libFuzzer harnesses. `model-itest` compiles the live integration tests
 //! that run against the official TROPIC01 emulator.
+//!
+//! # Example
+//!
+//! Open a secure channel and run one L3 command. The chip wiring (the SPI bus
+//! and the ready/timeout provider) is supplied by the integrator, here it is
+//! stubbed. All keys come from the caller via [`SessionConfig`].
+//!
+//! ```no_run
+//! # use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
+//! # use core::convert::Infallible;
+//! # struct Spi;
+//! # impl ErrorType for Spi { type Error = Infallible; }
+//! # impl SpiDevice for Spi {
+//! #     fn transaction(&mut self, _ops: &mut [Operation<'_, u8>]) -> Result<(), Infallible> { Ok(()) }
+//! # }
+//! # struct Wait;
+//! # impl tropic01_driver::SeWait for Wait {
+//! #     type Error = Infallible;
+//! #     fn wait_ready(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+//! #     fn delay_ms(&mut self, _ms: u32) -> Result<(), Infallible> { Ok(()) }
+//! # }
+//! use tropic01_driver::{SeCommands, SessionConfig, StartupId, Tropic01};
+//! use zeroize::Zeroizing;
+//!
+//! fn run() -> Result<(), tropic01_driver::SeError>
+//! {
+//!     let mut dev = Tropic01::new(Spi, Wait);
+//!     // Load the Application firmware: the secure channel lives there.
+//!     dev.reboot(StartupId::Reboot)?;
+//!
+//!     // All key material is caller-provided. The driver hardcodes no secrets.
+//!     // These zeros are PLACEHOLDERS: real ephemerals come from a TRNG, the
+//!     // pairing keys from provisioning, and `stpub` from the chip certificate.
+//!     // For a genuine-chip trust decision, obtain `stpub` via
+//!     // `read_verified_chip_stpub` against a `RootAnchor` pinned out-of-band,
+//!     // not the unverified `read_chip_stpub`.
+//!     let ehpriv = Zeroizing::new([0u8; 32]);
+//!     let shipriv = Zeroizing::new([0u8; 32]);
+//!     let shipub = [0u8; 32];
+//!     let stpub = [0u8; 32];
+//!     let cfg = SessionConfig
+//!     {
+//!         ehpriv: &ehpriv,
+//!         shipriv: &shipriv,
+//!         shipub: &shipub,
+//!         stpub: &stpub,
+//!         pkey_index: 0,
+//!     };
+//!     // open_session consumes the handle and reports the error as a tuple, so
+//!     // recover the SeError with map_err before using `?`.
+//!     let mut session = dev.open_session(cfg).map_err(|(_dev, e)| e)?;
+//!
+//!     // Run one encrypted L3 command, then tear the channel down.
+//!     let mut random = [0u8; 32];
+//!     session.random_into(&mut random)?;
+//!     let _dev = session.close_session();
+//!     Ok(())
+//! }
+//! ```
 
 #![cfg_attr(not(test), no_std)]
 
@@ -43,8 +107,11 @@ mod test_support;
 
 // Curated public surface. Nothing else is exported.
 pub use crate::cert::parse_stpub;
+#[cfg(feature = "attestation")]
 pub use crate::cert::parse_verified_stpub;
+#[cfg(feature = "attestation")]
 pub use crate::cert::verify_cert_chain;
+#[cfg(feature = "attestation")]
 pub use crate::cert::RootAnchor;
 pub use crate::device::ActiveSession;
 pub use crate::device::Bootloader;
@@ -56,6 +123,7 @@ pub use crate::device::SessionConfig;
 pub use crate::device::StartupId;
 pub use crate::device::Tropic01;
 pub use crate::error::CertError;
+#[cfg(feature = "attestation")]
 pub use crate::error::ChainError;
 pub use crate::error::FwImageError;
 pub use crate::error::HandshakeError;
@@ -147,6 +215,7 @@ pub mod fuzz
     /// pinned anchor. Must never panic. The anchor's exact value is irrelevant:
     /// fuzzing targets the bounded DER parsing in front of the crypto, which
     /// fails closed on essentially every mutated input.
+    #[cfg(feature = "attestation")]
     pub fn verify_cert_chain(data: &[u8])
     {
         // A fixed, REAL P-521 SEC1 point (0x04 || X(66) || Y(66)). The anchor now

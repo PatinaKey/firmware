@@ -2,13 +2,13 @@
 name = "tropic01-driver"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
 description = "Unofficial no_std, panic-free Rust driver for the TROPIC01 secure element."
 readme = "README.md"
-documentation = "Not published to docs.rs yet."
-keywords = ["tropic01", "secure-element", "no-std", "no_std", "embedded", "crypto"]
+keywords = ["tropic01", "secure-element", "no-std", "embedded", "crypto"]
 categories = ["embedded", "no-std", "cryptography", "hardware-support"]
 # Dev/validation tooling kept out of the published package. The crate is the
 # library. The fuzz harness has its own detached workspace and the scripts need
@@ -16,6 +16,13 @@ categories = ["embedded", "no-std", "cryptography", "hardware-support"]
 exclude = ["/fuzz", "/scripts"]
 
 [features]
+# X.509 attestation chain verification (verify_cert_chain, parse_verified_stpub,
+# RootAnchor, read_verified_chip_stpub). ON by default. It pulls the ECDSA curve
+# crates (ecdsa / p384 / p521). Disable via default-features = false to drop
+# those deps when only STPUB extraction (parse_stpub / read_chip_stpub) is
+# needed. The handshake still binds STPUB, so a session stays authenticated.
+default = ["attestation"]
+attestation = ["dep:ecdsa", "dep:p384", "dep:p521"]
 # Exposes the `fuzz` module (attacker-facing parsers) to libFuzzer harnesses.
 # Not for production. Enabled only by the fuzz crate.
 _fuzz = []
@@ -33,9 +40,14 @@ x25519-dalek = { workspace = true }
 aes-gcm = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
-ecdsa = { workspace = true }
-p384 = { workspace = true }
-p521 = { workspace = true }
+ecdsa = { workspace = true, optional = true }
+p384 = { workspace = true, optional = true }
+p521 = { workspace = true, optional = true }
+
+# Render the attestation API on docs.rs. Explicit (not all-features) so the
+# dev-only _fuzz / model-itest modules stay hidden from the published docs.
+[package.metadata.docs.rs]
+features = ["attestation"]
 
 [lints]
 workspace = true

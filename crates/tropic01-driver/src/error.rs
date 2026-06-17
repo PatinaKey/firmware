@@ -102,6 +102,7 @@ pub enum CertError
 /// from the chip), so every variant is a fail-closed rejection. The load-bearing
 /// trust step is verifying the product CA under the caller-PINNED root key, never
 /// under a key taken from the store.
+#[cfg(feature = "attestation")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainError
 {
@@ -170,6 +171,7 @@ pub enum SeError
     /// Parsing the X.509 certificate store (STPUB extraction) failed.
     Cert(CertError),
     /// Verifying the X.509 certificate chain up to the pinned root failed.
+    #[cfg(feature = "attestation")]
     Chain(ChainError),
     /// The session was torn down. Re-handshake before any further L3 command.
     SessionLost,
@@ -272,6 +274,7 @@ impl From<CertError> for SeError
     }
 }
 
+#[cfg(feature = "attestation")]
 impl From<ChainError> for SeError
 {
     fn from(e: ChainError) -> Self
@@ -341,6 +344,7 @@ mod tests
         assert_eq!(e, SeError::Cert(CertError::KeyNotFound));
     }
 
+    #[cfg(feature = "attestation")]
     #[test]
     fn chain_folds_into_se_error()
     {

@@ -1,10 +1,69 @@
 # tropic01-driver - TROPIC01 secure-element driver (no_std)
 
+[![crates.io](https://img.shields.io/crates/v/tropic01-driver.svg)](https://crates.io/crates/tropic01-driver)
+[![docs.rs](https://docs.rs/tropic01-driver/badge.svg)](https://docs.rs/tropic01-driver)
+[![MSRV 1.88+](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
+
+> **BETA - unofficial, NOT silicon-validated.** This is an early `0.0.x`
+> release. The driver has been validated host-side against the official
+> `tropic01_model` emulator, but it has NOT run on real TROPIC01 silicon. Do not
+> use it for production trust decisions yet.
+
 A `no_std`, heap-free, `unsafe-free` Rust driver for the **TROPIC01** secure
 element (Tropic Square, part `TR01-C2P-T301`), spoken over SPI through an
 authenticated, encrypted **Noise KK1** session.
 
-⚠️ Disclaimer: This is an unofficial, community-driven project. It is not affiliated with, endorsed by, or officially supported by Tropic Square. For the official SDK, please refer to Tropic Square's libtropic.
+## Quick start
+
+The integrator supplies the SPI bus (`embedded_hal::spi::SpiDevice`) and a
+ready/timeout provider (the crate's `SeWait` trait). All key material is
+caller-provided via `SessionConfig`. Open a channel, run a command, close it:
+
+```rust,no_run
+use tropic01_driver::{SeCommands, SessionConfig, StartupId, Tropic01};
+use zeroize::Zeroizing;
+
+fn run(spi: impl embedded_hal::spi::SpiDevice, wait: impl tropic01_driver::SeWait)
+    -> Result<(), tropic01_driver::SeError>
+{
+    let mut dev = Tropic01::new(spi, wait);
+    dev.reboot(StartupId::Reboot)?; // load the Application firmware
+
+    // Placeholder keys: real ephemerals come from a TRNG, the pairing keys from
+    // provisioning, and `stpub` from the chip certificate. For a genuine-chip
+    // trust decision, get `stpub` via `read_verified_chip_stpub` (not the
+    // unverified `read_chip_stpub`) against an out-of-band-pinned `RootAnchor`.
+    let ehpriv = Zeroizing::new([0u8; 32]);
+    let shipriv = Zeroizing::new([0u8; 32]);
+    let shipub = [0u8; 32];
+    let stpub = [0u8; 32];
+    let cfg = SessionConfig
+    {
+        ehpriv: &ehpriv,
+        shipriv: &shipriv,
+        shipub: &shipub,
+        stpub: &stpub,
+        pkey_index: 0,
+    };
+    // open_session reports its error as a tuple (handle, error).
+    let mut session = dev.open_session(cfg).map_err(|(_dev, e)| e)?;
+
+    let mut random = [0u8; 32];
+    session.random_into(&mut random)?;
+    let _dev = session.close_session();
+    Ok(())
+}
+```
+
+The `attestation` feature (ON by default) enables X.509 chain verification
+(`verify_cert_chain` / `read_verified_chip_stpub`) and pulls the ECDSA curve
+crates (`ecdsa` / `p384` / `p521`), which are PRE-RELEASE (`-rc`) today (pinned to
+keep one `digest` generation in the tree). Build with `default-features = false`
+to drop those dependencies when only STPUB extraction is needed.
+
+**Disclaimer:** This is an unofficial, community-driven project. It is not affiliated with, endorsed by, or officially supported by Tropic Square. For the official SDK, please refer to Tropic Square's libtropic.
 
 Written as a clean-room rewrite with the official C SDK
 [`libtropic`](https://github.com/tropicsquare/libtropic) used as a differential
@@ -106,11 +165,12 @@ This runs in the normal hermetic test suite.
 The TROPIC01 command surface is fully wired: every L2 request and L3 command,
 attestation, and the firmware-update bootloader are implemented.
 
-Non-command work toward a publishable crate: validate against silicon (the
-`tropic01_model` emulator is already wired, see
-[Validation](#validation-against-real-libtropic)), examples on docs.rs, 
-and an optional `embedded-hal`-based port so external users can plug
-their own HAL (currently the ports are the crate's own `SpiDevice` / `SeWait` traits).
+Work toward a production `1.0`: validate against real silicon (the
+`tropic01_model` emulator is wired, see
+[Validation](#validation-against-real-libtropic), but no silicon run yet). Move the
+`ecdsa` / `p384` / `p521` curve crates off their release candidates once stable
+versions on the same `digest` generation ship. A type-state `open_session` that
+consumes a chain-verified STPUB and an `embedded-hal-async` path.
 
 ## Design principles
 

@@ -16,7 +16,8 @@ libfuzzer-sys = "0.4"
 
 [dependencies.tropic01-driver]
 path = ".."
-features = ["_fuzz"]
+# attestation is needed so the verify_cert_chain fuzz target still builds.
+features = ["_fuzz", "attestation"]
 
 [[bin]]
 name = "parse_l2_response"
