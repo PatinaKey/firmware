@@ -1,0 +1,28 @@
+[package]
+name = "platform"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "STM32U545 MCU platform foundation: TrustZone (SAU/GTZC) runtime partition bring-up."
+
+[dependencies]
+
+# Lint QUARANTINE (per-crate override of the workspace `unsafe_code = forbid`).
+#
+# The workspace default forbids unsafe entirely. This crate is the ONE place that
+# must touch raw MMIO (the volatile register reads/writes that program SAU/GTZC),
+# so it defines its OWN [lints.rust] table here. Because a crate that declares its
+# own [lints] table does NOT inherit the workspace table, this DOWNGRADES the
+# `forbid` to `deny`: unsafe is still denied by default and every unsafe block must
+# carry a `// SAFETY:` justification, but the crate may opt individual blocks in.
+# `forbid` could not be locally relaxed; `deny` can, which is exactly the quarantine
+# we want. The clippy denial is kept identical to the workspace policy.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

@@ -1,0 +1,33 @@
+# Workspace cargo configuration.
+#
+# DESIGN CHOICE (host-testable lib + embeddable bins):
+#   We deliberately do NOT set a global `build.target`. The default target stays
+#   the host (x86_64-unknown-linux-gnu) so that:
+#     - `cargo test -p platform` runs the partition-sequence tests natively on the
+#       host (the platform lib is pure logic over a register-bus abstraction and
+#       MUST stay host-testable for the 100%-coverage goal), and
+#     - `cargo check` over the whole workspace stays a host check.
+#   The two binary crates (`secure`, `nonsecure`) gate their cortex-m-rt content
+#   behind `cfg(target_os = "none")`, so they compile to an empty host stub on the
+#   host and to real firmware only when built for the embedded target:
+#     cargo build --target thumbv8m.main-none-eabihf
+#
+#   Pinning `build.target = thumbv8m...` globally WOULD break host `cargo test` for
+#   the lib (no std test harness on a bare-metal target), which is why we leave the
+#   default host target and document the explicit `--target` invocation here.
+#
+# The rustflags below are TARGET-SCOPED: they apply ONLY when building for the
+# embedded target, never to the host build. They wire cortex-m-rt's linker script
+# (link.x), which in turn pulls each bin crate's provisional memory.x (emitted by
+# that crate's build.rs). The memory layout is PROVISIONAL (see each memory.x): the
+# real secure / non-secure split lands with the NSC-shim wiring (C toolchain +
+# linker).
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+# Convenience alias so the embedded build is one word. Optional; the explicit
+# `--target thumbv8m.main-none-eabihf` always works too.
+[alias]
+build-mcu = "build --target thumbv8m.main-none-eabihf"
+check-mcu = "check --target thumbv8m.main-none-eabihf"
