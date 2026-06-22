@@ -11,6 +11,15 @@ description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone
 [dependencies]
 platform = { path = "../platform" }
 
+# cc: compiles the C -mcmse NSC veneer shim (secure_nsc.c) at build time. It is
+# the de-facto, mature, mainstream build-script C compiler driver for Rust
+# (rust-lang org, used by the standard library's build).
+# It only runs on the host as a build tool. Nothing from it ships in
+# the binary except the object code of our own one-function shim. Forced to
+# clang with the -mcmse flags in build.rs.
+[build-dependencies]
+cc = "1.2"
+
 # Embedded-only deps: pulled in just for the firmware build. On the host the bin
 # is an empty stub (see src/main.rs), so these compile only for the target.
 [target.'cfg(target_os = "none")'.dependencies]

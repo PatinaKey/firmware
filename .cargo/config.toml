@@ -26,8 +26,17 @@
 [target.thumbv8m.main-none-eabihf]
 rustflags = ["-C", "link-arg=-Tlink.x"]
 
-# Convenience alias so the embedded build is one word. Optional; the explicit
-# `--target thumbv8m.main-none-eabihf` always works too.
+# Convenience alias so the embedded build.
+#
+# TWO-STAGE MCU BUILD: there is no Cargo dependency edge between the `secure` and
+# `nonsecure` bin crates, so cargo does NOT order them. The non-secure link needs
+# the CMSE import object produced by linking the secure bin, so build the secure
+# crate first, then the non-secure crate:
+#   cargo build -p secure    --target thumbv8m.main-none-eabihf
+#   cargo build -p nonsecure --target thumbv8m.main-none-eabihf
+# A plain whole-workspace `build-mcu` may race (NS link before the secure import
+# object exists, or against a stale one). nonsecure/build.rs then fails loudly with
+# an actionable message. The aliases below stay as-is for single-crate builds.
 [alias]
 build-mcu = "build --target thumbv8m.main-none-eabihf"
 check-mcu = "check --target thumbv8m.main-none-eabihf"

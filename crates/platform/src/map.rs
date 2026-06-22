@@ -85,16 +85,27 @@ pub(crate) const EXTMEM_NS_BASE: u32 = 0x6000_0000;
 /// External-memory range inclusive limit. RM0456 memory map.
 pub(crate) const EXTMEM_NS_LIMIT: u32 = 0x9FFF_FFFF;
 
+/// RSSLIB non-secure function-pointer table base.
+///
+/// The non-secure world reads this table to dispatch RSSLIB calls after the
+/// hand-off, so it must be attributed NS (NOT NSC). RM0456 sec 3.6.2 (RSSLIB)
+/// defers the exact bounds to the device RSSLIB_SYS_FLASH_NS_PFUNC_START /
+/// RSSLIB_SYS_FLASH_NS_PFUNC_END constants, which give this 192-byte range.
+///
+/// The region is deliberately the minimal PFUNC table (least privilege): it does
+/// NOT cover the bootloader code, the OTP area, the reserved gap, or the flash
+/// ECC test words, so the NS world cannot read any of them. OTP NS access is a
+/// separate concern and is not on the RSSLIB call path.
+pub(crate) const RSSLIB_NS_BASE: u32 = 0x0BF9_9E40;
+/// RSSLIB non-secure function-pointer table inclusive limit. RM0456 sec 3.6.2,
+/// device RSSLIB_SYS_FLASH_NS_PFUNC_END.
+pub(crate) const RSSLIB_NS_LIMIT: u32 = 0x0BF9_9EFF;
+
 // ===========================================================================
 // SAU region table: a validated description of the 8 architectural SAU regions.
 //
 // Secure is the DEFAULT (uncovered = secure once SAU is enabled), so only NS and
 // NSC regions need an entry.
-//
-// TODO: add the RSSLIB / system-memory NS SAU region before the non-secure
-// hand-off, or NS calls into system memory (RSSLIB services) will fault. Its
-// base/limit are pending (AN5347 Table 4 value to confirm), so it is omitted here
-// rather than encode an unverified address.
 // ===========================================================================
 
 /// A single SAU region: an inclusive `[base, limit]` range with an NSC flag.
@@ -168,14 +179,14 @@ impl SauRegion
 }
 
 /// The number of SAU regions the partition programs (of the 8 available).
-pub const SAU_PROGRAMMED_REGIONS: usize = 5;
+pub const SAU_PROGRAMMED_REGIONS: usize = 6;
 
 /// Builds the validated SAU region table.
 ///
 /// Returns the regions in RNR order (index = region number): the NSC veneer window
-/// plus the four NS ranges. Secure is the default attribution, so secure ranges
-/// need no entry. The remaining architectural regions (and the system-memory NS
-/// region whose address is an open item, see the TODO above) are not emitted.
+/// plus the NS ranges (flash, SRAM, peripherals, external memory, the RSSLIB NS
+/// function-pointer table). Secure is the default attribution, so secure ranges
+/// need no entry. The remaining architectural regions are not emitted.
 ///
 /// # Errors
 ///
@@ -195,6 +206,9 @@ pub(crate) fn sau_table() -> Result<[SauRegion; SAU_PROGRAMMED_REGIONS], Partiti
         SauRegion::new(PERIPH_NS_BASE, PERIPH_NS_LIMIT, false)?,
         // Region 4: external-memory range NS.
         SauRegion::new(EXTMEM_NS_BASE, EXTMEM_NS_LIMIT, false)?,
+        // Region 5: RSSLIB NS function-pointer table (so NS RSSLIB calls do not
+        // fault).
+        SauRegion::new(RSSLIB_NS_BASE, RSSLIB_NS_LIMIT, false)?,
     ])
 }
 
@@ -291,6 +305,32 @@ mod tests
         // LADDR = limit with low 5 bits cleared, ENABLE set, NSC clear.
         assert_eq!(r.rlar(), 0x0807_FFE0 | SAU_RLAR_ENABLE);
         assert_eq!(r.rbar(), 0x0804_0000);
+    }
+
+    #[test]
+    fn rsslib_ns_region_base_limit_and_ns_encoding()
+    {
+        // Pin the RSSLIB NS function-pointer table to its cited address and prove
+        // it encodes NS (not NSC). RM0456 sec 3.6.2, device
+        // RSSLIB_SYS_FLASH_NS_PFUNC_START/END. The minimal 192-byte table excludes
+        // the bootloader, OTP, and the flash ECC test words. 32-byte alignment
+        // holds (base low 5 bits clear, limit set).
+        assert_eq!(RSSLIB_NS_BASE, 0x0BF9_9E40);
+        assert_eq!(RSSLIB_NS_LIMIT, 0x0BF9_9EFF);
+        assert_eq!(RSSLIB_NS_BASE & SAU_ALIGN_MASK, 0);
+        assert_eq!(RSSLIB_NS_LIMIT & SAU_ALIGN_MASK, SAU_ALIGN_MASK);
+
+        let r = SauRegion::new(RSSLIB_NS_BASE, RSSLIB_NS_LIMIT, false)
+            .expect("RSSLIB region must validate");
+        assert_eq!(r.rbar(), 0x0BF9_9E40);
+        // Full RLAR word: LADDR = limit with low 5 bits cleared, ENABLE set, NSC clear.
+        assert_eq!(r.rlar(), 0x0BF9_9EE0 | SAU_RLAR_ENABLE);
+        assert_eq!(r.rlar() & SAU_RLAR_NSC, 0);
+
+        // It is the last region in the programmed table.
+        let t = sau_table().expect("table must validate");
+        assert_eq!(t.len(), SAU_PROGRAMMED_REGIONS);
+        assert_eq!(t[SAU_PROGRAMMED_REGIONS - 1], r);
     }
 
     #[test]

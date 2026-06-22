@@ -16,3 +16,15 @@ description = "STM32U545 non-secure (TZ-NS) firmware binary: minimal skeleton (b
 cortex-m = { workspace = true }
 cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
+
+# Lint quarantine: the NS entry declares + calls the secure-gateway veneer
+# through an unsafe extern block (the only unsafe here), so this bin overrides the
+# workspace `unsafe_code = forbid` to `deny` (own [lints] table = no workspace
+# inheritance) and keeps every unsafe behind a `// SAFETY:` note. Same clippy
+# denial as the workspace.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

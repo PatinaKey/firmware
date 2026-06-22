@@ -1,16 +1,23 @@
-/* PROVISIONAL secure-world memory layout for cortex-m-rt's link.x.
+/* Secure-world (TZ-S) memory layout for cortex-m-rt's link.x.
  *
- * This is a SKELETON to make the firmware link for thumbv8m.main-none-eabihf in
- * this increment. The real secure / non-secure flash + SRAM split (the secure
- * alias at 0x0C00_0000, the NSC veneer window, the NS bank, the SRAM1 split)
- * lands with the NSC-shim increment alongside the linker scripts derived from the
- * partition map. Do NOT treat these regions as the final security boundary.
+ * FLASH is secure Bank 1 at the secure alias 0x0C00_0000, the FULL 256 KB bank.
+ * The TOP 8 KB (0x0C03_E000) is the Non-Secure-Callable veneer window: the build
+ * pins the CMSE secure-gateway veneers (.gnu.sgstubs) to 0x0C03_E000 with a
+ * linker --section-start (see build.rs), so they land at the fixed address the
+ * SAU marks Non-Secure-Callable. Ordinary secure code/data uses the lower 248 KB.
+ * The single FLASH region (not a separate carve-out) is deliberate: cortex-m-rt's
+ * link.x assigns .gnu.sgstubs to FLASH, so a second region would leave that
+ * section's region unbound. The --section-start instead pins the address inside
+ * the one FLASH region. RM0456 memory map (Bank 1 secure alias).
  *
- * For now: a single secure flash + secure SRAM region large enough to link the
- * skeleton, using the secure alias base of Bank 1 (0x0C00_0000) and SRAM1.
+ * RAM is the lower 128 KB of SRAM1 at 0x2000_0000 (the provisional secure RAM
+ * half), matching the SAU region 2 / MPCBB1 split declared in platform's map.rs.
+ *
+ * The standard cortex-m-rt FLASH/RAM region names are used so link.x composes
+ * without edits.
  */
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x0C000000, LENGTH = 248K
-  RAM (rwx)   : ORIGIN = 0x20000000, LENGTH = 128K
+  FLASH (rx) : ORIGIN = 0x0C000000, LENGTH = 256K
+  RAM (rwx)  : ORIGIN = 0x20000000, LENGTH = 128K
 }

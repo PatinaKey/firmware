@@ -1,11 +1,10 @@
-/* PROVISIONAL non-secure (TZ-NS) memory layout for cortex-m-rt's link.x.
+/* Non-secure (TZ-NS) memory layout for cortex-m-rt's link.x.
  *
- * SKELETON to make the NS firmware link for thumbv8m.main-none-eabihf in this
- * increment. The real NS layout (Bank 2 NS alias at 0x0804_0000, the NS SRAM1
- * upper half) lands with the NSC-shim increment. Do NOT treat these as final.
- *
- * Uses the NS flash bank base (0x0804_0000, 256K) and the provisional NS upper
- * half of SRAM1 (64K at 0x2002_0000), matching the partition map's split.
+ * FLASH is the NS flash bank (Bank 2 NS alias) at 0x0804_0000, 256 KB. RAM is
+ * the upper 64 KB of SRAM1 at 0x2002_0000, the provisional NS half matching the
+ * partition map's SRAM1 split (SAU region 1 + region 2 in platform's map.rs).
+ * The secure world hands off here by pointing SCB_NS->VTOR at this FLASH base.
+ * RM0456 memory map.
  */
 MEMORY
 {
