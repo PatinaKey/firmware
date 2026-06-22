@@ -11,12 +11,13 @@
 //!   - For the host: an empty `main`, so the whole workspace stays host-checkable
 //!     (`cargo check`) without a bare-metal test harness.
 //!
-//! Deferred: the secure MPU and the SE driver instantiation.
+//! Deferred: the SE driver instantiation.
 //!
-//! FAIL-CLOSED CONTRACT: PartitionError => never hand off to NS. A partition fault
-//! leaves SPI1/crypto in their NS reset state, so on error the secure world wedges
-//! in a tight secure loop and the non-secure world is never started. Only the Ok
-//! path reaches the NS hand-off below.
+//! FAIL-CLOSED CONTRACT: PartitionError => never hand off to NS. A partition or
+//! secure-MPU fault leaves the secure world's isolation incomplete, so on error
+//! the secure world wedges in a tight secure loop and the non-secure world is
+//! never started. Only the path where both `apply_partition` and
+//! `apply_secure_mpu` succeed reaches the NS hand-off below.
 
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
@@ -28,6 +29,7 @@ mod firmware
     use cortex_m_rt::entry;
     use panic_halt as _;
     use platform::apply_partition;
+    use platform::apply_secure_mpu;
     use platform::MmioBus;
 
     /// Non-secure vector table base: NS flash Bank 2 (NS alias). RM0456 memory
@@ -55,9 +57,11 @@ mod firmware
         {
             Ok(()) =>
             {
-                // Partition applied: hand off to the non-secure world. This never
-                // returns.
-                start_nonsecure();
+                // Partition applied: enable the secure MPU then hand off to the
+                // non-secure world. This never returns on success. The MPU is
+                // enabled inside start_nonsecure as the LAST isolation step, and on
+                // an MPU fault that function wedges instead of handing off.
+                start_nonsecure(&mut bus);
             }
             Err(_) =>
             {
@@ -71,13 +75,24 @@ mod firmware
         }
     }
 
-    /// Hands control to the non-secure world. Diverges (the NS reset runs next).
+    /// Enables the secure MPU then hands control to the non-secure world.
+    /// Diverges (the NS reset runs next, or the secure world wedges on a fault).
     ///
-    /// Steps (Armv8-M secure->non-secure transition):
-    ///   1. point `SCB_NS->VTOR` at the NS vector table,
-    ///   2. load the NS main stack pointer from NS vector word[0],
-    ///   3. read the NS reset entry from NS vector word[1] and branch to it with
-    ///      `BXNS` (the low bit cleared selects the non-secure state).
+    /// Hand-off order (no standing NS window in the secure MPU): read and stage
+    /// the NS vectors while the MPU is OFF, enable the MPU as the LAST isolation
+    /// step, then branch.
+    ///   1. read the NS MSP (vector word 0) and NS reset entry (word 1) from the NS
+    ///      vector table, and point `SCB_NS->VTOR` at it, all while the MPU is OFF,
+    ///   2. apply the secure MPU (the last isolation step). On error, FAIL-CLOSED:
+    ///      wedge and never hand off,
+    ///   3. `DSB` then `ISB` so the new MPU config takes effect before any
+    ///      dependent access,
+    ///   4. set MSP_NS, then `BXNS` to the NS reset (the low bit cleared selects
+    ///      the non-secure state).
+    ///
+    /// Between the MPU enable and the `BXNS` there is NO secure data-memory access:
+    /// only secure-flash instruction fetch and register ops run, so the secure SRAM
+    /// region already covers everything needed and no extra MPU region is required.
     ///
     /// Only the partition's Ok path calls this, preserving the fail-closed
     /// contract. It is reached once at boot, it does not return.
@@ -86,28 +101,51 @@ mod firmware
     // This targeted allow opts in just the volatile NS-vector reads, the SCB_NS
     // write, and the MSR/BXNS hand-off below, each carrying its own `// SAFETY:`.
     #[allow(unsafe_code)]
-    fn start_nonsecure() -> !
+    fn start_nonsecure(bus: &mut MmioBus) -> !
     {
+        // Stage the NS hand-off inputs while the MPU is still OFF. These reads and
+        // the SCB_NS->VTOR write must happen before the MPU is enabled, because the
+        // secure MPU has no standing NS window.
+        //
         // SAFETY: a one-time boot hand-off after the partition succeeded. The NS
         // vector table sits at the cited NS-flash base. word[0]/word[1] are read as
         // aligned u32 (volatile, so the reads are not reordered or elided), and
-        // SCB_NS->VTOR is written at its architectural NS-alias address. MSP_NS is
-        // set then BXNS branches to the NS reset, clearing the low bit to enter the
-        // non-secure state. No value crosses as a pointer to secure memory. This is
-        // the architectural S->NS entry, which by definition leaves the secure
-        // state and never returns.
-        unsafe
+        // SCB_NS->VTOR is written at its architectural NS-alias address. No value
+        // crosses as a pointer to secure memory.
+        let (ns_msp, ns_reset) = unsafe
         {
             let ns_vectors = NS_VECTOR_TABLE as *const u32;
             let ns_msp = ptr::read_volatile(ns_vectors);
             let ns_reset = ptr::read_volatile(ns_vectors.add(1));
 
-            // 1. Point the non-secure VTOR at the NS vector table.
+            // Point the non-secure VTOR at the NS vector table (MPU still off).
             ptr::write_volatile(SCB_NS_VTOR as *mut u32, NS_VECTOR_TABLE);
+            (ns_msp, ns_reset)
+        };
 
-            // 2/3. Set MSP_NS, then BXNS to the NS reset entry. BXNS with the low
-            // bit of the target cleared selects the non-secure state. The NS reset
-            // value already carries the Thumb bit. Mask it for the state select.
+        // Enable the secure MPU as the LAST isolation step. On error FAIL-CLOSED:
+        // wedge and never hand off, so the NS world cannot start with the secure
+        // world unprotected.
+        if apply_secure_mpu(bus).is_err()
+        {
+            loop
+            {
+                cortex_m::asm::wfi();
+            }
+        }
+
+        // Architectural barriers so the freshly enabled MPU config is in effect
+        // before any subsequent access or the branch.
+        cortex_m::asm::dsb();
+        cortex_m::asm::isb();
+
+        // SAFETY: the architectural S->NS entry. MSP_NS is set then BXNS branches
+        // to the NS reset, clearing the low bit to enter the non-secure state. The
+        // NS reset value already carries the Thumb bit, masked here for the state
+        // select. The staged ns_msp/ns_reset were read above while the MPU was off.
+        // This leaves the secure state by definition and never returns.
+        unsafe
+        {
             core::arch::asm!(
                 "msr MSP_NS, {msp}",
                 "bxns {reset}",

@@ -4,7 +4,10 @@
 //! runs the ordered SAU/GTZC bring-up sequence that the first secure code
 //! executes to isolate the device: SAU memory attribution, GTZC peripheral/SRAM/DMA
 //! security, GPIO security, the TZIC illegal-access watch, and the sticky in-RAM
-//! config locks. It issues NO irreversible option-byte write (no TZEN / RDP /
+//! config locks. [`apply_secure_mpu`] programs the secure-bank MPU (W^X / DEP on
+//! the secure world) as the LAST isolation step, which the secure binary applies
+//! right before the non-secure hand-off. Neither `apply_partition` nor
+//! `apply_secure_mpu` issues an irreversible option-byte write (no TZEN / RDP /
 //! BOOT_LOCK / WRP). Those silicon-lifecycle steps wait on the hardware
 //! power-fault validation.
 //!
@@ -27,9 +30,9 @@
 //!
 //! # Out of scope here
 //!
-//! - The secure MPU: a separate banked-MPU region table.
-//! - The NS hand-off: `SCB_NS->VTOR` + NS MSP + `BXNS`, which use CPU intrinsics
-//!   with no register-bus form. It lives in the secure binary's glue.
+//! - The NS hand-off: `SCB_NS->VTOR` + NS MSP + `BXNS` plus the `DSB`/`ISB`
+//!   barriers after the MPU enable, which use CPU intrinsics with no register-bus
+//!   form. They live in the secure binary's glue.
 //! - The C `-mcmse` NSC veneer shim, pending the C toolchain + linker wiring
 //!   (no C / build.rs here).
 
@@ -38,6 +41,7 @@
 mod bus;
 mod error;
 mod map;
+mod mpu;
 mod partition;
 mod regs;
 
@@ -47,4 +51,5 @@ pub use crate::bus::MmioBus;
 pub use crate::error::PartitionError;
 pub use crate::map::SauRegion;
 pub use crate::map::SAU_PROGRAMMED_REGIONS;
+pub use crate::mpu::apply_secure_mpu;
 pub use crate::partition::apply_partition;

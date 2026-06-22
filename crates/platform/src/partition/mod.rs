@@ -11,9 +11,9 @@
 //! / BOOT_LOCK / WRP / FLASH_OPTR). Those are silicon-lifecycle steps deferred
 //! pending the hardware power-fault validation (RM0456 sec 7 option bytes).
 //!
-//! The secure MPU programming is deferred. It is a banked-MPU step whose region
-//! table is a separate design item, and it is not required to demonstrate the
-//! SAU/GTZC partition. It is called out as a residual in the crate docs.
+//! The secure-bank MPU is programmed separately by [`crate::apply_secure_mpu`] in
+//! the `mpu` module, applied by the secure binary as the LAST isolation step right
+//! before the non-secure hand-off (so it does not appear in this sequence).
 
 use crate::bus::RegisterBus;
 use crate::error::PartitionError;
@@ -32,9 +32,11 @@ use crate::regs;
 /// 4. MPCBB SRAM block security (SRAM1 split, SRAM2/4 stay secure at reset),
 /// 5. GPIO security (SE pins secure, USB/TSC pins NS),
 /// 6. GPDMA secure channels for the SE link,
-/// 7. (secure MPU deferred),
-/// 8. enable TZIC illegal-access events, AFTER all TZSC/MPCBB writes,
-/// 9. apply the sticky locks LAST.
+/// 7. enable TZIC illegal-access events, AFTER all TZSC/MPCBB writes,
+/// 8. apply the sticky locks LAST.
+///
+/// The secure-bank MPU is NOT programmed here. The caller applies
+/// [`crate::apply_secure_mpu`] as the last isolation step just before the hand-off.
 ///
 /// # Errors
 ///
@@ -181,7 +183,7 @@ where
     bus.modify32(regs::GPDMA_SECCFGR, 0, map::GPDMA_SECURE_CHANNELS);
 }
 
-/// Step 8: enable TZIC illegal-access events.
+/// Step 7: enable TZIC illegal-access events.
 ///
 /// Run AFTER all TZSC/MPCBB programming, or in-flux accesses raise spurious secure
 /// faults (ordering hazard). This step unmasks all four IER words so the controller catches
@@ -197,7 +199,7 @@ where
     bus.write32(regs::GTZC1_TZIC_BASE + regs::TZIC_IER4_OFF, 0xFFFF_FFFF);
 }
 
-/// Step 9: apply the sticky config locks LAST, after the config is set.
+/// Step 8: apply the sticky config locks LAST, after the config is set.
 ///
 /// Order: MPCBB super-block locks (CFGLOCKR1) -> MPCBB CR.GLOCK -> TZSC_CR.LCK
 /// (GTZC1 and GTZC2) -> GPDMA RCFGLOCKR for the SE channels. These freeze the

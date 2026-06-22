@@ -42,6 +42,59 @@ fn sau_bit_positions_are_canonical()
 }
 
 // ===========================================================================
+// Secure MPU (Armv8-M PMSAv8). The off-by-one slot defect lives here too: pin
+// every address to the canonical PM0264 / CMSIS core_cm33.h literal.
+// PM0264 sec 4.5.9 Table 97, CMSIS `MPU_Type`.
+// ===========================================================================
+
+#[test]
+fn mpu_register_addresses_are_canonical()
+{
+    assert_eq!(MPU_TYPE, 0xE000_ED90, "MPU_TYPE");
+    assert_eq!(MPU_CTRL, 0xE000_ED94, "MPU_CTRL");
+    assert_eq!(MPU_RNR, 0xE000_ED98, "MPU_RNR");
+    assert_eq!(MPU_RBAR, 0xE000_ED9C, "MPU_RBAR");
+    assert_eq!(MPU_RLAR, 0xE000_EDA0, "MPU_RLAR");
+    assert_eq!(MPU_MAIR0, 0xE000_EDC0, "MPU_MAIR0");
+    assert_eq!(MPU_MAIR1, 0xE000_EDC4, "MPU_MAIR1");
+}
+
+#[test]
+fn mpu_bit_positions_are_canonical()
+{
+    // MPU_CTRL: ENABLE bit0, HFNMIENA bit1, PRIVDEFENA bit2.
+    assert_eq!(MPU_CTRL_ENABLE, 0x0000_0001, "MPU_CTRL.ENABLE bit0");
+    assert_eq!(MPU_CTRL_HFNMIENA, 0x0000_0002, "MPU_CTRL.HFNMIENA bit1");
+    assert_eq!(MPU_CTRL_PRIVDEFENA, 0x0000_0004, "MPU_CTRL.PRIVDEFENA bit2");
+    // MPU_RLAR: EN bit0, AttrIndx[3:1].
+    assert_eq!(MPU_RLAR_EN, 0x0000_0001, "MPU_RLAR.EN bit0");
+    assert_eq!(MPU_RLAR_ATTRINDX_SHIFT, 1, "MPU_RLAR.AttrIndx shift");
+    // MPU_RBAR: XN bit0, AP[2:1], SH[4:3].
+    assert_eq!(MPU_RBAR_XN, 0x0000_0001, "MPU_RBAR.XN bit0");
+    assert_eq!(MPU_RBAR_AP_SHIFT, 1, "MPU_RBAR.AP shift");
+    assert_eq!(MPU_RBAR_SH_SHIFT, 3, "MPU_RBAR.SH shift");
+    // AP / SH encodings.
+    assert_eq!(MPU_AP_RW_PRIV, 0b00, "AP RW priv-only");
+    assert_eq!(MPU_AP_RO_PRIV, 0b10, "AP RO priv-only");
+    assert_eq!(MPU_SH_NON_SHAREABLE, 0b00, "SH non-shareable");
+    // 32-byte region granule mask (low 5 bits).
+    assert_eq!(MPU_ALIGN_MASK, 0x0000_001F, "MPU 32-byte align mask");
+}
+
+#[test]
+fn mpu_mair_attributes_are_canonical()
+{
+    // Attr bytes: Normal write-through non-transient = 0xAA, Device-nGnRnE = 0x00.
+    assert_eq!(MPU_MAIR_ATTR_NORMAL, 0xAA, "Attr Normal byte");
+    assert_eq!(MPU_MAIR_ATTR_DEVICE, 0x00, "Attr Device byte");
+    // AttrIndx 0 = Normal, AttrIndx 1 = Device.
+    assert_eq!(MPU_ATTRINDX_NORMAL, 0, "AttrIndx Normal");
+    assert_eq!(MPU_ATTRINDX_DEVICE, 1, "AttrIndx Device");
+    // MAIR0 packs Attr0 in byte0, Attr1 in byte1, the rest 0.
+    assert_eq!(MPU_MAIR0_VALUE, 0x0000_00AA, "MPU_MAIR0 packed value");
+}
+
+// ===========================================================================
 // RCC clock enables. RM0456 register map (AHB1ENR L32648, AHB3ENR L32654).
 // ===========================================================================
 

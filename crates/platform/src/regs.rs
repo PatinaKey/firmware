@@ -209,6 +209,92 @@ pub(crate) const SAU_RLAR_NSC: u32 = 1 << 1;
 /// AN5347 Table 1 alignment note, Armv8-M ARM SAU region encoding.
 pub(crate) const SAU_ALIGN_MASK: u32 = 0x1F;
 
+// ===========================================================================
+// Secure MPU (Armv8-M PMSAv8, banked secure bank), in the secure System
+// Control Space. The MPU register block base is 0xE000_ED90. PM0264 sec 4.5.9
+// Table 97, CMSIS core_cm33.h `MPU_Type`. RM0456 names these only.
+//
+// The SCS region 0xE000_E000-0xE000_EFFF is ALWAYS Device + XN accessible
+// regardless of the MPU, so NO MPU region is needed to reach the SAU / MPU / SCB
+// registers (PM0264 line 13199). With PRIVDEFENA = 0 there is no background map,
+// so every other secure access must hit an enabled region or fault.
+// ===========================================================================
+
+/// `MPU_TYPE` (read-only, DREGION field). PM0264 sec 4.5.9 Table 97.
+///
+/// Named so the address gap before `MPU_CTRL` is explicit. The sequence never
+/// writes it. The secure bank implements 8 regions (DREGION = 8).
+#[allow(dead_code)]
+pub(crate) const MPU_TYPE: u32 = 0xE000_ED90;
+/// `MPU_CTRL` (ENABLE bit0, HFNMIENA bit1, PRIVDEFENA bit2). PM0264 sec 4.5.11.
+pub(crate) const MPU_CTRL: u32 = 0xE000_ED94;
+/// `MPU_RNR` (region number select). PM0264 sec 4.5.9 Table 97.
+pub(crate) const MPU_RNR: u32 = 0xE000_ED98;
+/// `MPU_RBAR` (BASE[31:5], SH[4:3], AP[2:1], XN bit0). PM0264 sec 4.5.13.
+pub(crate) const MPU_RBAR: u32 = 0xE000_ED9C;
+/// `MPU_RLAR` (LIMIT[31:5], AttrIndx[3:1], EN bit0). PM0264 sec 4.5.15.
+pub(crate) const MPU_RLAR: u32 = 0xE000_EDA0;
+/// `MPU_MAIR0` (Attr0..3, one byte each). PM0264 sec 4.5.17.
+pub(crate) const MPU_MAIR0: u32 = 0xE000_EDC0;
+/// `MPU_MAIR1` (Attr4..7, one byte each). PM0264 sec 4.5.17.
+///
+/// Left at its reset value (0): only Attr0/Attr1 in MAIR0 are used. Named so the
+/// block layout is explicit. The sequence never writes it.
+#[allow(dead_code)]
+pub(crate) const MPU_MAIR1: u32 = 0xE000_EDC4;
+
+/// `MPU_CTRL.ENABLE` bit 0: enable the MPU. PM0264 sec 4.5.11 Table 99.
+pub(crate) const MPU_CTRL_ENABLE: u32 = 1 << 0;
+/// `MPU_CTRL.HFNMIENA` bit 1: keep the MPU on in HardFault / NMI. PM0264 Table 99.
+pub(crate) const MPU_CTRL_HFNMIENA: u32 = 1 << 1;
+/// `MPU_CTRL.PRIVDEFENA` bit 2: privileged background map. NEVER set here.
+///
+/// Left 0 so there is no background region: every secure access must match an
+/// enabled MPU region or fault (strict least privilege). Used by the test that
+/// asserts this bit is never present in any `MPU_CTRL` write. PM0264 Table 99.
+#[allow(dead_code)]
+pub(crate) const MPU_CTRL_PRIVDEFENA: u32 = 1 << 2;
+
+/// `MPU_RLAR.EN` bit 0: region enabled. PM0264 sec 4.5.15 Table 102.
+pub(crate) const MPU_RLAR_EN: u32 = 1 << 0;
+/// `MPU_RLAR.AttrIndx` field position (bits [3:1]). PM0264 sec 4.5.15 Table 102.
+pub(crate) const MPU_RLAR_ATTRINDX_SHIFT: u32 = 1;
+/// `MPU_RBAR.XN` bit 0: execute-never. PM0264 sec 4.5.13 Table 101.
+pub(crate) const MPU_RBAR_XN: u32 = 1 << 0;
+/// `MPU_RBAR.AP` field position (bits [2:1]). PM0264 sec 4.5.13 Table 101.
+pub(crate) const MPU_RBAR_AP_SHIFT: u32 = 1;
+/// `MPU_RBAR.SH` field position (bits [4:3]). PM0264 sec 4.5.13 Table 101.
+pub(crate) const MPU_RBAR_SH_SHIFT: u32 = 3;
+
+/// `MPU_RBAR.AP` = 0b00: read-write, privileged only. PM0264 sec 4.5.13 Table 101.
+pub(crate) const MPU_AP_RW_PRIV: u32 = 0b00;
+/// `MPU_RBAR.AP` = 0b10: read-only, privileged only. PM0264 sec 4.5.13 Table 101.
+pub(crate) const MPU_AP_RO_PRIV: u32 = 0b10;
+/// `MPU_RBAR.SH` = 0b00: non-shareable. PM0264 sec 4.5.13 Table 101.
+pub(crate) const MPU_SH_NON_SHAREABLE: u32 = 0b00;
+
+/// MAIR AttrIndx 0 = Normal memory (write-through non-transient, `0xAA`).
+pub(crate) const MPU_ATTRINDX_NORMAL: u32 = 0;
+/// MAIR AttrIndx 1 = Device-nGnRnE (`0x00`).
+pub(crate) const MPU_ATTRINDX_DEVICE: u32 = 1;
+
+/// `MAIR0` Attr0 byte: Normal memory, write-through non-transient. PM0264 sec
+/// 4.5.17, Armv8-M memory attribute encoding (`0xAA`).
+pub(crate) const MPU_MAIR_ATTR_NORMAL: u32 = 0xAA;
+/// `MAIR0` Attr1 byte: Device-nGnRnE. PM0264 sec 4.5.17 (`0x00`).
+pub(crate) const MPU_MAIR_ATTR_DEVICE: u32 = 0x00;
+
+/// `MPU_MAIR0` value: Attr0 = Normal (`0xAA`) in byte 0, Attr1 = Device (`0x00`)
+/// in byte 1, Attr2/Attr3 unused (0). PM0264 sec 4.5.17.
+pub(crate) const MPU_MAIR0_VALUE: u32 =
+    MPU_MAIR_ATTR_NORMAL | (MPU_MAIR_ATTR_DEVICE << 8);
+
+/// The 32-byte alignment mask MPU bases/limits must satisfy (BASE/LIMIT[31:5]).
+///
+/// Same architectural 32-byte granule as the SAU, so this reuses `SAU_ALIGN_MASK`
+/// (`0x1F`). PM0264 sec 4.5.13/4.5.15, Armv8-M PMSAv8 region encoding.
+pub(crate) const MPU_ALIGN_MASK: u32 = SAU_ALIGN_MASK;
+
 #[cfg(test)]
 #[path = "regs_pin_tests.rs"]
 mod regs_pin_tests;

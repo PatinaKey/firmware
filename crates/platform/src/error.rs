@@ -2,7 +2,8 @@
 //!
 //! Most of the partition sequence is a series of infallible MMIO writes, so a
 //! `Result` appears only where a failure mode exists: an out-of-range SAU region
-//! index or a misaligned SAU region base/limit. No stringly errors.
+//! index, a misaligned or inverted SAU region, or a misaligned or inverted MPU
+//! region. No stringly errors.
 
 /// Errors raised while programming the partition.
 ///
@@ -24,6 +25,17 @@ pub enum PartitionError
     SauRegionMisaligned,
     /// An SAU region limit was below its base.
     ///
-    /// A region must cover a non-empty, ascending address range.
+    /// A region must cover a non-empty, ascending inclusive address range.
     SauRegionInverted,
+    /// An MPU region base or limit was not 32-byte aligned.
+    ///
+    /// `MPU_RBAR.BASE` covers bits [31:5] (low 5 bits architecturally 0) and
+    /// `MPU_RLAR.LIMIT` is the inclusive top of a 32-byte unit (low 5 bits 1), so
+    /// a base or limit that breaks this granule is a bug in the region table
+    /// (PM0264 sec 4.5.13 / 4.5.15).
+    MpuRegionMisaligned,
+    /// An MPU region limit was below its base.
+    ///
+    /// A region must cover a non-empty, ascending inclusive address range.
+    MpuRegionInverted,
 }

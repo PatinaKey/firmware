@@ -213,6 +213,46 @@ pub(crate) fn sau_table() -> Result<[SauRegion; SAU_PROGRAMMED_REGIONS], Partiti
 }
 
 // ===========================================================================
+// Secure MPU region table (PMSAv8, banked secure bank). Three regions over the
+// addresses the CPU ACTUALLY emits in the secure state: secure FLASH at
+// 0x0C00_0000, secure SRAM at 0x2000_0000 (NOT the 0x0E / 0x0C SRAM alias), and
+// the secure peripheral aliases at 0x5xxx_xxxx. These match crates/secure/
+// memory.x. RM0456 memory map.
+//
+// W^X / DEP intent: code is RX read-only (XN = 0), data and peripherals are RW
+// execute-never (XN = 1). With PRIVDEFENA = 0 there is no background map, so any
+// secure access outside these three regions faults.
+// ===========================================================================
+
+/// Secure code region base: secure FLASH Bank 1 alias. RM0456 memory map.
+pub(crate) const MPU_CODE_BASE: u32 = 0x0C00_0000;
+/// Secure code region inclusive limit: 256 KB (covers the NSC veneer window at
+/// 0x0C03_E000). RM0456 memory map.
+pub(crate) const MPU_CODE_LIMIT: u32 = 0x0C03_FFFF;
+
+/// Secure SRAM region base: SRAM1 secure half. Reuses `SRAM1_BASE`.
+///
+/// SCOPE (intentional, least privilege): the secure MPU SRAM region covers ONLY
+/// the secure half of SRAM1, the RAM the secure binary actually uses per its
+/// linker layout (crates/secure/memory.x). SRAM2 and SRAM4 are kept secure by the
+/// GTZC / MPCBB partition (the DMA and bus view), but they are deliberately NOT
+/// mapped into the secure MPU. With `MPU_CTRL.PRIVDEFENA = 0` there is no
+/// background map, so the secure CPU cannot touch SRAM2 or SRAM4 at all. That is
+/// the W^X / least-privilege intent, not an oversight. Any future secure use of
+/// SRAM2 or SRAM4 MUST add a matching MPU region together with the linker-script
+/// change. Armv8-M PMSAv8 region model, RM0456 memory map.
+pub(crate) const MPU_SRAM_BASE: u32 = SRAM1_BASE;
+/// Secure SRAM region inclusive limit: last byte of the secure half
+/// (`SRAM1_NS_BASE - 1`), kept in lock-step with the SAU / MPCBB split.
+pub(crate) const MPU_SRAM_LIMIT: u32 = SRAM1_NS_BASE - 1;
+
+/// Secure peripheral region base: secure peripheral alias. RM0456 memory map.
+pub(crate) const MPU_PERIPH_BASE: u32 = 0x5000_0000;
+/// Secure peripheral region inclusive limit: covers RCC / GTZC / GPIO / SPI1 /
+/// crypto secure aliases. RM0456 memory map.
+pub(crate) const MPU_PERIPH_LIMIT: u32 = 0x5FFF_FFFF;
+
+// ===========================================================================
 // GPIO pin assignments (board pin map).
 // GPIOx_SECCFGR: bit per pin, reset all-secure. The partition KEEPS the SE-SPI pins
 // secure (reset value) and CLEARS the USB + TSC pins to non-secure.
@@ -331,6 +371,27 @@ mod tests
         let t = sau_table().expect("table must validate");
         assert_eq!(t.len(), SAU_PROGRAMMED_REGIONS);
         assert_eq!(t[SAU_PROGRAMMED_REGIONS - 1], r);
+    }
+
+    #[test]
+    fn mpu_region_constants_are_consistent()
+    {
+        // The secure SRAM MPU region ends exactly one byte below the NS half, so
+        // it cannot overlap the non-secure SRAM. This guards the lock-step with
+        // the SAU / MPCBB split.
+        assert_eq!(MPU_SRAM_BASE, 0x2000_0000);
+        assert_eq!(MPU_SRAM_LIMIT, SRAM1_NS_BASE - 1);
+        assert_eq!(MPU_SRAM_LIMIT, 0x2001_FFFF);
+        // Code region spans the full secure FLASH bank, including the NSC window.
+        assert_eq!(MPU_CODE_BASE, 0x0C00_0000);
+        assert_eq!(MPU_CODE_LIMIT, 0x0C03_FFFF);
+        // The NSC veneer window is contained in the secure code region.
+        let veneer_in_code = NSC_VENEER_BASE >= MPU_CODE_BASE
+            && NSC_VENEER_LIMIT <= MPU_CODE_LIMIT;
+        assert!(veneer_in_code, "NSC veneer must lie inside the code region");
+        // Peripheral region covers the secure peripheral aliases.
+        assert_eq!(MPU_PERIPH_BASE, 0x5000_0000);
+        assert_eq!(MPU_PERIPH_LIMIT, 0x5FFF_FFFF);
     }
 
     #[test]
