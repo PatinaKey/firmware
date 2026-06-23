@@ -14,3 +14,6 @@
  * Armv8-M secure gateway / .gnu.sgstubs convention. cortex-m-rt link.x.
  */
 EXTERN(patinakey_nsc_version);
+EXTERN(patinakey_nsc_se_smoke);
+EXTERN(patinakey_nsc_se_riscv_fw_version);
+EXTERN(patinakey_nsc_se_spect_fw_version);

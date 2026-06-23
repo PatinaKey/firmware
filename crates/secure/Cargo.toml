@@ -12,20 +12,18 @@ description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone
 platform = { path = "../platform" }
 
 # cc: compiles the C -mcmse NSC veneer shim (secure_nsc.c) at build time. It is
-# the de-facto, mature, mainstream build-script C compiler driver for Rust
-# (rust-lang org, used by the standard library's build).
-# It only runs on the host as a build tool. Nothing from it ships in
-# the binary except the object code of our own one-function shim. Forced to
-# clang with the -mcmse flags in build.rs.
+# the de-facto, mature, mainstream build-script C compiler driver for Rust.
 [build-dependencies]
 cc = "1.2"
 
-# Embedded-only deps: pulled in just for the firmware build. On the host the bin
+# Embedded-only deps. On the host the bin
 # is an empty stub (see src/main.rs), so these compile only for the target.
 [target.'cfg(target_os = "none")'.dependencies]
 cortex-m = { workspace = true }
 cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
+mcu-spi = { path = "../mcu-spi" }
+tropic01-driver = { path = "../tropic01-driver", default-features = false }
 
 # Lint quarantine: this bin holds the untestable MMIO wiring (it instantiates the
 # real MmioBus), so it overrides the workspace `unsafe_code = forbid` to `deny`

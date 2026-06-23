@@ -22,6 +22,12 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
+// The non-secure-callable smoke routines (the secure side of the SE bring-up
+// veneers). Target-only: they build the device on the real SPI1 MMIO bus. The C
+// veneers in csrc/secure_nsc.c forward to these `extern "C"` entries.
+#[cfg(target_os = "none")]
+mod se_smoke;
+
 #[cfg(target_os = "none")]
 mod firmware
 {

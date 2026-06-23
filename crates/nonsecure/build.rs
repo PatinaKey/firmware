@@ -70,6 +70,11 @@ fn main() -> Result<(), Box<dyn Error>>
     fs::write(out_dir.join("memory.x"), include_bytes!("memory.x"))?;
     println!("cargo:rustc-link-search={}", out_dir.display());
 
+    // Add the defmt linker fragment so the defmt-rtt log strings land in their
+    // dedicated section. defmt ships defmt.x on the linker search path via its own
+    // build script, so this only adds the -T link arg.
+    println!("cargo:rustc-link-arg=-Tdefmt.x");
+
     // 2. Link against the secure crate's CMSE import object so the veneer symbol
     //    resolves. Passed as a direct positional input to rust-lld.
     let target_root = target_root_from_out_dir(&out_dir)

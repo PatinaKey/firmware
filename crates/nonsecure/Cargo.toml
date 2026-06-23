@@ -12,10 +12,18 @@ description = "STM32U545 non-secure (TZ-NS) firmware binary: minimal skeleton (b
 
 # Embedded-only deps. On the host the bin is an empty stub, so these compile only
 # for the target. embassy is not a dependency yet (the NS app is still a skeleton).
+#
+# defmt + defmt-rtt: the SE bring-up report channel (defmt over RTT, read by
+# probe-rs over SWD).
 [target.'cfg(target_os = "none")'.dependencies]
-cortex-m = { workspace = true }
+# critical-section-single-core supplies the single-hart critical-section impl
+# that defmt-rtt's RTT encoder needs. The non-secure world is the single-core
+# Armv8-M context, so the interrupt-masking critical section is sound here.
+cortex-m = { workspace = true, features = ["critical-section-single-core"] }
 cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
+defmt = { workspace = true }
+defmt-rtt = { workspace = true }
 
 # Lint quarantine: the NS entry declares + calls the secure-gateway veneer
 # through an unsafe extern block (the only unsafe here), so this bin overrides the

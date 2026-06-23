@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/tropic01-driver",
     "crates/platform",
+    "crates/mcu-spi",
     "crates/secure",
     "crates/nonsecure",
 ]
@@ -40,19 +41,19 @@ ecdsa = { version = "0.17.0-rc.23", default-features = false }
 p384 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
 p521 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
 
-# --- MCU platform / firmware-binary dependencies ---
+# MCU platform / firmware-binary dependencies
+
 # cortex-m-rt: the de-facto reset-vector + .data/.bss init + linker glue for
-# Cortex-M. Mature (rust-embedded org, 0.7.x stable since 2021), audited, the
-# standard startup crate. Provides #[entry] and the link.x script our bins use.
+# Cortex-M. Provides #[entry] and the link.x script our bins use.
 cortex-m-rt = "0.7.5"
-# cortex-m: low-level Cortex-M core access (NVIC, SCB, asm). Same org, same
-# maturity tier. Used for the bins' core intrinsics; the platform lib stays
-# free of it (it talks to MMIO through its own audited register layer).
+# cortex-m: low-level Cortex-M core access (NVIC, SCB, asm).
 cortex-m = "0.7.7"
-# panic-halt: minimal panicking-aborts-by-spinning handler. One tiny, auditable
-# file; no formatting, no unwinding. Correct default for a security firmware where
-# a panic must wedge rather than unwind. v1.0 is stable.
+# panic-halt: minimal panicking-aborts-by-spinning handler.
 panic-halt = "1.0.0"
+# defmt + defmt-rtt: the SE bring-up report channel (defmt over RTT, read by
+# probe-rs over SWD).
+defmt = "1.0"
+defmt-rtt = "1.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

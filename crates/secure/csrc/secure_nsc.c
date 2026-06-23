@@ -31,3 +31,26 @@ __attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_version(void)
 {
     return (uint32_t)patinakey_nsc_version_value;
 }
+
+/* SE bring-up forwarders. The Rust secure routines (src/se_smoke.rs) do all the
+ * work: build the TROPIC01 over SPI1, run a no-session L2 probe, pack the result
+ * into a uint32_t. Each veneer just forwards the return value.
+ * Value-out only: no pointer, secret, or non-secure function pointer crosses. */
+extern uint32_t patinakey_se_smoke(void);
+extern uint32_t patinakey_se_riscv_fw_version(void);
+extern uint32_t patinakey_se_spect_fw_version(void);
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_smoke(void)
+{
+    return patinakey_se_smoke();
+}
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_riscv_fw_version(void)
+{
+    return patinakey_se_riscv_fw_version();
+}
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_spect_fw_version(void)
+{
+    return patinakey_se_spect_fw_version();
+}
