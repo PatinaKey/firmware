@@ -1,0 +1,31 @@
+[package]
+name = "fw-update"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "no_std, fail-closed dual-bank A/B firmware-update state machine modelled behind a mocked flash seam."
+# Dev-only fuzz harness kept out of the published package. It has its own
+# detached workspace and needs nightly instrumentation.
+exclude = ["/fuzz"]
+
+[features]
+# Exposes the host mock seams to libFuzzer harnesses. Not for production. The
+# real flash MMIO driver is a separate hardware-gated crate, never this one.
+_fuzz = []
+
+[dependencies]
+# The signed-image verifier. The state machine runs verify_image before any
+# commit, so the inactive bank is authenticated against the pinned root key.
+image-verify = { path = "../image-verify" }
+
+[dev-dependencies]
+# Host-only fixture minting: the tests sign a synthetic image with a known
+# secret scalar so verify_image accepts it. Verify-only on the device, the
+# signing path runs solely in tests.
+ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true

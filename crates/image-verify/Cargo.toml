@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "no_std, panic-free Ed25519 verifier for the patina_key signed firmware-image format."
+description = "no_std Ed25519 verifier for the patina_key signed firmware-image format."
 # Dev-only fuzz harness kept out of the published package. It has its own
 # detached workspace and needs nightly instrumentation.
 exclude = ["/fuzz"]
