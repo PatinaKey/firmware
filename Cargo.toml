@@ -6,6 +6,7 @@ members = [
     "crates/mcu-spi",
     "crates/secure",
     "crates/nonsecure",
+    "crates/image-verify",
 ]
 
 [workspace.package]
@@ -40,6 +41,15 @@ hmac = { version = "0.13", default-features = false }
 ecdsa = { version = "0.17.0-rc.23", default-features = false }
 p384 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
 p521 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
+
+# Ed25519 verification of the signed firmware-image header (image-verify crate).
+# Verify-only on the device: the pinned root public key is the trust input and
+# no secret key runs here, so the failure modes are correctness, not
+# side-channel leakage. default-features = false keeps it no_std and heap-free.
+#
+# NOTE: ed25519-dalek 2.2 pins sha2 0.10 while the workspace otherwise sits on
+# sha2 0.11. This second sha2 copy is accepted.
+ed25519-dalek = { version = "2.2", default-features = false }
 
 # MCU platform / firmware-binary dependencies
 
