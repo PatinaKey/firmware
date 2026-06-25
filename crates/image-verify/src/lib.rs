@@ -2,10 +2,8 @@
 //!
 //! A `no_std`, heap-free library that parses the patina_key
 //! signed-image format and verifies its Ed25519 signature against an
-//! out-of-band PINNED root public key supplied by the caller. It writes no
-//! flash, touches no lifecycle or option byte, and runs no bootloader or A/B
-//! state machine: those are a future crate. This crate decides one thing,
-//! is this image authentic under the pinned root, fail-closed.
+//! out-of-band PINNED root public key supplied by the caller. 
+//! This crate decides one thing, is this image authentic under the pinned root.
 //!
 //! # Trust model
 //!
@@ -24,9 +22,13 @@
 #[cfg(test)]
 extern crate std;
 
+#[cfg(feature = "encode")]
+mod encode;
 mod error;
 mod format;
 
+#[cfg(feature = "encode")]
+pub use crate::encode::encode_header;
 pub use crate::error::VerifyError;
 pub use crate::format::ImageVersion;
 pub use crate::format::HEADER_LEN;
