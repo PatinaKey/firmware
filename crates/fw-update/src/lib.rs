@@ -28,6 +28,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod fidelity;
 mod machine;
 mod mock;
 mod seam;
@@ -162,3 +164,6 @@ pub mod fuzz
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod power_fault;

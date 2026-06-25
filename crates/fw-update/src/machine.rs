@@ -225,6 +225,16 @@ where
         &self.flash
     }
 
+    /// Consumes the updater and returns the flash seam (test inspection only).
+    ///
+    /// The power-fault harness uses this to model a reboot: it drops the volatile
+    /// updater and reads the surviving persistent state out of the flash seam.
+    #[cfg(test)]
+    pub(crate) fn into_flash(self) -> F
+    {
+        self.flash
+    }
+
     /// Borrows the secure-element counter seam (test inspection only).
     #[cfg(test)]
     pub(crate) fn se_counter(&self) -> &S
