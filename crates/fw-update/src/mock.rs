@@ -18,6 +18,7 @@ use crate::seam::PageIndex;
 use crate::seam::PendingFlag;
 use crate::seam::SeCounterError;
 use crate::seam::SeCounterSeam;
+use crate::seam::UpdateOutcome;
 
 /// The modelled page size in bytes.
 pub const PAGE_LEN: usize = 256;
@@ -65,6 +66,7 @@ pub struct MockFlash
     nvcnt: u32,
     pending: PendingFlag,
     boot_count: u32,
+    outcome: UpdateOutcome,
     running: BankId,
     target: BankId,
     fault: FaultPoint,
@@ -86,6 +88,7 @@ impl MockFlash
             nvcnt,
             pending: PendingFlag::None,
             boot_count: 0,
+            outcome: UpdateOutcome::None,
             running: BankId::Bank1,
             target: BankId::Bank2,
             fault: FaultPoint::None,
@@ -276,6 +279,28 @@ impl FlashSeam for MockFlash
             .boot_count
             .checked_add(1)
             .ok_or(FlashError::WriteFailed)?;
+        Ok(())
+    }
+
+    fn update_outcome_read(&mut self) -> Result<UpdateOutcome, FlashError>
+    {
+        Ok(self.outcome)
+    }
+
+    fn update_outcome_write
+    (
+        &mut self,
+        outcome: UpdateOutcome,
+    )
+        -> Result<(), FlashError>
+    {
+        self.outcome = outcome;
+        Ok(())
+    }
+
+    fn update_outcome_clear(&mut self) -> Result<(), FlashError>
+    {
+        self.outcome = UpdateOutcome::None;
         Ok(())
     }
 }

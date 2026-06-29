@@ -47,6 +47,7 @@ pub use crate::seam::PageIndex;
 pub use crate::seam::PendingFlag;
 pub use crate::seam::SeCounterError;
 pub use crate::seam::SeCounterSeam;
+pub use crate::seam::UpdateOutcome;
 
 #[cfg(any(test, feature = "_fuzz"))]
 pub use crate::mock::BANK_LEN;

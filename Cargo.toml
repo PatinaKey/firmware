@@ -4,6 +4,7 @@ members = [
     "crates/tropic01-driver",
     "crates/platform",
     "crates/mcu-spi",
+    "crates/mcu-flash",
     "crates/secure",
     "crates/nonsecure",
     "crates/image-verify",

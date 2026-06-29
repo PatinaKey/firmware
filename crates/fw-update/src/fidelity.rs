@@ -69,6 +69,7 @@ use crate::seam::PageIndex;
 use crate::seam::PendingFlag;
 use crate::seam::SeCounterError;
 use crate::seam::SeCounterSeam;
+use crate::seam::UpdateOutcome;
 
 /// The modelled bank size in bytes (each of the two physical banks).
 ///
@@ -109,6 +110,8 @@ pub struct PersistentState
     pub nvcnt: u32,
     /// The persistent pending-confirm record.
     pub pending: PendingFlag,
+    /// The persistent update-outcome record (reserved for the boot-stage).
+    pub outcome: UpdateOutcome,
     /// The boot-count confirmation countdown.
     pub boot_count: u32,
     /// The bank the firmware currently runs from (the OLD bank).
@@ -147,6 +150,7 @@ impl PersistentState
             bank_b: [0xFF; BANK_LEN],
             nvcnt,
             pending: PendingFlag::None,
+            outcome: UpdateOutcome::None,
             boot_count: 0,
             running: BankId::Bank1,
             target: BankId::Bank2,
@@ -596,6 +600,51 @@ impl FlashSeam for FidelityFlash
             }
             // The boot count is a word write, so a TornWrite cut degrades to
             // BeforeMutation here: it faults, the count keeps its prior value.
+            CutAction::Fault | CutAction::Tear =>
+            {
+                Err(FlashError::WriteFailed)
+            }
+        }
+    }
+
+    fn update_outcome_read(&mut self) -> Result<UpdateOutcome, FlashError>
+    {
+        Ok(self.persistent.outcome)
+    }
+
+    fn update_outcome_write
+    (
+        &mut self,
+        outcome: UpdateOutcome,
+    )
+        -> Result<(), FlashError>
+    {
+        match self.step_cut()
+        {
+            CutAction::Proceed | CutAction::MutateThenStop =>
+            {
+                self.persistent.outcome = outcome;
+                Ok(())
+            }
+            // The outcome record is a word write, not a quad-word image write, so
+            // a TornWrite cut degrades to BeforeMutation here: it faults, the
+            // record keeps its prior value.
+            CutAction::Fault | CutAction::Tear =>
+            {
+                Err(FlashError::WriteFailed)
+            }
+        }
+    }
+
+    fn update_outcome_clear(&mut self) -> Result<(), FlashError>
+    {
+        match self.step_cut()
+        {
+            CutAction::Proceed | CutAction::MutateThenStop =>
+            {
+                self.persistent.outcome = UpdateOutcome::None;
+                Ok(())
+            }
             CutAction::Fault | CutAction::Tear =>
             {
                 Err(FlashError::WriteFailed)

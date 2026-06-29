@@ -89,6 +89,28 @@ pub enum BankId
     Bank2,
 }
 
+/// The persistent outcome of the LAST update attempt.
+///
+/// An auto-revert (the boot-stage re-arms SWAP_BANK back to the old bank when a
+/// new image does not confirm in time) must NOT be silent. The boot-stage SETS
+/// this record on an auto-revert, and it is cleared when a fresh update begins or
+/// a new image confirms. It survives the reset the revert commits on, so a later
+/// boot and a host tool can read it back and surface the event.
+///
+/// This crate ships the type and the seam. The boot-stage that SETS it on an
+/// auto-revert, and the LED plus host-CLI surfacing that consumes it, are future
+/// work. The machine in this crate does not set it: it lives in the metadata area
+/// alongside the pending record, reserved for the boot-stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome
+{
+    /// No outcome recorded. The last update path ran clean, or none has run.
+    None,
+    /// The boot-stage auto-reverted the last update (the new image never
+    /// confirmed within the boot budget).
+    AutoReverted,
+}
+
 /// The only path from the machine to flash and the SWAP_BANK commit.
 ///
 /// Each method returns a typed [`Result`] so a fault fails closed. The machine
@@ -224,6 +246,40 @@ pub trait FlashSeam
     ///
     /// [`FlashError::WriteFailed`] on a write fault.
     fn boot_count_advance(&mut self) -> Result<(), FlashError>;
+
+    /// Reads the persistent update-outcome record.
+    ///
+    /// Reserved for a future boot-stage. It reads back what the boot-stage last
+    /// wrote, so an auto-revert is never silent. The metadata area survives a
+    /// swap (RM0456 sec 7.5.8).
+    ///
+    /// # Errors
+    ///
+    /// [`FlashError::Hardware`] if the record store is unreadable.
+    fn update_outcome_read(&mut self) -> Result<UpdateOutcome, FlashError>;
+
+    /// Writes the persistent update-outcome record.
+    ///
+    /// The boot-stage sets [`UpdateOutcome::AutoReverted`] on an auto-revert.
+    ///
+    /// # Errors
+    ///
+    /// [`FlashError::WriteFailed`] on a write fault.
+    fn update_outcome_write
+    (
+        &mut self,
+        outcome: UpdateOutcome,
+    )
+        -> Result<(), FlashError>;
+
+    /// Clears the update-outcome record back to [`UpdateOutcome::None`].
+    ///
+    /// A fresh update begins or a new image confirms by clearing the record.
+    ///
+    /// # Errors
+    ///
+    /// [`FlashError::WriteFailed`] on a write fault.
+    fn update_outcome_clear(&mut self) -> Result<(), FlashError>;
 }
 
 /// The secure-element monotonic counter (Gate 2, anti-rollback after channel up).

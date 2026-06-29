@@ -1,0 +1,33 @@
+[package]
+name = "mcu-flash"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "STM32U545 embedded-flash driver implementing the fw-update dual-bank A/B FlashSeam in hand-rolled raw MMIO, behind a host-testable register seam."
+
+[dependencies]
+# The FlashSeam trait plus BankId / PageIndex / PendingFlag / FlashError types
+# the dual-bank A/B update machine consumes. This driver is the real backend.
+fw-update = { path = "../fw-update" }
+
+[dev-dependencies]
+# Host-only integration fixture: the A/B machine re-cabled onto the real driver
+# over the FLASH-controller model is driven through the public Updater API, and
+# minting a valid signed image needs the verifier crate plus a signing key.
+image-verify = { path = "../image-verify", features = ["encode"] }
+ed25519-dalek = { workspace = true }
+
+# This crate owns the volatile FLASH MMIO
+# (word reads / writes of the controller registers and the memory-mapped banks),
+# so it defines its OWN [lints.rust] table to DOWNGRADE the forbid to deny:
+# unsafe is still denied by default and every unsafe block must carry a
+# `// SAFETY:` justification. The MMIO impl is gated to the embedded target.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"
