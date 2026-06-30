@@ -5,8 +5,10 @@
 //! There is no crypto-agility trait: the algorithms are fixed by the protocol,
 //! so an abstraction would only add a downgrade surface.
 
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::aead::Key;
+use aes_gcm::aead::Nonce;
+use aes_gcm::aead::Tag;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::KeyInit as AesKeyInit;
 use hmac::Hmac;
@@ -120,10 +122,11 @@ pub(crate) fn aes256gcm_seal
 )
 -> Result<[u8; GCM_TAG_LEN], CryptoError>
 {
-    let cipher = <Aes256Gcm as AesKeyInit>::new(&GenericArray::from(*key));
-    let nonce = GenericArray::from(*iv);
+    let key_arr: Key<Aes256Gcm> = (*key).into();
+    let cipher = <Aes256Gcm as AesKeyInit>::new(&key_arr);
+    let nonce: Nonce<Aes256Gcm> = (*iv).into();
     let tag = cipher
-        .encrypt_in_place_detached(&nonce, aad, buffer)
+        .encrypt_inout_detached(&nonce, aad, buffer.into())
         .map_err(|_| CryptoError)?;
     Ok(tag.into())
 }
@@ -142,11 +145,12 @@ pub(crate) fn aes256gcm_open
 )
 -> Result<(), CryptoError>
 {
-    let cipher = <Aes256Gcm as AesKeyInit>::new(&GenericArray::from(*key));
-    let nonce = GenericArray::from(*iv);
-    let tag = GenericArray::from(*tag);
+    let key_arr: Key<Aes256Gcm> = (*key).into();
+    let cipher = <Aes256Gcm as AesKeyInit>::new(&key_arr);
+    let nonce: Nonce<Aes256Gcm> = (*iv).into();
+    let tag_arr: Tag<Aes256Gcm> = (*tag).into();
     cipher
-        .decrypt_in_place_detached(&nonce, aad, buffer, &tag)
+        .decrypt_inout_detached(&nonce, aad, buffer.into(), &tag_arr)
         .map_err(|_| CryptoError)
 }
 

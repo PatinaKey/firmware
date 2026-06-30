@@ -12,9 +12,11 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::vec::Vec;
 
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::aead::Key;
 use aes_gcm::aead::KeyInit;
+use aes_gcm::aead::Nonce;
+use aes_gcm::aead::Tag;
 use aes_gcm::Aes256Gcm;
 use embedded_hal::spi::ErrorKind;
 use embedded_hal::spi::ErrorType;
@@ -323,7 +325,8 @@ pub(crate) enum GetInfoFault
     ErrorStatus,
     /// Corrupt the reply frame CRC.
     BadCrc,
-    /// Queue no response (the read path then sees RSP_LEN = 0xFF).
+    /// Queue no response (the read path then sees STATUS = 0xFF, the NO_RESP
+    /// sentinel).
     NoResp,
     /// Reply with a valid-CRC frame carrying a RequestCont (more-chunks) status.
     ///
@@ -351,10 +354,12 @@ fn iv(n: u32) -> [u8; 12]
 /// AES-256-GCM seal: returns `ciphertext || tag`.
 fn seal(key: &[u8; 32], n: u32, pt: &[u8]) -> Vec<u8>
 {
-    let cipher = Aes256Gcm::new(&GenericArray::from(*key));
+    let key_arr: Key<Aes256Gcm> = (*key).into();
+    let cipher = Aes256Gcm::new(&key_arr);
+    let nonce: Nonce<Aes256Gcm> = iv(n).into();
     let mut buf = pt.to_vec();
     let tag = cipher
-        .encrypt_in_place_detached(&GenericArray::from(iv(n)), &[], &mut buf)
+        .encrypt_inout_detached(&nonce, &[], buf.as_mut_slice().into())
         .unwrap();
     buf.extend_from_slice(&tag);
     buf
@@ -363,12 +368,14 @@ fn seal(key: &[u8; 32], n: u32, pt: &[u8]) -> Vec<u8>
 /// AES-256-GCM open of `ciphertext || tag`, returning the plaintext.
 fn open(key: &[u8; 32], n: u32, ct_tag: &[u8]) -> Vec<u8>
 {
-    let cipher = Aes256Gcm::new(&GenericArray::from(*key));
+    let key_arr: Key<Aes256Gcm> = (*key).into();
+    let cipher = Aes256Gcm::new(&key_arr);
     let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
     let mut buf = ct.to_vec();
-    let tag = GenericArray::clone_from_slice(tag);
+    let nonce: Nonce<Aes256Gcm> = iv(n).into();
+    let tag_arr: Tag<Aes256Gcm> = tag.try_into().unwrap();
     cipher
-        .decrypt_in_place_detached(&GenericArray::from(iv(n)), &[], &mut buf, &tag)
+        .decrypt_inout_detached(&nonce, &[], buf.as_mut_slice().into(), &tag_arr)
         .unwrap();
     buf
 }
@@ -954,10 +961,10 @@ impl ChipMockSpi
             }
             None =>
             {
-                // No response queued: report READY but RSP_LEN = 0xFF.
-                status[0] = 0x01;
-                out[0] = 0x00;
-                out[1] = 0xFF;
+                // No response queued: model the real chip with STATUS = 0xFF
+                // (the NO_RESP sentinel).
+                status[0] = 0x00;
+                out[0] = 0xFF;
             }
         }
     }
@@ -1058,9 +1065,10 @@ impl SpiDevice for ScriptedSpi
                     }
                     None =>
                     {
-                        // Nothing left: report READY with RSP_LEN = 0xFF.
-                        status[0] = 0x01;
-                        out[1] = 0xFF;
+                        // Nothing left: model the real chip with STATUS = 0xFF
+                        // (the NO_RESP sentinel).
+                        status[0] = 0x00;
+                        out[0] = 0xFF;
                     }
                 }
             }
@@ -1132,9 +1140,10 @@ impl SpiDevice for RecordingSpi
                     }
                     None =>
                     {
-                        // Nothing left: report READY with RSP_LEN = 0xFF.
-                        status[0] = 0x01;
-                        out[1] = 0xFF;
+                        // Nothing left: model the real chip with STATUS = 0xFF
+                        // (the NO_RESP sentinel).
+                        status[0] = 0x00;
+                        out[0] = 0xFF;
                     }
                 }
             }
@@ -1365,9 +1374,10 @@ impl FwUpdateSpi
             }
             None =>
             {
-                // Nothing queued: report READY with RSP_LEN = 0xFF.
-                status[0] = 0x01;
-                out[1] = 0xFF;
+                // Nothing queued: model the real chip with STATUS = 0xFF (the
+                // NO_RESP sentinel).
+                status[0] = 0x00;
+                out[0] = 0xFF;
             }
         }
     }

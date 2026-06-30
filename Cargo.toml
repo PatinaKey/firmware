@@ -15,7 +15,7 @@ license = "GPL-3.0-or-later"
 embedded-hal = "1.0"
 zeroize = { version = "1.9", default-features = false, features = ["derive"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 # ECDSA verification of the TROPIC01 X.509 attestation chain (P-384/SHA-384 on
@@ -31,9 +31,9 @@ hmac = { version = "0.13", default-features = false }
 # binary. Pinning the rc keeps a single crypto generation, which is the smaller
 # audit and flash surface.
 # TODO: drop the -rc pins once p384/p521 0.14 and ecdsa 0.17 ship stable.
-ecdsa = { version = "0.17.0-rc.19", default-features = false }
-p384 = { version = "0.14.0-rc.11", default-features = false, features = ["ecdsa"] }
-p521 = { version = "0.14.0-rc.11", default-features = false, features = ["ecdsa"] }
+ecdsa = { version = "0.17.0-rc.23", default-features = false }
+p384 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
+p521 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
