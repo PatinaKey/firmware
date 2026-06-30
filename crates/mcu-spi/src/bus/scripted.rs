@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use super::SpiBusAccess;
+use crate::regs;
 
 /// A single recorded write, tagged 32-bit (`Word`) or 8-bit (`Byte`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,46 @@ impl ScriptedBus
         })
     }
 
+    /// Models the silicon mode-fault (MODF) the host recording bus cannot show.
+    ///
+    /// The recording bus reads back the last value written, so it never raises a
+    /// status the firmware did not write. On real silicon, selecting MASTER under
+    /// software slave management while the internal slave-select is low (CR1.SSI =
+    /// 0) ARMS a mode fault: SR.MODF latches and the hardware clears MASTER and SPE.
+    /// This models exactly that one transition, plus the IFCR.MODFC clear, so a test
+    /// can observe the fault the wrong write order would cause.
+    ///
+    /// The latch lands in the config-readback map, and `read32` serves a scripted
+    /// queue first, so a latched MODF is observable only when SR is read without a
+    /// scripted value (the init tests, which never script SR). The transfer tests
+    /// script SR for the polling loop and do not exercise this fault.
+    fn model_mode_fault(&mut self, addr: u32, value: u32)
+    {
+        if addr == regs::SPI1_CFG2
+        {
+            let sets_master_with_ssm = value & regs::SPI_CFG2_MASTER != 0
+                && value & regs::SPI_CFG2_SSM != 0;
+            let ssi_high =
+                self.config.get(&regs::SPI1_CR1).copied().unwrap_or(0) & regs::SPI_CR1_SSI != 0;
+            if sets_master_with_ssm && !ssi_high
+            {
+                // Latch MODF and drop MASTER + SPE, as the hardware does.
+                let sr = self.config.entry(regs::SPI1_SR).or_default();
+                *sr |= regs::SPI_SR_MODF;
+                let cfg2 = self.config.entry(regs::SPI1_CFG2).or_default();
+                *cfg2 &= !regs::SPI_CFG2_MASTER;
+                let cr1 = self.config.entry(regs::SPI1_CR1).or_default();
+                *cr1 &= !regs::SPI_CR1_SPE;
+            }
+        }
+        else if addr == regs::SPI1_IFCR
+            && value & regs::SPI_IFCR_MODFC != 0
+            && let Some(sr) = self.config.get_mut(&regs::SPI1_SR)
+        {
+            *sr &= !regs::SPI_SR_MODF;
+        }
+    }
+
     /// Returns the ordered byte values written to `addr`.
     pub(crate) fn byte_writes(&self, addr: u32) -> Vec<u8>
     {
@@ -151,6 +192,7 @@ impl SpiBusAccess for ScriptedBus
     {
         self.config.insert(addr, value);
         self.writes.push(Write::Word { addr, value });
+        self.model_mode_fault(addr, value);
     }
 
     fn read8(&mut self, addr: u32) -> u8

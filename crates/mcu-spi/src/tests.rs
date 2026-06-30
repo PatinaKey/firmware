@@ -10,6 +10,7 @@ use embedded_hal::spi::Operation;
 use embedded_hal::spi::SpiDevice;
 
 use crate::bus::ScriptedBus;
+use crate::bus::SpiBusAccess;
 use crate::regs;
 use crate::spi::Spi1Device;
 use crate::spi::Spi1Error;
@@ -94,6 +95,64 @@ fn init_holds_ssi_and_runs_endless_then_enables_and_starts()
     let cr2 = bus.last_word_value(regs::SPI1_CR2).expect("CR2 written");
     // Endless transfer: TSIZE field cleared.
     assert_eq!(cr2 & regs::SPI_CR2_TSIZE_MASK, 0, "TSIZE = 0 (endless)");
+}
+
+#[test]
+fn init_writes_ssi_high_before_selecting_master()
+{
+    let bus = ScriptedBus::new();
+    let dev = Spi1Device::new(bus);
+    let bus = consume(dev);
+
+    // The CR1 write that ORs in SSI must precede the CFG2 write that sets MASTER,
+    // so the internal slave-select is high before the master is ever selected and
+    // the mode-fault window never opens. Find the first CR1 write that carries SSI
+    // and the first CFG2 write that carries MASTER, then assert SSI comes first.
+    let ssi_idx = bus
+        .writes()
+        .iter()
+        .position(|w| matches!(w, crate::bus::Write::Word { addr, value }
+            if *addr == regs::SPI1_CR1 && *value & regs::SPI_CR1_SSI != 0))
+        .expect("a CR1 write must set SSI");
+    let master_idx = bus
+        .writes()
+        .iter()
+        .position(|w| matches!(w, crate::bus::Write::Word { addr, value }
+            if *addr == regs::SPI1_CFG2 && *value & regs::SPI_CFG2_MASTER != 0))
+        .expect("a CFG2 write must set MASTER");
+    assert!(ssi_idx < master_idx, "SSI written high before MASTER selected");
+}
+
+#[test]
+fn init_never_latches_a_mode_fault()
+{
+    let bus = ScriptedBus::new();
+    let dev = Spi1Device::new(bus);
+    let mut bus = consume(dev);
+
+    let sr = bus.read32(regs::SPI1_SR);
+    assert_eq!(sr & regs::SPI_SR_MODF, 0, "no mode fault latched after init");
+}
+
+#[test]
+fn transaction_clears_mode_fault_in_the_ifcr_write()
+{
+    let mut bus = ScriptedBus::new();
+    script_sr_ready(&mut bus, 1);
+    bus.script_byte_reads(regs::SPI1_RXDR, &[0x00]);
+    let mut dev = Spi1Device::new(bus);
+
+    dev.transaction(&mut [Operation::Write(&[0x42])])
+        .expect("write transaction succeeds");
+
+    let bus = consume(dev);
+    // The per-transaction IFCR clear must carry MODFC alongside EOTC / TXTFC / OVRC,
+    // so a latched mode fault is cleared each transaction as defense in depth.
+    let ifcr = bus.last_word_value(regs::SPI1_IFCR).expect("IFCR written");
+    assert_ne!(ifcr & regs::SPI_IFCR_MODFC, 0, "MODFC cleared");
+    assert_ne!(ifcr & regs::SPI_IFCR_EOTC, 0, "EOTC cleared");
+    assert_ne!(ifcr & regs::SPI_IFCR_TXTFC, 0, "TXTFC cleared");
+    assert_ne!(ifcr & regs::SPI_IFCR_OVRC, 0, "OVRC cleared");
 }
 
 #[test]

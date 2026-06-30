@@ -219,6 +219,14 @@ pub(crate) const SPI_SR_RXP: u32 = 1 << 0;
 pub(crate) const SPI_SR_TXP: u32 = 1 << 1;
 /// `SPI_SR.OVR` bit 6: receive overrun. RM0456 sec 68.8.6.
 pub(crate) const SPI_SR_OVR: u32 = 1 << 6;
+/// `SPI_SR.MODF` bit 9: mode fault. Set when MASTER and SSM are both set while
+/// SSI is 0 (the internal slave-select is asserted low). A latched MODF
+/// hardware-clears MASTER and SPE and is
+/// cleared only by writing `IFCR.MODFC`. Defined so the host model can observe the
+/// fault the silicon would raise (production code prevents MODF by ordering, so it
+/// never reads this flag). RM0456 sec 68.8.6.
+#[cfg(test)]
+pub(crate) const SPI_SR_MODF: u32 = 1 << 9;
 
 // --- SPI_IFCR bits. RM0456 sec 68.8.7. ---
 
@@ -228,6 +236,11 @@ pub(crate) const SPI_IFCR_EOTC: u32 = 1 << 3;
 pub(crate) const SPI_IFCR_TXTFC: u32 = 1 << 4;
 /// `SPI_IFCR.OVRC` bit 6: clear OVR. RM0456 sec 68.8.7.
 pub(crate) const SPI_IFCR_OVRC: u32 = 1 << 6;
+/// `SPI_IFCR.MODFC` bit 9: clear MODF (mode fault). This SPI clears a latched
+/// mode fault by WRITING 1 here, NOT by the legacy read-SR-then-write-CR1
+/// sequence of the older SPI. A latched MODF hardware-clears MASTER and SPE, so
+/// until MODFC is written the master cannot re-enable. RM0456 sec 68.8.7.
+pub(crate) const SPI_IFCR_MODFC: u32 = 1 << 9;
 
 /// Returns the 2-bit-field shift for `pin` in a MODER/OSPEEDR/PUPDR register.
 pub(crate) const fn field2_shift(pin: u32) -> u32

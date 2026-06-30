@@ -246,11 +246,17 @@ where
         }
         self.deselect();
 
-        // Clear the sticky transfer flags so a stale EOT / TXTF / OVR cannot leak
-        // into the next transaction. Write-1-to-clear. RM0456 sec 68.8.7.
+        // Clear the sticky transfer flags so a stale EOT / TXTF / OVR / MODF cannot
+        // leak into the next transaction. MODF is cleared here as defense in depth:
+        // a latched mode fault hardware-clears MASTER and SPE, and only writing
+        // MODFC clears it, so without this a once-latched fault would keep the
+        // master from ever re-enabling. Write-1-to-clear. RM0456 sec 68.8.7.
         self.bus.write32(
             regs::SPI1_IFCR,
-            regs::SPI_IFCR_EOTC | regs::SPI_IFCR_TXTFC | regs::SPI_IFCR_OVRC,
+            regs::SPI_IFCR_EOTC
+                | regs::SPI_IFCR_TXTFC
+                | regs::SPI_IFCR_OVRC
+                | regs::SPI_IFCR_MODFC,
         );
 
         // FAIL-CLOSED DRAIN: on any operation error, clear SPE so the engine is
@@ -340,9 +346,11 @@ where
 /// Programs SPI1 for SPI mode 0, MSB-first, 8-bit, software-CS, endless transfer.
 ///
 /// CFG1/CFG2 are written while `SPE` = 0 (RM0456 sec 68.8.3/4 write-protect them
-/// once enabled), then `SSI` = 1 (prevents a master MODF under software slave
-/// management), `TSIZE` = 0 (endless), `SPE` = 1, and `CSTART` to arm the master
-/// engine. RM0456 sec 68.4.10.
+/// once enabled). `SSI` = 1 is written BEFORE the CFG2 write that selects MASTER
+/// with SSM, so the internal slave-select is never low while the master is
+/// selected (which would arm a mode fault under software slave management). Then
+/// `TSIZE` = 0 (endless), `SPE` = 1, and `CSTART` arm the master engine. RM0456
+/// sec 68.4.10.
 fn configure_spi<B>(bus: &mut B)
 where
     B: SpiBusAccess,
@@ -361,9 +369,31 @@ where
         cfg1,
     );
 
+    // Hold the internal slave-select inactive BEFORE master mode is selected, and
+    // arm MASRX so the master auto-suspends SCK on an RxFIFO-full condition before
+    // it can overrun.
+    //
+    // SSI MUST be high before the CFG2 write below sets MASTER with SSM. With
+    // software slave management the internal slave-select follows SSI, so if MASTER
+    // and SSM were set while SSI is still 0 the master would be selected low for the
+    // window between the two writes. A master selected low ARMS a mode fault (MODF,
+    // SR bit 9), which hardware-clears MASTER and SPE and drops the peripheral back
+    // to slave mode, so it never drives SCK and every transfer stalls. Writing SSI
+    // high first keeps the internal select inactive and that window never opens.
+    //
+    // MASRX makes the master suspend SCK on an RxFIFO-full condition before it can
+    // overrun, closing the OVR window where a non-secure IRQ preempts the secure
+    // veneer mid-byte and the received companion frame would otherwise be lost.
+    // MASRX acts on the RxFIFO-full condition with no TSIZE restriction, so it is
+    // effective in the TSIZE = 0 endless model. RM0456 sec 68.8.1 bit 12 (SSI) and
+    // bit 8 (MASRX), and sec 68.5.2 (MASRX prevents OVR in master mode).
+    bus.modify32(regs::SPI1_CR1, 0, regs::SPI_CR1_SSI | regs::SPI_CR1_MASRX);
+
     // CFG2: master, full-duplex, SPI mode 0 (CPOL=0, CPHA=0), MSB-first
     // (LSBFRST=0), software slave management (SSM=1, NSS pin freed), NSS output
     // disabled (SSOE=0), AF GPIO control retained across CS toggles (AFCNTR=1).
+    // SSI is already high above, so selecting MASTER here never opens the MODF
+    // window.
     let cfg2 = regs::SPI_CFG2_MASTER
         | regs::SPI_CFG2_COMM_FULL_DUPLEX
         | regs::SPI_CFG2_SSM
@@ -380,16 +410,6 @@ where
             | regs::SPI_CFG2_AFCNTR,
         cfg2,
     );
-
-    // Hold the internal slave-select inactive so master mode does not fault, and
-    // arm MASRX so the master auto-suspends SCK on an RxFIFO-full condition before
-    // it can overrun. This closes the OVR window where a non-secure IRQ preempts
-    // the secure veneer mid-byte and the received companion frame would otherwise
-    // be lost. MASRX is documented to act on the RxFIFO-full condition with no
-    // TSIZE restriction, so it is effective in the TSIZE = 0 endless model. RM0456
-    // sec 68.8.1 bit 8 (p.2936) and sec 68.5.2 (p.2929, MASRX prevents OVR in
-    // master mode).
-    bus.modify32(regs::SPI1_CR1, 0, regs::SPI_CR1_SSI | regs::SPI_CR1_MASRX);
 
     // Arm the engine for the first transaction: TSIZE = 0, SPE = 1, CSTART. Each
     // transaction re-arms the same way through rearm_engine.

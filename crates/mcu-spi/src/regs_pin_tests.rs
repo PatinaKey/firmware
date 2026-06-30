@@ -133,6 +133,7 @@ fn spi_sr_bits_are_canonical()
     assert_eq!(SPI_SR_RXP, 1u32 << 0, "SR.RXP bit0");
     assert_eq!(SPI_SR_TXP, 1u32 << 1, "SR.TXP bit1");
     assert_eq!(SPI_SR_OVR, 1u32 << 6, "SR.OVR bit6");
+    assert_eq!(SPI_SR_MODF, 0x200, "SR.MODF bit9");
 }
 
 #[test]
@@ -141,4 +142,5 @@ fn spi_ifcr_bits_are_canonical()
     assert_eq!(SPI_IFCR_EOTC, 1u32 << 3, "IFCR.EOTC bit3");
     assert_eq!(SPI_IFCR_TXTFC, 1u32 << 4, "IFCR.TXTFC bit4");
     assert_eq!(SPI_IFCR_OVRC, 1u32 << 6, "IFCR.OVRC bit6");
+    assert_eq!(SPI_IFCR_MODFC, 0x200, "IFCR.MODFC bit9");
 }
