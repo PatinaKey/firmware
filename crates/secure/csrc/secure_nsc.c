@@ -54,3 +54,18 @@ __attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_spect_fw_version
 {
     return patinakey_se_spect_fw_version();
 }
+
+/* One-shot SE firmware-update veneer. Feature-gated (build.rs defines
+ * PATINAKEY_SE_FW_UPDATE only under the se-fw-update cargo feature), so the
+ * default product build never emits it. The Rust secure body
+ * (src/se_fw_update.rs) drives the whole update and packs the outcome (which
+ * step, success or failure) into a uint32_t.
+*/
+#ifdef PATINAKEY_SE_FW_UPDATE
+extern uint32_t patinakey_se_fw_update(void);
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_fw_update(void)
+{
+    return patinakey_se_fw_update();
+}
+#endif /* PATINAKEY_SE_FW_UPDATE */

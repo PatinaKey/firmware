@@ -8,6 +8,14 @@ repository.workspace = true
 license.workspace = true
 description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone partition bring-up."
 
+[features]
+# se-fw-update: adds the one-shot SE firmware-update path (secure body plus its
+# NSC veneer and the two vendor blobs). OFF by default, so the product firmware
+# is byte-unchanged. Build both bin crates with --features se-fw-update to turn
+# the whole path on.
+default = []
+se-fw-update = []
+
 [dependencies]
 platform = { path = "../platform" }
 

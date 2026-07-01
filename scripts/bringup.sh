@@ -18,6 +18,10 @@
 #   PROFILE=release|debug          cargo profile (default release)
 #   CONNECT_UNDER_RESET=1|0        assert NRST while attaching (default 1)
 #   CHIP=<probe-rs chip>           target name (default STM32U545CEUx)
+#   DEFMT_LOG=<filter>             defmt log level baked at build time (default
+#                                  info). defmt filters at COMPILE time, so an
+#                                  unset or too-high filter drops the info boot
+#                                  log to silence even when the firmware runs.
 #
 # BRICK-SAFETY (read this): this script ONLY flashes the two reflashable code
 # banks. It NEVER writes an option byte, never sets TZEN or SECWM or RDP or
@@ -38,6 +42,8 @@ CHIP="${CHIP:-STM32U545CEUx}"
 TARGET="thumbv8m.main-none-eabihf"
 PROFILE="${PROFILE:-release}"
 CONNECT_UNDER_RESET="${CONNECT_UNDER_RESET:-1}"
+
+export DEFMT_LOG="${DEFMT_LOG:-info}"
 
 # Map the profile name to the cargo flag and the target output subdirectory.
 # The dev profile builds into the "debug" directory with no flag, release uses

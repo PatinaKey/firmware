@@ -77,9 +77,21 @@ fn main() -> Result<(), Box<dyn Error>>
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
-    // 1. Emit the linker scripts and add them to the search path.
+    // The fw-update veneer is feature-gated. When the feature is on, clang gets a
+    // define to compile the extra `cmse_nonsecure_entry`, and the sgstubs fragment
+    // gets an extra EXTERN to root its veneer. When off, neither exists, so the
+    // product build is byte-unchanged and no undefined EXTERN can dangle.
+    let fw_update = env::var_os("CARGO_FEATURE_SE_FW_UPDATE").is_some();
+
+    // 1. Emit the linker scripts and add them to the search path. The sgstubs
+    //    fragment gets the fw-update EXTERN appended only under the feature.
     fs::write(out_dir.join("memory.x"), include_bytes!("memory.x"))?;
-    fs::write(out_dir.join("sgstubs.x"), include_bytes!("sgstubs.x"))?;
+    let mut sgstubs = Vec::from(*include_bytes!("sgstubs.x"));
+    if fw_update
+    {
+        sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_fw_update);\n");
+    }
+    fs::write(out_dir.join("sgstubs.x"), sgstubs)?;
     println!("cargo:rustc-link-search={}", out_dir.display());
     // Append the sgstubs fragment after link.x so its EXTERN roots the veneers.
     println!("cargo:rustc-link-arg=-Tsgstubs.x");
@@ -105,6 +117,11 @@ fn main() -> Result<(), Box<dyn Error>>
         .flag("-mcmse")
         .flag("-ffreestanding")
         .include("csrc");
+    if fw_update
+    {
+        // Gate the fw-update veneer in the C shim behind the same feature.
+        build.define("PATINAKEY_SE_FW_UPDATE", None);
+    }
     build.compile("patinakey_nsc");
 
     // 3. Drive rust-lld to emit the CMSE import library at the stable contract

@@ -68,8 +68,10 @@ const VERSION_ERR_BASE: u32 = 0xEEEE_EE00;
 /// Maps a [`SeError`] to a stable one-byte status code for the value-out words.
 ///
 /// The non-secure side logs the code. The exact numbering is a local convention,
-/// not a chip value. It groups by layer so a fault is legible in the log.
-fn se_error_code(err: SeError) -> u32
+/// not a chip value. It groups by layer so a fault is legible in the log. Shared
+/// with the fw-update path (se_fw_update.rs) so both veneers encode errors the
+/// same way.
+pub(crate) fn se_error_code(err: SeError) -> u32
 {
     let code: u8 = match err
     {
@@ -95,7 +97,10 @@ fn se_error_code(err: SeError) -> u32
 /// is 128 KiB and no other deep frame is live during a smoke veneer, so the
 /// headroom is ample for a one-shot probe. A persistent session would instead hold
 /// the handle in a secure `static`, added when the application logic is wired.
-fn build_device() -> Tropic01<Spi1Device<MmioSpiBus>, CycleWait, NoSession>
+///
+/// Shared with the fw-update path (se_fw_update.rs) so both build the handle the
+/// same way over the real SPI1.
+pub(crate) fn build_device() -> Tropic01<Spi1Device<MmioSpiBus>, CycleWait, NoSession>
 {
     let spi = Spi1Device::new(MmioSpiBus::new());
     let wait = CycleWait::new(CYCLES_PER_MS);

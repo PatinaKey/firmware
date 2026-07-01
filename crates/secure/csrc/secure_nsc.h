@@ -30,4 +30,13 @@ uint32_t patinakey_nsc_se_riscv_fw_version(void);
  * 0xEEEE_EExx error sentinel on a fault. */
 uint32_t patinakey_nsc_se_spect_fw_version(void);
 
+/* One-shot SE firmware-update veneer. Feature-gated (PATINAKEY_SE_FW_UPDATE,
+ * defined by build.rs under the se-fw-update cargo feature), so the default
+ * build does not declare it. Runs the whole update and returns a packed status
+ * word: bit 31 error (bits 15..8 = step, bits 7..0 = error code), bit 8 ok (low
+ * byte = an updated-to-2.0.0 marker). Value-out only. */
+#ifdef PATINAKEY_SE_FW_UPDATE
+uint32_t patinakey_nsc_se_fw_update(void);
+#endif /* PATINAKEY_SE_FW_UPDATE */
+
 #endif /* PATINAKEY_SECURE_NSC_H */

@@ -26,3 +26,6 @@ seed.bin
 *.gpg
 *.asc
 /tools/image-signer/target/
+
+# Vendor SE firmware-update blobs (Tropic Square signed, from the libtropic SDK)
+crates/secure/fw_blobs/

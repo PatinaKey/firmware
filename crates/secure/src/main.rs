@@ -28,6 +28,12 @@
 #[cfg(target_os = "none")]
 mod se_smoke;
 
+// The one-shot SE firmware-update path (secure side of the fw-update veneer).
+// Feature-gated: OFF by default, so the product firmware is byte-unchanged and
+// never references it.
+#[cfg(all(target_os = "none", feature = "se-fw-update"))]
+mod se_fw_update;
+
 #[cfg(target_os = "none")]
 mod firmware
 {
