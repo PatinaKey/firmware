@@ -602,7 +602,10 @@ where
     let n = frame::build_request(L2ReqId::Startup as u8, &body, l2)?;
     l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
     let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
-    let resp = frame::parse_response(&l2[..frame_len])?;
+    // The Startup_Req response uses the errata-tolerant parser (see
+    // parse_startup_response): the reset can corrupt the second RSP_CRC byte, so
+    // only the first is validated here. Every other L2 response stays full-CRC.
+    let resp = frame::parse_startup_response(&l2[..frame_len])?;
     // A successful Startup_Req is acknowledged with an empty RequestOk frame.
     if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
     {

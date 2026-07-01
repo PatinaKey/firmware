@@ -73,11 +73,27 @@ pub(crate) fn build_request
     Ok(total)
 }
 
-/// Parses an L2 response frame out of `frame`.
+/// Selects how strictly the trailing RSP_CRC is validated.
+///
+/// `Full` compares both CRC bytes and is the default for every L2 response.
+/// `FirstByteOnly` compares only the first transmitted CRC byte (the high
+/// byte) and is used solely for the `Startup_Req` response. See
+/// `parse_startup_response` for the errata that motivates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrcCheck
+{
+    /// Compare both RSP_CRC bytes (the strict default).
+    Full,
+    /// Compare only the first RSP_CRC byte (Startup_Req errata workaround).
+    FirstByteOnly,
+}
+
+/// Parses an L2 response frame out of `frame` with full CRC validation.
 ///
 /// `frame` is the bytes AFTER the CHIP_STATUS byte, i.e. starting at STATUS.
-/// Validates the length field, checks the CRC, and maps non-OK statuses to
-/// `L2Error::Status`.
+/// Validates the length field, checks both CRC bytes, and maps non-OK statuses
+/// to `L2Error::Status`. This is the strict path used by every response except
+/// `Startup_Req`.
 ///
 /// Errors:
 /// - `L2Error::ShortFrame` when the slice is too short for the declared frame.
@@ -85,6 +101,32 @@ pub(crate) fn build_request
 /// - `L2Error::Crc` when the trailing CRC does not match.
 /// - `L2Error::Status(s)` for any non-OK chip status.
 pub(crate) fn parse_response(frame: &[u8]) -> Result<L2Response<'_>, L2Error>
+{
+    parse_response_with(frame, CrcCheck::Full)
+}
+
+/// Parses a `Startup_Req` response, tolerating the RSP_CRC errata.
+///
+/// TROPIC01 mutable firmware up to 1.0.1 has an erratum where the chip resets
+/// after the host reads the FIRST RSP_CRC byte of a Startup_Req response, which
+/// can corrupt the SECOND RSP_CRC byte. libtropic v2.0.0 mitigates this by
+/// checking only the first CRC byte of the Startup_Req response. This helper
+/// does the same: it validates only the first transmitted CRC byte (the high
+/// byte) and ignores the second. Every other check (status byte, length,
+/// bounds) is identical to the strict path.
+///
+/// Errors: same as `parse_response`, except `L2Error::Crc` fires only on a
+/// first-CRC-byte mismatch.
+pub(crate) fn parse_startup_response(frame: &[u8]) -> Result<L2Response<'_>, L2Error>
+{
+    parse_response_with(frame, CrcCheck::FirstByteOnly)
+}
+
+/// Shared response parser. `crc_check` selects full-vs-first-byte CRC.
+///
+/// All callers reach this through `parse_response` (Full) or
+/// `parse_startup_response` (FirstByteOnly). The relaxation is confined here.
+fn parse_response_with(frame: &[u8], crc_check: CrcCheck) -> Result<L2Response<'_>, L2Error>
 {
     // STATUS then RSP_LEN.
     let (rest, status_byte) = take_u8(frame).map_err(|_| L2Error::ShortFrame)?;
@@ -119,10 +161,20 @@ pub(crate) fn parse_response(frame: &[u8]) -> Result<L2Response<'_>, L2Error>
             // `get` keeps the bounds check on attacker-influenced input.
             let covered = 2 + len;
             let covered_bytes = frame.get(..covered).ok_or(L2Error::ShortFrame)?;
-            let computed = crc16(covered_bytes);
-            // crc_bytes is [hi, lo] in transmit order.
-            let received = u16::from_be_bytes(crc_bytes);
-            if received != computed
+            // `crc16` returns the already-swapped value, so `to_be_bytes` yields
+            // the on-wire pair [hi, lo] in the same order as `crc_bytes`.
+            let computed = crc16(covered_bytes).to_be_bytes();
+            // `crc_bytes` is [hi, lo] in transmit order. The first transmitted
+            // byte is the high byte at index 0.
+            let crc_ok = match crc_check
+            {
+                CrcCheck::Full => crc_bytes == computed,
+                // Startup_Req errata: the premature reset can corrupt the second
+                // CRC byte, so only the first byte is trusted (as libtropic
+                // v2.0.0 does). The second byte is deliberately ignored here.
+                CrcCheck::FirstByteOnly => crc_bytes[0] == computed[0],
+            };
+            if !crc_ok
             {
                 return Err(L2Error::Crc);
             }
@@ -248,6 +300,54 @@ mod tests
         {
             let _ = parse_response(&full[..cut]);
         }
+    }
+
+    /// Builds a valid framed response, then corrupts one CRC byte.
+    ///
+    /// `corrupt_index` picks which CRC byte to flip (0 = first/high byte,
+    /// 1 = second/low byte). Returns the frame buffer and its used length.
+    fn framed_response_with_corrupt_crc(corrupt_index: usize) -> ([u8; 16], usize)
+    {
+        let data = [0x11u8, 0x22];
+        let mut frame = [0u8; 16];
+        frame[0] = L2Status::RequestOk as u8;
+        frame[1] = data.len() as u8;
+        frame[2] = data[0];
+        frame[3] = data[1];
+        let crc = crc_of(&frame[..4]);
+        frame[4] = crc[0];
+        frame[5] = crc[1];
+        frame[4 + corrupt_index] ^= 0xFF;
+        (frame, 6)
+    }
+
+    #[test]
+    fn startup_response_accepts_corrupt_second_crc_byte()
+    {
+        // Startup_Req errata: the premature reset corrupts the SECOND CRC byte.
+        // FirstByteOnly must accept this, where the old Full check rejected it.
+        let (frame, n) = framed_response_with_corrupt_crc(1);
+        // The strict path still rejects it, proving the test is non-vacuous.
+        assert_eq!(parse_response(&frame[..n]), Err(L2Error::Crc));
+        let resp = parse_startup_response(&frame[..n]).unwrap();
+        assert_eq!(resp.status, L2Status::RequestOk);
+    }
+
+    #[test]
+    fn startup_response_rejects_corrupt_first_crc_byte()
+    {
+        // Integrity is not fully abandoned: a corrupt FIRST CRC byte is still
+        // rejected under FirstByteOnly.
+        let (frame, n) = framed_response_with_corrupt_crc(0);
+        assert_eq!(parse_startup_response(&frame[..n]), Err(L2Error::Crc));
+    }
+
+    #[test]
+    fn full_path_still_rejects_corrupt_second_crc_byte()
+    {
+        // No regression: the relaxation must not leak into the normal path.
+        let (frame, n) = framed_response_with_corrupt_crc(1);
+        assert_eq!(parse_response(&frame[..n]), Err(L2Error::Crc));
     }
 
     #[test]

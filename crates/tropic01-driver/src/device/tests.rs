@@ -89,6 +89,33 @@ fn reboot_rejects_a_continuation_status()
     assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::BadFrame)));
 }
 
+#[test]
+fn reboot_tolerates_corrupt_second_crc_byte()
+{
+    // Startup_Req errata: the chip may reset after the host reads the first
+    // RSP_CRC byte and corrupt the second. libtropic v2.0.0 checks only the
+    // first CRC byte. A Startup ack whose SECOND CRC byte is corrupted must
+    // still succeed, so a valid reboot is not aborted mid firmware update.
+    let mut ack = l2_frame(L2Status::RequestOk as u8, &[]);
+    let last = ack.len() - 1;
+    ack[last] ^= 0xFF; // corrupt the second (low) CRC byte only
+    let acks = std::vec![ack];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert!(dev.reboot(StartupId::Reboot).is_ok());
+}
+
+#[test]
+fn reboot_still_rejects_corrupt_first_crc_byte()
+{
+    // Integrity is not fully abandoned: a corrupt FIRST CRC byte is rejected.
+    let mut ack = l2_frame(L2Status::RequestOk as u8, &[]);
+    let first = ack.len() - 2;
+    ack[first] ^= 0xFF; // corrupt the first (high) CRC byte
+    let acks = std::vec![ack];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::Crc)));
+}
+
 // Sleep (L2, NoSession)
 
 #[test]
