@@ -23,6 +23,8 @@ name: 'CI/CD Pipeline PatinaKey'
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   schedule:
     # Weekly deep run: long fuzz pass and a fresh advisory database.

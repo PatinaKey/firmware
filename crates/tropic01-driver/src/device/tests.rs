@@ -46,6 +46,7 @@ use crate::test_support::ChipMockSpi;
 use crate::test_support::GetInfoFault;
 use crate::test_support::MockSpi;
 use crate::test_support::MockWait;
+use crate::test_support::RebootModeSpi;
 use crate::test_support::RecordingSpi;
 use crate::test_support::StatusSpi;
 
@@ -114,6 +115,50 @@ fn reboot_still_rejects_corrupt_first_crc_byte()
     let acks = std::vec![ack];
     let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
     assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::Crc)));
+}
+
+#[test]
+fn maintenance_reboot_succeeds_when_chip_settles_into_maintenance()
+{
+    // The Startup_Req is acked and the chip comes up in Maintenance Mode
+    // (CHIP_STATUS READY | STARTUP = 0x05). enter_bootloader must succeed.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let dev = Tropic01::new(RebootModeSpi::new(acks, 0x01 | 0x04), MockWait::new());
+    assert!(dev.enter_bootloader().is_ok());
+}
+
+#[test]
+fn maintenance_reboot_reports_unsuccessful_when_chip_stays_in_application()
+{
+    // The Startup_Req is acked but the chip reports Application Mode (READY,
+    // STARTUP clear = 0x01) instead of Maintenance.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let dev = Tropic01::new(RebootModeSpi::new(acks, 0x01), MockWait::new());
+    match dev.enter_bootloader()
+    {
+        Ok(_) => panic!("expected RebootUnsuccessful when the chip stays in Application"),
+        Err((_dev, e)) => assert_eq!(e, SeError::RebootUnsuccessful),
+    }
+}
+
+#[test]
+fn reboot_reports_unsuccessful_when_chip_stays_in_maintenance()
+{
+    // The inverse direction: a plain Reboot is acked but the chip reports
+    // Maintenance (READY | STARTUP = 0x05) instead of Application.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let mut dev = Tropic01::new(RebootModeSpi::new(acks, 0x01 | 0x04), MockWait::new());
+    assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::RebootUnsuccessful));
+}
+
+#[test]
+fn reboot_maps_alarm_reported_after_the_ack()
+{
+    // The Startup_Req is acked but the chip comes up in Alarm Mode
+    // (CHIP_STATUS ALARM = 0x02). The reboot must surface it as L1 Alarm.
+    let acks = std::vec![l2_frame(L2Status::RequestOk as u8, &[])];
+    let mut dev = Tropic01::new(RebootModeSpi::new(acks, 0x02), MockWait::new());
+    assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L1(L1Error::Alarm)));
 }
 
 // Sleep (L2, NoSession)
