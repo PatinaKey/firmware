@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 use crate::buf::L2_FRAME_MAX;
 use crate::buf::L3Buf;
 use crate::crypto;
+use crate::error::L1Error;
 use crate::error::L2Error;
 use crate::error::SeError;
 use crate::handshake;
@@ -41,6 +42,13 @@ use super::GET_INFO_CERT_STORE_LEN;
 /// The only documented kind (Deep Sleep was removed). Source: libtropic
 /// `TR01_L2_SLEEP_KIND_SLEEP`.
 const SLEEP_KIND_SLEEP_MODE: u8 = 0x05;
+
+/// Settle delay after a `Startup_Req` ack, before re-reading the chip mode.
+///
+/// The chip acknowledges the `Startup_Req` immediately, but the reboot into the
+/// requested mode takes time. Sending the next command before the chip settles 
+/// gets it rejected as `UnknownErr`. Source: libtropic `LT_TR01_REBOOT_DELAY_MS`.
+const REBOOT_DELAY_MS: u32 = 250;
 
 impl<SPI, W> Tropic01<SPI, W, NoSession>
 where
@@ -581,10 +589,16 @@ where
 /// `STARTUP_ID` body, sends it, reads the reply, and requires an empty
 /// `RequestOk` frame. Mirrors libtropic `lt_reboot`.
 ///
+/// After the ack, waits `REBOOT_DELAY_MS` for the chip to actually reboot.
+/// Then re-reads CHIP_STATUS and confirms the chip reached the requested mode 
+/// (`MaintenanceReboot` -> Start-up/Maintenance, `Reboot` -> Application).
+///
 /// # Errors
 ///
-/// `SeError` on a bus fault, and `SeError::L2(L2Error::BadFrame)` on any reply
-/// that is not an empty `RequestOk` ack.
+/// `SeError` on a bus fault, `SeError::L2(L2Error::BadFrame)` on any reply that
+/// is not an empty `RequestOk` ack, `SeError::L1(L1Error::Alarm)` if the chip
+/// came up in Alarm Mode, and `SeError::RebootUnsuccessful` if it did not settle
+/// into the requested mode within the reboot delay.
 pub(crate) fn send_startup<SPI, W>
 (
     spi: &mut SPI,
@@ -610,6 +624,20 @@ where
     if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
     {
         return Err(SeError::L2(L2Error::BadFrame));
+    }
+
+    wait.delay_ms(REBOOT_DELAY_MS).map_err(|_| SeError::L1(L1Error::Bus))?;
+    let status = l1::read_chip_status(spi, wait)?;
+    if status & l1::CHIP_STATUS_ALARM != 0
+    {
+        return Err(SeError::L1(L1Error::Alarm));
+    }
+
+    let in_startup = status & l1::CHIP_STATUS_STARTUP != 0;
+    let want_startup = matches!(startup_id, StartupId::MaintenanceReboot);
+    if in_startup != want_startup
+    {
+        return Err(SeError::RebootUnsuccessful);
     }
     Ok(())
 }

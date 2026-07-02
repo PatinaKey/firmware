@@ -995,6 +995,12 @@ impl SpiDevice for ChipMockSpi
             {
                 self.handle_read(status, out);
             }
+            [Operation::TransferInPlace(status)] =>
+            {
+                // send_startup's post-reboot CHIP_STATUS poll: report READY
+                // (Application). This mock drives no maintenance-reboot path.
+                status[0] = 0x01;
+            }
             _ =>
             {}
         }
@@ -1072,6 +1078,12 @@ impl SpiDevice for ScriptedSpi
                     }
                 }
             }
+            [Operation::TransferInPlace(status)] =>
+            {
+                // send_startup's post-reboot CHIP_STATUS poll: report READY
+                // (Application). This mock drives no maintenance-reboot path.
+                status[0] = 0x01;
+            }
             _ =>
             {}
         }
@@ -1147,6 +1159,15 @@ impl SpiDevice for RecordingSpi
                     }
                 }
             }
+            [Operation::TransferInPlace(status)] =>
+            {
+                // send_startup's post-reboot CHIP_STATUS poll. Report the mode
+                // the LAST Startup_Req asked for: a MaintenanceReboot (startup_id
+                // 0x03 at frame offset 2) settles into Maintenance (READY+STARTUP
+                // = 0x05), any other into Application (READY = 0x01).
+                let sid = self.writes.last().and_then(|w| w.get(2)).copied();
+                status[0] = if sid == Some(0x03) { 0x05 } else { 0x01 };
+            }
             _ =>
             {}
         }
@@ -1184,6 +1205,7 @@ pub(crate) struct FwUpdateSpi
     version_response: [u8; 4],
     bank_version: [u8; 4],
     bank_header_len: usize,
+    last_startup_id: u8,
 }
 
 impl FwUpdateSpi
@@ -1205,6 +1227,8 @@ impl FwUpdateSpi
             bank_version: FW_UPDATE_DEFAULT_VERSION,
             // A populated 52-byte BOOT_V2 header by default.
             bank_header_len: 52,
+            // Set on each Startup_Req: drives the post-reboot mode poll.
+            last_startup_id: 0,
         }
     }
 
@@ -1341,6 +1365,9 @@ impl FwUpdateSpi
             Ok(L2ReqId::Startup) =>
             {
                 self.b3_count += 1;
+                // Startup_Req REQ_DATA = STARTUP_ID(1). Record it so the
+                // post-reboot CHIP_STATUS poll reports the matching mode.
+                self.last_startup_id = data.first().copied().unwrap_or(0);
                 self.ack_or_fail(self.b3_count, self.gen_err_on_nth_b3);
             }
             Ok(L2ReqId::MutableFwUpdate) =>
@@ -1407,6 +1434,14 @@ impl SpiDevice for FwUpdateSpi
             {
                 self.handle_read(status, out);
             }
+            [Operation::TransferInPlace(status)] =>
+            {
+                // send_startup's post-reboot CHIP_STATUS poll. Report the mode
+                // the last Startup_Req asked for: MaintenanceReboot (0x03)
+                // settles into Maintenance (READY+STARTUP = 0x05), Reboot (0x01)
+                // into Application (READY = 0x01).
+                status[0] = if self.last_startup_id == 0x03 { 0x05 } else { 0x01 };
+            }
             _ =>
             {}
         }
@@ -1456,6 +1491,79 @@ impl SpiDevice for StatusSpi
             && let Some(b) = buf.first_mut()
         {
             *b = self.status;
+        }
+        Ok(())
+    }
+}
+
+/// A `SpiDevice` for the `send_startup` settle-and-verify path.
+///
+/// Replays queued ack frames on the two-op GET_RESPONSE read (like
+/// `ScriptedSpi`) and answers the single-op post-reboot CHIP_STATUS poll with a
+/// FIXED byte, so a test can force any settled mode (Application / Maintenance /
+/// Alarm) after a `Startup_Req` ack, independent of the reboot direction the
+/// driver asked for.
+pub(crate) struct RebootModeSpi
+{
+    frames: VecDeque<Vec<u8>>,
+    poll_status: u8,
+}
+
+impl RebootModeSpi
+{
+    /// Builds a mock that replays `frames` on reads and reports `poll_status` as
+    /// the post-reboot CHIP_STATUS byte.
+    pub(crate) fn new(frames: Vec<Vec<u8>>, poll_status: u8) -> Self
+    {
+        RebootModeSpi
+        {
+            frames: frames.into_iter().collect(),
+            poll_status,
+        }
+    }
+}
+
+impl ErrorType for RebootModeSpi
+{
+    type Error = MockSpiError;
+}
+
+impl SpiDevice for RebootModeSpi
+{
+    fn transaction
+    (
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    )
+    -> Result<(), Self::Error>
+    {
+        match operations
+        {
+            [Operation::Write(_)] =>
+            {}
+            [Operation::TransferInPlace(status), Operation::Read(out)] =>
+            {
+                match self.frames.pop_front()
+                {
+                    Some(f) =>
+                    {
+                        status[0] = 0x01; // READY
+                        out[..f.len()].copy_from_slice(&f);
+                    }
+                    None =>
+                    {
+                        status[0] = 0x00;
+                        out[0] = 0xFF; // NO_RESP sentinel
+                    }
+                }
+            }
+            [Operation::TransferInPlace(status)] =>
+            {
+                // The post-reboot CHIP_STATUS poll: report the forced mode byte.
+                status[0] = self.poll_status;
+            }
+            _ =>
+            {}
         }
         Ok(())
     }

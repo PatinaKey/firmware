@@ -192,6 +192,12 @@ pub enum SeError
     /// does not match the supplied image. The bank was written but holds an
     /// unexpected version.
     FwVersionMismatch,
+    /// A `Startup_Req` was acknowledged but the chip did not settle into the
+    /// requested mode within the reboot delay: a `MaintenanceReboot` did not
+    /// reach Start-up (Maintenance) Mode, or a `Reboot` did not reach
+    /// Application Mode. Mirrors libtropic `LT_REBOOT_UNSUCCESSFUL`
+    /// (`lt_reboot`). Recoverable: the chip stays reachable, retry the reboot.
+    RebootUnsuccessful,
 }
 
 impl From<L1Error> for L2Error
