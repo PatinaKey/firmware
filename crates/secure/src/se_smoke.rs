@@ -24,6 +24,8 @@ use mcu_spi::CycleWait;
 use mcu_spi::MmioSpiBus;
 use mcu_spi::Spi1Device;
 use tropic01_driver::ChipMode;
+use tropic01_driver::L1Error;
+use tropic01_driver::L2Error;
 use tropic01_driver::NoSession;
 use tropic01_driver::SeError;
 use tropic01_driver::Tropic01;
@@ -75,8 +77,12 @@ pub(crate) fn se_error_code(err: SeError) -> u32
 {
     let code: u8 = match err
     {
-        SeError::L1(_) => 0x11,
-        SeError::L2(_) => 0x12,
+        SeError::L1(l1) => l1_diag_code(l1),
+        SeError::L2(L2Error::Crc) => 0xE1,
+        SeError::L2(L2Error::BadFrame) => 0xE2,
+        SeError::L2(L2Error::ShortFrame) => 0xE3,
+        SeError::L2(L2Error::Status(s)) => s as u8,
+        SeError::L2(L2Error::L1(l1)) => l1_diag_code(l1),
         SeError::L3(_) => 0x13,
         SeError::Handshake(_) => 0x20,
         SeError::Cert(_) => 0x30,
@@ -87,8 +93,21 @@ pub(crate) fn se_error_code(err: SeError) -> u32
         SeError::Image(_) => 0x60,
         SeError::FwUpdateIncomplete => 0x61,
         SeError::FwVersionMismatch => 0x62,
+        SeError::RebootUnsuccessful => 0x63,
     };
     code as u32
+}
+
+/// Diagnostic: maps an L1 error to a distinct low-byte code (bring-up only).
+fn l1_diag_code(l1: L1Error) -> u8
+{
+    match l1
+    {
+        L1Error::Bus => 0xE4,
+        L1Error::ChipBusy => 0xE5,
+        L1Error::Alarm => 0xE6,
+        L1Error::BadChipStatus => 0xE7,
+    }
 }
 
 /// Builds a fresh no-session TROPIC01 handle over the real SPI1.
