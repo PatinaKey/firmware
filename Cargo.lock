@@ -751,10 +751,12 @@ dependencies = [
  "cc",
  "cortex-m",
  "cortex-m-rt",
+ "ed25519-dalek",
  "mcu-spi",
  "panic-halt",
  "platform",
  "tropic01-driver",
+ "zeroize",
 ]
 
 [[package]]

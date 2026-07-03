@@ -82,14 +82,23 @@ fn main() -> Result<(), Box<dyn Error>>
     // gets an extra EXTERN to root its veneer. When off, neither exists, so the
     // product build is byte-unchanged and no undefined EXTERN can dangle.
     let fw_update = env::var_os("CARGO_FEATURE_SE_FW_UPDATE").is_some();
+    // The L3 session veneer is feature-gated the same way: any
+    // combination of se-fw-update and se-session is valid.
+    let se_session = env::var_os("CARGO_FEATURE_SE_SESSION").is_some();
 
     // 1. Emit the linker scripts and add them to the search path. The sgstubs
-    //    fragment gets the fw-update EXTERN appended only under the feature.
+    //    fragment gets the fw-update / session EXTERNs appended only under their
+    //    features.
     fs::write(out_dir.join("memory.x"), include_bytes!("memory.x"))?;
     let mut sgstubs = Vec::from(*include_bytes!("sgstubs.x"));
     if fw_update
     {
         sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_fw_update);\n");
+    }
+    if se_session
+    {
+        sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_session_ping);\n");
+        sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_crypto);\n");
     }
     fs::write(out_dir.join("sgstubs.x"), sgstubs)?;
     println!("cargo:rustc-link-search={}", out_dir.display());
@@ -121,6 +130,11 @@ fn main() -> Result<(), Box<dyn Error>>
     {
         // Gate the fw-update veneer in the C shim behind the same feature.
         build.define("PATINAKEY_SE_FW_UPDATE", None);
+    }
+    if se_session
+    {
+        // Gate the L3 session veneer in the C shim behind the same feature.
+        build.define("PATINAKEY_SE_SESSION", None);
     }
     build.compile("patinakey_nsc");
 

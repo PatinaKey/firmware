@@ -14,6 +14,11 @@ description = "STM32U545 non-secure (TZ-NS) firmware binary: minimal skeleton (b
 # with the secure crate's matching feature (the veneer is emitted secure-side).
 default = []
 se-fw-update = []
+# se-session: declares and calls the L3 session NSC veneer and logs the decoded
+# outcome, then busy-drains RTT so the final line is not dropped before the host
+# reads it. OFF by default, so the NS entry is unchanged. Must be built together
+# with the secure crate's matching feature (the veneer is emitted secure-side).
+se-session = []
 
 [dependencies]
 

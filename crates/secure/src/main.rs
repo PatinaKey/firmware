@@ -34,6 +34,18 @@ mod se_smoke;
 #[cfg(all(target_os = "none", feature = "se-fw-update"))]
 mod se_fw_update;
 
+// The L3 secure-channel bring-up path (secure side of the session veneer).
+// Feature-gated: OFF by default, so the product firmware is byte-unchanged and
+// never references it.
+#[cfg(all(target_os = "none", feature = "se-session"))]
+mod se_session;
+
+// The crypto + attestation bring-up path (secure side of the crypto veneer).
+// Feature-gated under the se-session feature: OFF by default, so the
+// product firmware is byte-unchanged and never references it.
+#[cfg(all(target_os = "none", feature = "se-session"))]
+mod se_crypto;
+
 #[cfg(target_os = "none")]
 mod firmware
 {

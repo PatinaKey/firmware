@@ -73,3 +73,8 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = "deny"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

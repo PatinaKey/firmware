@@ -15,6 +15,13 @@ description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone
 # the whole path on.
 default = []
 se-fw-update = []
+# se-session: adds the L3 secure-channel bring-up path (secure body plus its NSC
+# veneer). Reads STPUB, opens a Noise KK1 session against slot 0, runs one L3
+# Ping with an echo compare, then aborts.
+# Also adds a crypto + attestation bring-up path (se_crypto.rs): it turns on the
+# driver attestation feature (chain verify to the pinned root) and links
+# ed25519-dalek to verify an SE-produced EdDSA signature on-host.
+se-session = ["tropic01-driver/attestation", "dep:ed25519-dalek"]
 
 [dependencies]
 platform = { path = "../platform" }
@@ -32,6 +39,9 @@ cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
 mcu-spi = { path = "../mcu-spi" }
 tropic01-driver = { path = "../tropic01-driver", default-features = false }
+zeroize = { workspace = true }
+# Pulled in only by the se-session feature.
+ed25519-dalek = { workspace = true, optional = true }
 
 # Lint quarantine: this bin holds the untestable MMIO wiring (it instantiates the
 # real MmioBus), so it overrides the workspace `unsafe_code = forbid` to `deny`

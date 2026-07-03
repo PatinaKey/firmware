@@ -69,3 +69,32 @@ __attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_fw_update(void)
     return patinakey_se_fw_update();
 }
 #endif /* PATINAKEY_SE_FW_UPDATE */
+
+/* L3 secure-channel bring-up veneer. Feature-gated (build.rs defines
+ * PATINAKEY_SE_SESSION only under the se-session cargo feature), so the default
+ * product build never emits it. The Rust secure body (src/se_session.rs) reads
+ * STPUB, opens a Noise KK1 session against slot 0, runs one L3 Ping with an echo
+ * compare, aborts, and packs the outcome (which step, success or failure) into a
+ * uint32_t.
+*/
+#ifdef PATINAKEY_SE_SESSION
+extern uint32_t patinakey_se_session_ping(void);
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_session_ping(void)
+{
+    return patinakey_se_session_ping();
+}
+
+/* Crypto + attestation bring-up veneer.
+ * The Rust secure body (src/se_crypto.rs) verifies the chip cert chain
+ * to the pinned production root, opens a session on the verified STPUB, runs the
+ * TRNG / Ed25519 / P-256 sequence, aborts, and packs the outcome (which step,
+ * success or failure) into a uint32_t.
+*/
+extern uint32_t patinakey_se_crypto(void);
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_crypto(void)
+{
+    return patinakey_se_crypto();
+}
+#endif /* PATINAKEY_SE_SESSION */

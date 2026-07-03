@@ -86,6 +86,11 @@ pub(crate) fn se_error_code(err: SeError) -> u32
         SeError::L3(_) => 0x13,
         SeError::Handshake(_) => 0x20,
         SeError::Cert(_) => 0x30,
+        // The chain-verify error variant is compiled into the driver whenever the
+        // driver attestation feature is on (the crypto path verifies the chain to
+        // the pinned root).
+        #[cfg(feature = "se-session")]
+        SeError::Chain(_) => 0x31,
         SeError::SessionLost => 0x40,
         SeError::NonceExhausted => 0x41,
         SeError::InvalidArgument => 0x50,
@@ -94,6 +99,16 @@ pub(crate) fn se_error_code(err: SeError) -> u32
         SeError::FwUpdateIncomplete => 0x61,
         SeError::FwVersionMismatch => 0x62,
         SeError::RebootUnsuccessful => 0x63,
+        // Catch-all arm to handle Cargo feature unification.
+        // If another crate in the workspace enables the driver's attestation feature,
+        // the `SeError::Chain` variant is globally compiled into the enum. 
+        // Since we cannot `#[cfg]` check other crates' features, this match would 
+        // fail to compile (E0004) if our own `se-session` feature is off.
+        //
+        // This wildcard ensures the match remains exhaustive across all workspace builds.
+        // We use `allow(unreachable_patterns)` to silence the warning when it's not needed.
+        #[allow(unreachable_patterns)]
+        _ => 0x7F,
     };
     code as u32
 }

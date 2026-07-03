@@ -45,6 +45,24 @@ mod firmware
         fn patinakey_nsc_se_fw_update() -> u32;
     }
 
+    // The L3 session veneer is feature-gated: it is only emitted secure-side
+    // under the matching feature.
+    #[cfg(feature = "se-session")]
+    #[allow(unsafe_code)]
+    unsafe extern "C"
+    {
+        fn patinakey_nsc_se_session_ping() -> u32;
+    }
+
+    // The crypto + attestation veneer rides the SAME se-session feature: it is
+    // only emitted secure-side under that feature.
+    #[cfg(feature = "se-session")]
+    #[allow(unsafe_code)]
+    unsafe extern "C"
+    {
+        fn patinakey_nsc_se_crypto() -> u32;
+    }
+
     // CROSS-CRATE COUPLING: SMOKE_ERR / SMOKE_OK MUST match the encoding produced
     // on the secure side (crates/secure/src/se_smoke.rs). The two crates do not
     // share a type, so the bit layout is duplicated by hand and the two copies must
@@ -86,6 +104,76 @@ mod firmware
             // Verify failed: banks written, a re-run recovers.
             4 => ("verify", true),
             _ => ("unknown", false),
+        }
+    }
+
+    // CROSS-CRATE COUPLING: the L3-session status-word bit layout below MUST
+    // match the encoding produced on the secure side
+    // (crates/secure/src/se_session.rs). The two crates do not share a type, so
+    // it is duplicated by hand and the two copies must stay in sync.
+
+    /// Session word bit set when the secure side reports the L3 bring-up failed.
+    /// Bits 15..8 then carry the step, bits 7..0 the error code (or 0xF0, an echo
+    /// mismatch, which is not an SeError).
+    #[cfg(feature = "se-session")]
+    const SES_ERR: u32 = 1 << 31;
+    /// Session word bit set when the L3 bring-up succeeded. The low byte carries
+    /// the OK marker.
+    #[cfg(feature = "se-session")]
+    const SES_OK: u32 = 1 << 8;
+
+    /// Decodes an L3-session failing-step code into a static label. Steps mirror
+    /// se_session.rs: 1 read-stpub, 2 open-session, 3 ping, 4 session-abort.
+    #[cfg(feature = "se-session")]
+    fn ses_step(step: u32) -> &'static str
+    {
+        match step
+        {
+            1 => "read-stpub",
+            2 => "open-session",
+            3 => "ping",
+            4 => "session-abort",
+            _ => "unknown",
+        }
+    }
+
+    // CROSS-CRATE COUPLING: the crypto status-word bit layout below MUST match
+    // the encoding produced on the secure side (crates/secure/src/se_crypto.rs).
+    // The two crates do not share a type, so it is duplicated by hand and the two
+    // copies must stay in sync.
+
+    /// Crypto word bit set when the secure side reports the bring-up failed. Bits
+    /// 15..8 then carry the step, bits 7..0 the error code. RESERVED non-SeError
+    /// low-byte codes: 0xF1 EdDSA verify reject, 0xF2 random sanity, 0xF3 ECDSA
+    /// shape, 0xF4 pubkey length.
+    #[cfg(feature = "se-session")]
+    const SCR_ERR: u32 = 1 << 31;
+    /// Crypto word bit set when the bring-up succeeded. The low byte carries the
+    /// OK marker.
+    #[cfg(feature = "se-session")]
+    const SCR_OK: u32 = 1 << 8;
+
+    /// Decodes a crypto failing-step code into a static label. Steps mirror
+    /// se_crypto.rs: 1 attestation, 2 open-session, 3 random, 4 pre-clean, 5
+    /// ed25519-generate, 6 ed25519-pubkey, 7 eddsa-sign, 8 eddsa-verify, 9
+    /// ed25519-erase, 10 ecdsa-p256, 11 session-abort.
+    #[cfg(feature = "se-session")]
+    fn crypto_step(step: u32) -> &'static str
+    {
+        match step
+        {
+            1 => "attestation",
+            2 => "open-session",
+            3 => "random",
+            4 => "pre-clean",
+            5 => "ed25519-generate",
+            6 => "ed25519-pubkey",
+            7 => "eddsa-sign",
+            8 => "eddsa-verify",
+            9 => "ed25519-erase",
+            10 => "ecdsa-p256",
+            11 => "session-abort",
+            _ => "unknown",
         }
     }
 
@@ -195,6 +283,78 @@ mod firmware
             else
             {
                 defmt::warn!("SE fw-update word unrecognized {=u32:#010x}", fwu);
+            }
+        }
+
+        // Feature-gated: run the L3 secure-channel bring-up and log the decoded
+        // outcome (which step, success plus the OK marker, or the failure plus
+        // its error code).
+        #[cfg(feature = "se-session")]
+        {
+            // SAFETY: the session veneer is a CMSE secure-gateway entry taking
+            // no argument and returning a scalar. Calling it crosses into the
+            // secure world through the SG veneer. No pointer or caller memory is
+            // shared, so there is nothing to validate on either side.
+            let ses = unsafe { patinakey_nsc_se_session_ping() };
+
+            if ses & SES_ERR != 0
+            {
+                // The low byte is the SeError code, or 0xF0 = echo mismatch (a
+                // good L3 reply that did not echo the Ping payload).
+                defmt::error!
+                (
+                    "SE L3 session FAILED at step {=str}, error code {=u8:#04x}",
+                    ses_step((ses >> 8) & 0xFF),
+                    ses as u8
+                );
+            }
+            else if ses & SES_OK != 0
+            {
+                defmt::info!("SE L3 session + Ping OK, marker {=u8:#04x}", ses as u8);
+            }
+            else
+            {
+                defmt::warn!("SE L3 session word unrecognized {=u32:#010x}", ses);
+            }
+
+            // Crypto + attestation bring-up, run AFTER the session ping. It
+            // verifies the chain to the pinned root, opens a session on the
+            // verified STPUB, and runs the TRNG / Ed25519 / P-256 sequence.
+            //
+            // SAFETY: the crypto veneer is a CMSE secure-gateway entry taking no
+            // argument and returning a scalar. Calling it crosses into the secure
+            // world through the SG veneer. No pointer or caller memory is shared,
+            // so there is nothing to validate on either side.
+            let scr = unsafe { patinakey_nsc_se_crypto() };
+
+            if scr & SCR_ERR != 0
+            {
+                // The low byte is the SeError code, or a RESERVED code: 0xF1
+                // EdDSA verify reject, 0xF2 random sanity, 0xF3 ECDSA shape, 0xF4
+                // pubkey length.
+                defmt::error!
+                (
+                    "SE crypto FAILED at step {=str}, error code {=u8:#04x}",
+                    crypto_step((scr >> 8) & 0xFF),
+                    scr as u8
+                );
+            }
+            else if scr & SCR_OK != 0
+            {
+                defmt::info!("SE crypto + attestation OK, marker {=u8:#04x}", scr as u8);
+            }
+            else
+            {
+                defmt::warn!("SE crypto word unrecognized {=u32:#010x}", scr);
+            }
+
+            // defmt-rtt is non-blocking and the core reaching wfi immediately
+            // after the final line can drop it before the host drains RTT. Busy
+            // spin a bounded count (about 4 s at 4 MHz MSI) so the host has time
+            // to read the buffer. Bring-up only, gated with the feature.
+            for _ in 0..16_000_000u32
+            {
+                cortex_m::asm::nop();
             }
         }
 
