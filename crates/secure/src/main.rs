@@ -46,6 +46,18 @@ mod se_session;
 #[cfg(all(target_os = "none", feature = "se-session"))]
 mod se_crypto;
 
+// The persistent-but-reversible state bring-up path. 
+// Feature-gated under the se-session feature: OFF by default, so the
+// product firmware is byte-unchanged and never references it.
+#[cfg(all(target_os = "none", feature = "se-session"))]
+mod se_persist;
+
+// The read-only sweep plus P-256 export path.
+// Feature-gated under the se-session feature: OFF by default, so the
+// product firmware is byte-unchanged and never references it.
+#[cfg(all(target_os = "none", feature = "se-session"))]
+mod se_readonly;
+
 #[cfg(target_os = "none")]
 mod firmware
 {

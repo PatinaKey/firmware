@@ -63,6 +63,27 @@ mod firmware
         fn patinakey_nsc_se_crypto() -> u32;
     }
 
+    // The persistent-but-reversible state veneer rides the SAME se-session
+    // feature: it is only emitted secure-side under that feature.
+    #[cfg(feature = "se-session")]
+    #[allow(unsafe_code)]
+    unsafe extern "C"
+    {
+        fn patinakey_nsc_se_persist() -> u32;
+    }
+
+    // The read-only sweep plus P-256 export veneer rides the SAME se-session
+    // feature. The exported record is too
+    // big for a u32, so the secure side writes it to the pinned shared non-secure
+    // output window (SHARED_OUT below) at a fixed compile-time address. 
+    // This side reads that window after the veneer returns.
+    #[cfg(feature = "se-session")]
+    #[allow(unsafe_code)]
+    unsafe extern "C"
+    {
+        fn patinakey_nsc_se_readonly() -> u32;
+    }
+
     // CROSS-CRATE COUPLING: SMOKE_ERR / SMOKE_OK MUST match the encoding produced
     // on the secure side (crates/secure/src/se_smoke.rs). The two crates do not
     // share a type, so the bit layout is duplicated by hand and the two copies must
@@ -173,6 +194,132 @@ mod firmware
             9 => "ed25519-erase",
             10 => "ecdsa-p256",
             11 => "session-abort",
+            _ => "unknown",
+        }
+    }
+
+    // CROSS-CRATE COUPLING: the persist status-word bit layout below MUST match
+    // the encoding produced on the secure side (crates/secure/src/se_persist.rs).
+    // The two crates do not share a type, so it is duplicated by hand and the two
+    // copies must stay in sync.
+
+    /// Persist word bit set when the secure side reports the bring-up failed. Bits
+    /// 15..8 then carry the step, bits 7..0 the error code. RESERVED non-SeError
+    /// low-byte codes: 0xF5 mcounter value mismatch, 0xF6 mcounter zero-boundary
+    /// surprise, 0xF7 MAC-and-Destroy determinism mismatch, 0xF8 pubkey KAT
+    /// mismatch, 0xF9 EdDSA verify reject, 0xFA post-erase sign unexpectedly Ok.
+    #[cfg(feature = "se-session")]
+    const SPR_ERR: u32 = 1 << 31;
+    /// Persist word bit set when the bring-up succeeded. The low byte carries the
+    /// OK marker.
+    #[cfg(feature = "se-session")]
+    const SPR_OK: u32 = 1 << 8;
+
+    /// Decodes a persist failing-step code into a static label. Steps mirror
+    /// se_persist.rs: 1 open-session, 2 mcounter-init, 3 mcounter-get, 4
+    /// mcounter-update, 5 mcounter-reinit, 6 mcounter-zero, 7 mac-and-destroy, 8
+    /// pre-clean, 9 ecc-store, 10 ecc-pubkey, 11 ecc-sign, 12 ecc-erase, 13
+    /// post-erase, 14 session-abort.
+    #[cfg(feature = "se-session")]
+    fn persist_step(step: u32) -> &'static str
+    {
+        match step
+        {
+            1 => "open-session",
+            2 => "mcounter-init",
+            3 => "mcounter-get",
+            4 => "mcounter-update",
+            5 => "mcounter-reinit",
+            6 => "mcounter-zero",
+            7 => "mac-and-destroy",
+            8 => "pre-clean",
+            9 => "ecc-store",
+            10 => "ecc-pubkey",
+            11 => "ecc-sign",
+            12 => "ecc-erase",
+            13 => "post-erase",
+            14 => "session-abort",
+            _ => "unknown",
+        }
+    }
+
+    // CROSS-CRATE COUPLING: the read-only status-word bit layout and record byte
+    // layout below MUST match the encoding produced on the secure side
+    // (crates/secure/src/se_readonly.rs). The two crates do not share a type, so
+    // it is duplicated by hand and the two copies must stay in sync.
+
+    /// Read-only word bit set when the secure side reports the sweep failed. Bits
+    /// 15..8 then carry the step, bits 7..0 the error code. RESERVED non-SeError
+    /// low-byte codes: 0xFB prod0 pubkey mismatch, 0xFD slot not empty, 0xFE
+    /// length surprise.
+    #[cfg(feature = "se-session")]
+    const RDO_ERR: u32 = 1 << 31;
+    /// Read-only word bit set when the sweep succeeded. The low byte carries the
+    /// OK marker.
+    #[cfg(feature = "se-session")]
+    const RDO_OK: u32 = 1 << 8;
+
+    /// Total exported-record length. Matches `RECORD_LEN` in se_readonly.rs.
+    #[cfg(feature = "se-session")]
+    const RDO_RECORD_LEN: usize = 540;
+
+    /// Pinned shared non-secure OUTPUT window: the fixed RAM block the secure
+    /// read-only veneer writes the exported record into. It is placed in the
+    /// dedicated `.shared_out` linker section (crates/nonsecure/memory.x), which
+    /// pins it at 0x2002_FC00, the top 1 KiB of the NS SRAM half. The main RAM
+    /// region is shrunk so no stack, static, or embassy allocation overlaps it.
+    ///
+    /// HAND-SYNCED PIN: the section address MUST match SHARED_OUT_ADDR in
+    /// se_readonly.rs and MPU_NS_SHARED_BASE in platform map.rs (the 4th secure
+    /// MPU region). The buffer is 1 KiB, larger than RDO_RECORD_LEN, and sits at
+    /// the region base, so the secure write lands at its start.
+    //
+    // QUARANTINE: This allow opts in the pinned `link_section` placement of the shared output buffer.
+    #[cfg(feature = "se-session")]
+    #[allow(unsafe_code)]
+    #[unsafe(link_section = ".shared_out")]
+    static mut SHARED_OUT: [u8; 1024] = [0u8; 1024];
+
+    /// The four-byte record magic ("PK54"). Matches `RECORD_MAGIC` in
+    /// se_readonly.rs. The secure side writes it at offset 0, and this side checks
+    /// it before trusting the rest of the record.
+    #[cfg(feature = "se-session")]
+    const RDO_MAGIC: [u8; 4] = [0x50, 0x4B, 0x35, 0x34];
+
+    /// Record field offsets, matching the layout in se_readonly.rs. The operator
+    /// pipes the P-256 public key, signature, and digest to the host verifier.
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_CHIP_ID: usize = 4;
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_PAIRING0: usize = 132;
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_P256_PUB: usize = 164;
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_P256_SIG: usize = 228;
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_DIGEST: usize = 292;
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_R_CONFIG: usize = 324;
+    #[cfg(feature = "se-session")]
+    const RDO_OFF_I_CONFIG: usize = 432;
+
+    /// Decodes a read-only failing-step code into a static label. Steps mirror
+    /// se_readonly.rs: 1 chip-id, 2 open-session, 3 pairing, 4 r-config, 5
+    /// i-config, 6 rmem-read, 7 rmem-erase, 8 p256, 9 session-abort.
+    #[cfg(feature = "se-session")]
+    fn rdo_step(step: u32) -> &'static str
+    {
+        match step
+        {
+            1 => "chip-id",
+            2 => "open-session",
+            3 => "pairing",
+            4 => "r-config",
+            5 => "i-config",
+            6 => "rmem-read",
+            7 => "rmem-erase",
+            8 => "p256",
+            9 => "session-abort",
             _ => "unknown",
         }
     }
@@ -346,6 +493,95 @@ mod firmware
             else
             {
                 defmt::warn!("SE crypto word unrecognized {=u32:#010x}", scr);
+            }
+
+            // Persistent-but-reversible state bring-up, run after the crypto
+            // veneer. It opens a session and exercises the monotonic counters,
+            // MAC-and-Destroy, and ECC_Key_Store, all reversible (no OTP, config,
+            // or pairing write).
+            //
+            // SAFETY: No pointer or caller memory is shared,
+            // so there is nothing to validate on either side.
+            let spr = unsafe { patinakey_nsc_se_persist() };
+
+            if spr & SPR_ERR != 0
+            {
+                // The low byte is the SeError code, or a RESERVED code: 0xF5
+                // mcounter value mismatch, 0xF6 mcounter zero-boundary surprise,
+                // 0xF7 MAC-and-Destroy determinism mismatch, 0xF8 pubkey KAT
+                // mismatch, 0xF9 EdDSA verify reject, 0xFA post-erase sign Ok.
+                defmt::error!
+                (
+                    "SE persistent state FAILED at step {=str}, error code {=u8:#04x}",
+                    persist_step((spr >> 8) & 0xFF),
+                    spr as u8
+                );
+            }
+            else if spr & SPR_OK != 0
+            {
+                defmt::info!("SE persistent state OK, marker {=u8:#04x}", spr as u8);
+            }
+            else
+            {
+                defmt::warn!("SE persistent state word unrecognized {=u32:#010x}", spr);
+            }
+
+            // Read-only sweep plus P-256 export, run after the persist veneer. It
+            // takes no argument: the secure side writes the exported record to the
+            // pinned shared output window (SHARED_OUT) at a fixed compile-time
+            // address, so nothing is shared to validate.
+            //
+            // SAFETY: No pointer or caller memory is shared,
+            // so there is nothing to validate on either side.
+            let rdo = unsafe { patinakey_nsc_se_readonly() };
+
+            // Read the pinned shared window the secure world just wrote. Only the
+            // first RDO_RECORD_LEN bytes are meaningful. read_volatile forces the
+            // read (the compiler cannot see the cross-world write) and copies out
+            // of the static.
+            //
+            // SAFETY: SHARED_OUT is a valid, correctly-aligned NS static of 1024
+            // bytes at the pinned address. The secure veneer wrote the record there
+            // before returning. Only public bytes are read.
+            let record: [u8; 1024] = unsafe { core::ptr::read_volatile(&raw const SHARED_OUT) };
+
+            if rdo & RDO_ERR != 0
+            {
+                // The low byte is the SeError code, or a RESERVED code: 0xFB prod0
+                // pubkey mismatch, 0xFD slot not empty, 0xFE length surprise.
+                defmt::error!
+                (
+                    "SE read-only sweep FAILED at step {=str}, error code {=u8:#04x}",
+                    rdo_step((rdo >> 8) & 0xFF),
+                    rdo as u8
+                );
+            }
+            else if rdo & RDO_OK != 0 && record[0..RDO_MAGIC.len()] != RDO_MAGIC
+            {
+                // The status word says OK, but the record does not carry the magic
+                // tag: a corrupt or stale buffer. Do NOT log the fields as valid.
+                defmt::error!
+                (
+                    "SE read-only sweep OK but record magic mismatch, first bytes {=[u8]:02x}",
+                    record[0..RDO_MAGIC.len()]
+                );
+            }
+            else if rdo & RDO_OK != 0
+            {
+                defmt::info!("SE read-only sweep OK, marker {=u8:#04x}", rdo as u8);
+                // Log each record field over RTT as hex so the operator copies the
+                // P-256 fields to the host verifier. All bytes are public.
+                defmt::info!("chip id: {=[u8]:02x}", record[RDO_OFF_CHIP_ID..RDO_OFF_PAIRING0]);
+                defmt::info!("pairing0 pubkey: {=[u8]:02x}", record[RDO_OFF_PAIRING0..RDO_OFF_P256_PUB]);
+                defmt::info!("p256 pubkey X||Y: {=[u8]:02x}", record[RDO_OFF_P256_PUB..RDO_OFF_P256_SIG]);
+                defmt::info!("p256 signature r||s: {=[u8]:02x}", record[RDO_OFF_P256_SIG..RDO_OFF_DIGEST]);
+                defmt::info!("p256 digest: {=[u8]:02x}", record[RDO_OFF_DIGEST..RDO_OFF_R_CONFIG]);
+                defmt::info!("r-config dump: {=[u8]:02x}", record[RDO_OFF_R_CONFIG..RDO_OFF_I_CONFIG]);
+                defmt::info!("i-config dump: {=[u8]:02x}", record[RDO_OFF_I_CONFIG..RDO_RECORD_LEN]);
+            }
+            else
+            {
+                defmt::warn!("SE read-only sweep word unrecognized {=u32:#010x}", rdo);
             }
 
             // defmt-rtt is non-blocking and the core reaching wfi immediately

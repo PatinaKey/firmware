@@ -213,15 +213,17 @@ pub(crate) fn sau_table() -> Result<[SauRegion; SAU_PROGRAMMED_REGIONS], Partiti
 }
 
 // ===========================================================================
-// Secure MPU region table (PMSAv8, banked secure bank). Three regions over the
+// Secure MPU region table (PMSAv8, banked secure bank). Four regions over the
 // addresses the CPU ACTUALLY emits in the secure state: secure FLASH at
-// 0x0C00_0000, secure SRAM at 0x2000_0000 (NOT the 0x0E / 0x0C SRAM alias), and
+// 0x0C00_0000, secure SRAM at 0x2000_0000 (NOT the 0x0E / 0x0C SRAM alias), the
+// pinned non-secure shared output window near the top of the NS SRAM half, and
 // the secure peripheral aliases at 0x5xxx_xxxx. These match crates/secure/
-// memory.x. RM0456 memory map.
+// memory.x and crates/nonsecure/memory.x. RM0456 memory map.
 //
-// W^X / DEP intent: code is RX read-only (XN = 0), data and peripherals are RW
-// execute-never (XN = 1). With PRIVDEFENA = 0 there is no background map, so any
-// secure access outside these three regions faults.
+// W^X / DEP intent: code is RX read-only (XN = 0), data, the shared output
+// window, and peripherals are RW execute-never (XN = 1). With PRIVDEFENA = 0
+// there is no background map, so any secure access outside these four regions
+// faults.
 // ===========================================================================
 
 /// Secure code region base: secure FLASH Bank 1 alias. RM0456 memory map.
@@ -251,6 +253,33 @@ pub(crate) const MPU_PERIPH_BASE: u32 = 0x5000_0000;
 /// Secure peripheral region inclusive limit: covers RCC / GTZC / GPIO / SPI1 /
 /// crypto secure aliases. RM0456 memory map.
 pub(crate) const MPU_PERIPH_LIMIT: u32 = 0x5FFF_FFFF;
+
+// ===========================================================================
+// Pinned non-secure shared OUTPUT window. A fixed 1 KiB block at the very top of
+// the non-secure SRAM half, the ONLY non-secure RAM the secure core is granted
+// permission to write. A secure veneer that must return more than a u32 (an SE
+// data record) writes it here at a COMPILE-TIME address.
+//
+// HAND-SYNCED PIN: 
+// this base and limit MUST match the `SHARED_OUT` MEMORY region + `.shared_out` 
+// section in crates/nonsecure/memory.x AND the `SHARED_OUT_ADDR` / `SHARED_OUT_LEN`
+// constants in crates/secure/src/se_readonly.rs. The three copies are kept in
+// lock-step by hand because the crates share no type. Base 0x2002_FC00, length
+// 0x400, inclusive limit 0x2002_FFFF, all 32-byte aligned.
+//
+// SAU / GTZC: NO change is needed. The whole NS half [0x2002_0000, 0x2002_FFFF]
+// is already SAU-attributed non-secure (SAU region 2 above) and GTZC MPCBB NS,
+// so this window is already non-secure memory. The 4th MPU region below only
+// grants the SECURE CORE permission to write into that NS range.
+//
+// LEAST PRIVILEGE: the region covers ONLY the 1 KiB window, never the whole NS
+// half, so the secure core can write nowhere else in non-secure RAM.
+// ===========================================================================
+
+/// Non-secure shared output window base: top 1 KiB of the NS SRAM half.
+pub(crate) const MPU_NS_SHARED_BASE: u32 = 0x2002_FC00;
+/// Non-secure shared output window inclusive limit (1 KiB, ending at the NS top).
+pub(crate) const MPU_NS_SHARED_LIMIT: u32 = 0x2002_FFFF;
 
 // ===========================================================================
 // GPIO pin assignments (board pin map).
@@ -392,6 +421,27 @@ mod tests
         // Peripheral region covers the secure peripheral aliases.
         assert_eq!(MPU_PERIPH_BASE, 0x5000_0000);
         assert_eq!(MPU_PERIPH_LIMIT, 0x5FFF_FFFF);
+    }
+
+    #[test]
+    fn ns_shared_window_is_pinned_aligned_and_disjoint()
+    {
+        // Pinned base/limit, hand-synced with crates/nonsecure/memory.x and
+        // crates/secure/src/se_readonly.rs.
+        assert_eq!(MPU_NS_SHARED_BASE, 0x2002_FC00);
+        assert_eq!(MPU_NS_SHARED_LIMIT, 0x2002_FFFF);
+        // 32-byte granule: base low 5 bits clear, limit low 5 bits set.
+        assert_eq!(MPU_NS_SHARED_BASE & SAU_ALIGN_MASK, 0);
+        assert_eq!(MPU_NS_SHARED_LIMIT & SAU_ALIGN_MASK, SAU_ALIGN_MASK);
+        // 1 KiB window.
+        assert_eq!(MPU_NS_SHARED_LIMIT - MPU_NS_SHARED_BASE + 1, 1024);
+        // Entirely inside the non-secure half of SRAM1, ending at the NS top.
+        let in_ns_half = MPU_NS_SHARED_BASE >= SRAM1_NS_BASE;
+        assert!(in_ns_half, "shared window must start in the NS half");
+        assert_eq!(MPU_NS_SHARED_LIMIT, SRAM1_TOP);
+        // Strictly above the secure SRAM region, so the two never overlap.
+        let above_secure_sram = MPU_NS_SHARED_BASE > MPU_SRAM_LIMIT;
+        assert!(above_secure_sram, "shared window must not overlap secure SRAM");
     }
 
     #[test]

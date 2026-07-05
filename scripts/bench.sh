@@ -9,13 +9,19 @@
 # the defmt decoder attached, in a single command.
 #
 # Usage:
-#   scripts/bringup.sh            run     (default) build, flash both, live RTT
-#   scripts/bringup.sh run        same as the default
-#   scripts/bringup.sh flash      build, flash both, NO run, NO RTT
-#   scripts/bringup.sh detect     READ-ONLY probe and chip detection, no write
+#   scripts/bench.sh            run     (default) build, flash both, live RTT
+#   scripts/bench.sh run        same as the default
+#   scripts/bench.sh flash      build, flash both, NO run, NO RTT
+#   scripts/bench.sh detect     READ-ONLY probe and chip detection, no write
 #
 # Environment overrides:
 #   PROFILE=release|debug          cargo profile (default release)
+#   FEATURES=<cargo features>      space-separated cargo features applied to BOTH
+#                                  the secure and nonsecure builds (default none).
+#                                  The feature-gated SE bring-up veneers need
+#                                  FEATURES=se-session. A change of FEATURES or
+#                                  PROFILE since the last run forces the shared
+#                                  CMSE implib to regenerate (see below).
 #   CONNECT_UNDER_RESET=1|0        assert NRST while attaching (default 1)
 #   CHIP=<probe-rs chip>           target name (default STM32U545CEUx)
 #   DEFMT_LOG=<filter>             defmt log level baked at build time (default
@@ -66,6 +72,29 @@ OUT_DIR="target/${TARGET}/${PROFILE_DIR}"
 SECURE_ELF="${OUT_DIR}/secure"
 NONSECURE_ELF="${OUT_DIR}/nonsecure"
 
+# Optional cargo features applied to both crate builds. Held in an array so the
+# empty (no-feature) case expands to no argument. The SE bring-up veneers live
+# behind FEATURES=se-session.
+FEATURES="${FEATURES:-}"
+if [ -n "${FEATURES}" ]
+then
+    FEATURE_ARGS=(--features "${FEATURES}")
+else
+    FEATURE_ARGS=()
+fi
+
+# The shared CMSE import object lives at target/<triple>/patinakey_nsc_implib.o,
+# OUTSIDE the per-crate directory, and is re-emitted only when the secure crate
+# actually re-links. A cached secure build (feature or profile unchanged on disk
+# but different from what we now ask for) leaves a STALE implib, so the nonsecure
+# link then fails with undefined veneer symbols. cargo clean -p secure does NOT
+# fix it (the implib is outside that dir and secure/build.rs regenerates it only
+# on a csrc change). The reliable trigger is to bump the C shim mtime, which makes
+# build.rs rerun and the secure link re-emit the implib. A stamp records the last
+# built PROFILE plus FEATURES so this cost is paid only on an actual change.
+IMPLIB_STAMP="target/${TARGET}/.bench_stamp"
+STAMP_VALUE="${PROFILE}:${FEATURES}"
+
 # Shared probe options. connect-under-reset asserts NRST during attach, which is
 # the reliable path on STM32U5 and the recovery path if a prior image wedged the
 # core. Set CONNECT_UNDER_RESET=0 only if NRST is not wired to the probe.
@@ -81,10 +110,26 @@ build_two_stage()
     # object exists. There is no cargo dependency edge between the two bins, so
     # the order is enforced here. nonsecure/build.rs fails loudly if the import
     # object is missing.
-    echo ">> build secure (${PROFILE_DIR})"
-    cargo build -p secure --target "${TARGET}" "${PROFILE_ARGS[@]}" --locked
-    echo ">> build nonsecure (${PROFILE_DIR})"
-    cargo build -p nonsecure --target "${TARGET}" "${PROFILE_ARGS[@]}" --locked
+    # If the build config changed since the last run, force the secure crate to
+    # re-link so the shared CMSE implib matches THIS feature or profile set. See
+    # the IMPLIB_STAMP comment above for why a bare rebuild can leave it stale.
+    local last_stamp=""
+    if [ -f "${IMPLIB_STAMP}" ]
+    then
+        last_stamp="$(cat "${IMPLIB_STAMP}")"
+    fi
+    if [ "${last_stamp}" != "${STAMP_VALUE}" ]
+    then
+        echo ">> build config changed (${last_stamp:-none} -> ${STAMP_VALUE}), forcing CMSE implib regen"
+        touch crates/secure/csrc/secure_nsc.c
+    fi
+    echo ">> build secure (${PROFILE_DIR})${FEATURES:+ [${FEATURES}]}"
+    cargo build -p secure --target "${TARGET}" "${PROFILE_ARGS[@]}" "${FEATURE_ARGS[@]}" --locked
+    echo ">> build nonsecure (${PROFILE_DIR})${FEATURES:+ [${FEATURES}]}"
+    cargo build -p nonsecure --target "${TARGET}" "${PROFILE_ARGS[@]}" "${FEATURE_ARGS[@]}" --locked
+    # Record the config that produced the current on-disk implib and images.
+    mkdir -p "target/${TARGET}"
+    printf '%s' "${STAMP_VALUE}" > "${IMPLIB_STAMP}"
 }
 
 # Retry an attach command. The ST-LINK connect-under-reset sequence is
@@ -159,7 +204,7 @@ case "${COMMAND}" in
         cmd_run
         ;;
     *)
-        echo "usage: scripts/bringup.sh [detect|flash|run]" >&2
+        echo "usage: scripts/bench.sh [detect|flash|run]" >&2
         exit 2
         ;;
 esac

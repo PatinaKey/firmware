@@ -7,7 +7,7 @@
 //! seam so the sequence is 100% host-testable.
 //!
 //! No background map: `MPU_CTRL.PRIVDEFENA` stays 0, so every secure access must
-//! match one of the three enabled regions or fault (strict least privilege). The
+//! match one of the four enabled regions or fault (strict least privilege). The
 //! SCS region 0xE000_E000-0xE000_EFFF is always Device + XN accessible regardless
 //! of the MPU, so the SAU / MPU / SCB registers need no region (PM0264 line 13199).
 //!
@@ -20,7 +20,7 @@ use crate::map;
 use crate::regs;
 
 /// The number of secure MPU regions programmed (of the 8 implemented).
-pub(crate) const MPU_PROGRAMMED_REGIONS: usize = 3;
+pub(crate) const MPU_PROGRAMMED_REGIONS: usize = 4;
 
 /// Data-access permission for a region (`MPU_RBAR.AP`).
 ///
@@ -145,7 +145,7 @@ impl MpuRegion
 
     /// The value to write to `MPU_RBAR`: BASE[31:5] | SH[4:3] | AP[2:1] | XN.
     ///
-    /// SH is fixed non-shareable (0b00) for all three regions.
+    /// SH is fixed non-shareable (0b00) for all four regions.
     pub(crate) const fn rbar(self) -> u32
     {
         // `base` is already 32-byte aligned (the constructor cleared the low 5
@@ -170,9 +170,14 @@ impl MpuRegion
 
 /// Builds the validated secure MPU region table in `MPU_RNR` order.
 ///
+/// Bases are strictly ascending, matching the RNR order:
 /// - R0 secure code: RX read-only (AP RO priv, XN allow), Normal memory.
 /// - R1 secure SRAM: RW execute-never (AP RW priv, XN never), Normal memory.
-/// - R2 secure peripherals: RW execute-never (AP RW priv, XN never), Device.
+/// - R2 non-secure shared output window: RW execute-never (AP RW priv, XN never),
+///   Normal memory. The ONE range in non-secure RAM the secure core may write.
+///   XN preserves W^X (the secure core never executes from non-secure RAM), and
+///   the region covers ONLY the pinned window.
+/// - R3 secure peripherals: RW execute-never (AP RW priv, XN never), Device.
 ///
 /// # Errors
 ///
@@ -198,7 +203,17 @@ pub(crate) fn mpu_table() -> Result<[MpuRegion; MPU_PROGRAMMED_REGIONS], Partiti
             Exec::Never,
             regs::MPU_ATTRINDX_NORMAL,
         )?,
-        // R2: secure peripherals, read-write execute-never device memory.
+        // R2: pinned non-secure shared output window, read-write execute-never
+        // (W^X: writable, never X). Grants the secure core permission to write
+        // this NS range.
+        MpuRegion::new(
+            map::MPU_NS_SHARED_BASE,
+            map::MPU_NS_SHARED_LIMIT,
+            Access::ReadWritePriv,
+            Exec::Never,
+            regs::MPU_ATTRINDX_NORMAL,
+        )?,
+        // R3: secure peripherals, read-write execute-never device memory.
         MpuRegion::new(
             map::MPU_PERIPH_BASE,
             map::MPU_PERIPH_LIMIT,
@@ -441,6 +456,24 @@ mod tests
     }
 
     #[test]
+    fn region_rbar_rlar_encode_ns_shared_region()
+    {
+        // R2 non-secure shared window: AP RW priv (0b00), XN never (1), SH 00,
+        // Normal index, base 0x2002_FC00, inclusive limit 0x2002_FFFF.
+        let r = MpuRegion::new(
+            0x2002_FC00,
+            0x2002_FFFF,
+            Access::ReadWritePriv,
+            Exec::Never,
+            regs::MPU_ATTRINDX_NORMAL,
+        )
+        .expect("valid");
+        // RBAR low bits: SH 00 | AP 00 | XN 1 = 0x1.
+        assert_eq!(r.rbar(), 0x2002_FC01);
+        assert_eq!(r.rlar(), 0x2002_FFE0 | regs::MPU_RLAR_EN);
+    }
+
+    #[test]
     fn exact_ordered_write_trace()
     {
         // The full trace is the contract: CTRL=0, MAIR0, then per region
@@ -456,6 +489,9 @@ mod tests
             (regs::MPU_RBAR, 0x2000_0001),
             (regs::MPU_RLAR, 0x2001_FFE0 | regs::MPU_RLAR_EN),
             (regs::MPU_RNR, 2),
+            (regs::MPU_RBAR, 0x2002_FC01),
+            (regs::MPU_RLAR, 0x2002_FFE0 | regs::MPU_RLAR_EN),
+            (regs::MPU_RNR, 3),
             (regs::MPU_RBAR, 0x5000_0001),
             (
                 regs::MPU_RLAR,
@@ -466,6 +502,20 @@ mod tests
             (regs::MPU_CTRL, regs::MPU_CTRL_ENABLE | regs::MPU_CTRL_HFNMIENA),
         ];
         assert_eq!(bus.writes(), expected.as_slice());
+    }
+
+    #[test]
+    fn region_bases_strictly_ascending_and_shared_disjoint()
+    {
+        // RNR order must follow strictly ascending region bases, and the shared
+        // non-secure window must not overlap the secure SRAM region.
+        let t = mpu_table().expect("table");
+        for pair in t.windows(2)
+        {
+            assert!(pair[0].base < pair[1].base, "region bases must ascend");
+        }
+        // R1 secure SRAM ends strictly below R2 shared-window base.
+        assert!(t[1].limit < t[2].base, "shared window must not overlap secure SRAM");
     }
 
     #[test]

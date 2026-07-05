@@ -99,6 +99,8 @@ fn main() -> Result<(), Box<dyn Error>>
     {
         sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_session_ping);\n");
         sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_crypto);\n");
+        sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_persist);\n");
+        sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_readonly);\n");
     }
     fs::write(out_dir.join("sgstubs.x"), sgstubs)?;
     println!("cargo:rustc-link-search={}", out_dir.display());

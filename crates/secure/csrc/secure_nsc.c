@@ -6,12 +6,13 @@
  * linker pins to the SAU Non-Secure-Callable window.
  *
  * SAFETY / boundary contract:
- *   - Every entry is value-in / value-out (scalar uint32_t only). No pointer,
- *     buffer, handle, secret, or non-secure function pointer crosses the
- *     boundary, so there is NO caller-supplied memory to validate (no
- *     cmse_check_address_range needed) and NO callback path back into NS.
- *   - The body holds zero logic and touches no secure state. It cannot fault on
- *     untrusted input because it takes none.
+ *   - Every entry takes a scalar uint32_t only. 
+ *     No buffer, handle, secret, or non-secure pointer crosses on ANY entry, so
+ *     there is NO caller memory to validate and NO callback path back into NS.
+ *     The feature-gated read-only sweep veneer returns an SE data record too big
+ *     for a u32, but it writes that record to a fixed compile-time non-secure
+ *     address (the pinned shared output window, see src/se_readonly.rs).
+ *   - The bodies hold zero logic and touch no secure state beyond forwarding.
  * Armv8-M secure gateway model, AN5347.
  */
 
@@ -96,5 +97,31 @@ extern uint32_t patinakey_se_crypto(void);
 __attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_crypto(void)
 {
     return patinakey_se_crypto();
+}
+
+/* Persistent-but-reversible state bring-up veneer.
+ * The Rust secure body (src/se_persist.rs) opens a session, exercises the
+ * monotonic counters, MAC-and-Destroy, and ECC_Key_Store, aborts, 
+ * and packs the outcome (which step, success or failure) into a uint32_t.
+*/
+extern uint32_t patinakey_se_persist(void);
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_persist(void)
+{
+    return patinakey_se_persist();
+}
+
+/* Read-only sweep plus P-256 export veneer.
+ * The exported record is too big for a uint32_t, so the Rust secure body
+ * (src/se_readonly.rs) writes it to a FIXED compile-time non-secure address (the
+ * pinned shared output window).
+ * The record holds only public bytes (pairing / ECC public keys, an ECDSA signature, 
+ * the digest, chip id, config dumps).
+*/
+extern uint32_t patinakey_se_readonly(void);
+
+__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_readonly(void)
+{
+    return patinakey_se_readonly();
 }
 #endif /* PATINAKEY_SE_SESSION */
