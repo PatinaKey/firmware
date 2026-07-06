@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 description = "STM32U545 embedded-flash driver implementing the fw-update dual-bank A/B FlashSeam in hand-rolled raw MMIO, behind a host-testable register seam."
 
 [dependencies]

@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 description = "STM32U545 blocking SPI1 master driver for the TROPIC01 secure element, behind a host-testable register seam."
 
 [dependencies]

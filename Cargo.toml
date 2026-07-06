@@ -32,15 +32,14 @@ hmac = { version = "0.13", default-features = false }
 # secret key and no secret-dependent path runs here, so the inputs are public
 # certificates and the failure modes are correctness, not side-channel leakage.
 #
-# These are RELEASE CANDIDATES on purpose. The crate tree already sits on the
-# RustCrypto digest 0.11 / crypto-common 0.2 generation (sha2 0.11, hmac 0.13).
-# The matching p384/p521/ecdsa releases that speak that same generation are still
-# release candidates. the last STABLE curve releases (p384 0.13, ecdsa 0.16) speak the older
-# digest 0.10 generation and would pull a SECOND copy of sha2/digest into the
-# binary. Pinning the rc keeps a single crypto generation, which is the smaller
-# audit and flash surface.
-# TODO: drop the -rc pins once p384/p521 0.14 and ecdsa 0.17 ship stable.
-ecdsa = { version = "0.17.0-rc.23", default-features = false }
+# The crate tree sits on the RustCrypto digest 0.11 / crypto-common 0.2
+# generation (sha2 0.11, hmac 0.13. p384 and p521 0.14 that speak the same
+# generation are STILL release candidates, and the last stable curve release
+# (p384 0.13) speaks the older digest 0.10 generation, which would pull a SECOND
+# copy of sha2/digest into the binary. Pinning the p384/p521 rc keeps a single
+# crypto generation, the smaller audit and flash surface.
+# TODO: drop the p384/p521 -rc pins once 0.14 ships stable.
+ecdsa = { version = "0.17", default-features = false }
 p384 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
 p521 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
 
@@ -64,8 +63,8 @@ cortex-m = "0.7.7"
 panic-halt = "1.0.0"
 # defmt + defmt-rtt: the SE bring-up report channel (defmt over RTT, read by
 # probe-rs over SWD).
-defmt = "1.0"
-defmt-rtt = "1.0"
+defmt = "1.1"
+defmt-rtt = "1.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

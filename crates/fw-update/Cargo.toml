@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 description = "no_std, fail-closed dual-bank A/B firmware-update state machine modelled behind a mocked flash seam."
 # Dev-only fuzz harness kept out of the published package. It has its own
 # detached workspace and needs nightly instrumentation.

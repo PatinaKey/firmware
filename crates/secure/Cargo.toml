@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone partition bring-up."
 
 [features]
