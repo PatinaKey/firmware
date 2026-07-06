@@ -3,10 +3,13 @@
 # Deliberate choices for this security-critical no_std codebase:
 # - NO rustfmt: the project uses a strict hand-written Allman style that
 #   rustfmt cannot reproduce. Style is reviewed, not auto-formatted.
-# - Host tests + target builds: `cargo test` runs on the host against mock
-#   ports. The bare-metal target has no std, no test harness, and no runner,
-#   so the thumbv8m job proves the no_std build and lints it instead.
-#   On-hardware tests (probe-rs) become a separate job once boards exist.
+# - Host job runs cargo test on the whole workspace against mock ports.
+# - Embedded job builds the real firmware for thumbv8m: it lints every embedded
+#   library on the target, then runs the two-image TrustZone build across the
+#   feature matrix (default, se-session, se-fw-update). The secure crate MUST
+#   link before the non-secure crate so its CMSE import object exists, so the
+#   order is enforced and the shared object is forced to regenerate per feature.
+# - The host signing tool is a detached workspace, so it has its own job.
 # - Live model integration: the coverage job clones the official TROPIC01 model
 #   (libtropic, pinned to a tag + commit) and drives tropic01-driver against it
 #   end-to-end (real handshake + AES-GCM). These run under coverage so the
@@ -36,11 +39,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Official TROPIC01 model (libtropic), pinned to a release tag and its commit. 
+  # Shared by the coverage job (the model) and the embedded job 
+  # (the se-fw-update vendor blobs).
+  LIBTROPIC_REF: v4.0.0
+  LIBTROPIC_SHA: 756c8ee898ed61b12272ecb22b213edf97aab751
 
 jobs:
-  # Job 1: Check & Linting (host + firmware target)
+  # Job 1: Host check and lint (whole workspace on the host)
   lint:
-    name: Check & Lint
+    name: Check & Lint (host)
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: '-D warnings'
@@ -52,7 +60,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv8m.main-none-eabihf
           components: clippy
 
       - name: Cache cargo registry
@@ -67,11 +74,8 @@ jobs:
           path: target
           key: ${{ runner.os }}-target-lint-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Cargo Check (Host)
+      - name: Cargo Check (host, whole workspace)
         run: cargo check --workspace --locked --all-targets
-
-      - name: Cargo Check (Firmware target, no_std proof)
-        run: cargo check -p tropic01-driver --locked --target thumbv8m.main-none-eabihf
 
       - name: Generate Clippy report
         run: |
@@ -83,17 +87,8 @@ jobs:
             --message-format=json \
             > clippy-report.json || true
 
-          cargo clippy \
-            -p tropic01-driver \
-            --locked \
-            --target thumbv8m.main-none-eabihf \
-            --message-format=json \
-            >> clippy-report.json || true
-
-      - name: Run Clippy (strict)
-        run: |
-          cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
-          cargo clippy -p tropic01-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
+      - name: Run Clippy (strict, host)
+        run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 
       - name: Upload Clippy report
         if: always()
@@ -102,18 +97,136 @@ jobs:
           name: clippy-report
           path: clippy-report.json
 
-  # Job 2: Tests & coverage (host)
+  # Job 2: Embedded build and lint (thumbv8m, the real firmware)
+  embedded:
+    name: Embedded build (thumbv8m)
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [default, se-session, se-fw-update]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+          components: clippy
+
+      # The secure crate's build.rs compiles the C -mcmse NSC veneer shim with
+      # clang and emits the CMSE import object with rust-lld. clang ships on the
+      # runner, rust-lld ships with the toolchain.
+      - name: Verify the CMSE C toolchain
+        run: clang --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-embedded-${{ matrix.feature }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Lint the embedded libraries on the target
+        if: matrix.feature == 'default'
+        run: |
+          set -euo pipefail
+          for c in platform mcu-spi mcu-flash image-verify fw-update tropic01-driver
+          do
+            cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings
+          done
+
+      # se-fw-update embeds two Tropic Square signed firmware blobs that are
+      # gitignored (vendor artifacts, not part of the source). Fetch them from
+      # the pinned libtropic so the update path still compile-checks.
+      - name: Fetch the vendor firmware blobs
+        if: matrix.feature == 'se-fw-update'
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/libtropic"
+          git clone --depth 1 --branch "$LIBTROPIC_REF" \
+            https://github.com/tropicsquare/libtropic "$src"
+          got="$(git -C "$src" rev-parse HEAD)"
+          if [ "$got" != "$LIBTROPIC_SHA" ]; then
+            echo "libtropic $LIBTROPIC_REF moved: expected $LIBTROPIC_SHA, got $got" >&2
+            exit 1
+          fi
+          cpu="$(find "$src" -name 'fw_v2.0.0.hex32_signed_chunks.bin' | head -1)"
+          spect="$(find "$src" -name 'spect_app-v1.0.0_signed_chunks.bin' | head -1)"
+          if [ -z "$cpu" ] || [ -z "$spect" ]; then
+            echo "vendor firmware blobs not found in libtropic $LIBTROPIC_REF" >&2
+            exit 1
+          fi
+          mkdir -p crates/secure/fw_blobs
+          cp "$cpu" crates/secure/fw_blobs/cpu_fw_2_0_0.bin
+          cp "$spect" crates/secure/fw_blobs/spect_fw_1_0_0.bin
+
+      - name: Two-stage TrustZone build
+        run: |
+          set -euo pipefail
+          feat=()
+          if [ "${{ matrix.feature }}" != "default" ]; then
+            feat=(--features "${{ matrix.feature }}")
+          fi
+          # Force the shared CMSE import object to regenerate for THIS feature
+          # set. A cached secure build otherwise leaves a stale import object and
+          # the non-secure link fails with undefined veneer symbols.
+          touch crates/secure/csrc/secure_nsc.c
+          echo ">> build secure (${{ matrix.feature }})"
+          cargo build -p secure    --locked --release --target thumbv8m.main-none-eabihf "${feat[@]}"
+          echo ">> build nonsecure (${{ matrix.feature }})"
+          cargo build -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${feat[@]}"
+
+      - name: Lint the secure and non-secure images on the target
+        run: |
+          set -euo pipefail
+          feat=()
+          if [ "${{ matrix.feature }}" != "default" ]; then
+            feat=(--features "${{ matrix.feature }}")
+          fi
+          cargo clippy -p secure    --locked --release --target thumbv8m.main-none-eabihf "${feat[@]}" -- -D warnings
+          cargo clippy -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${feat[@]}" -- -D warnings
+
+  # Job 3: Host signing tool (detached workspace)
+  image-signer:
+    name: Host tool (image-signer)
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      RUSTFLAGS: '-D warnings'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            tools/image-signer/target
+          key: ${{ runner.os }}-cargo-signer-${{ hashFiles('tools/image-signer/Cargo.lock') }}
+
+      - name: Test the signing tool
+        run: cargo test --locked --manifest-path tools/image-signer/Cargo.toml
+
+      - name: Lint the signing tool
+        run: cargo clippy --locked --manifest-path tools/image-signer/Cargo.toml --all-targets -- -D warnings
+
+  # Job 4: Tests & coverage (host, whole workspace + live model)
   test:
     name: Test and Coverage
     runs-on: ubuntu-latest
     needs: lint
-    env:
-      # Official TROPIC01 model (libtropic), pinned to a release tag AND its
-      # commit so the test vectors cannot drift if the tag is ever moved.
-      LIBTROPIC_REF: v4.0.0
-      # Commit the annotated tag v4.0.0 dereferences to (git rev-parse HEAD after
-      # checkout), NOT the tag-object hash.
-      LIBTROPIC_SHA: 756c8ee898ed61b12272ecb22b213edf97aab751
 
     steps:
       - name: Checkout repository
@@ -135,7 +248,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Run tests (Host, hermetic)
+      - name: Run tests (host, hermetic, whole workspace)
         run: cargo test --workspace --locked
 
       - name: Set up Python
@@ -192,7 +305,7 @@ jobs:
             --ignore-filename-regex 'tests/' \
             --lcov --output-path lcov.info -- --test-threads=1
 
-      # Raise this floor as the crate grows.
+      # Raise this floor as the crates grow.
       - name: Enforce coverage floor
         run: cargo llvm-cov report --ignore-filename-regex 'tests/' --fail-under-lines 90
 
@@ -207,7 +320,7 @@ jobs:
           name: coverage-report
           path: lcov.info
 
-  # Job 4: Security audit (RustSec advisories, blocking)
+  # Job 5: Security audit (RustSec advisories, blocking)
   security:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -238,7 +351,7 @@ jobs:
           name: audit-report
           path: cargo-audit.sarif
 
-  # Job 5: Dependency policy (cargo-deny, udeps, outdated)
+  # Job 6: Dependency policy (cargo-deny, udeps, outdated)
   dependencies:
     name: Dependency Policy
     runs-on: ubuntu-latest
@@ -280,7 +393,7 @@ jobs:
         continue-on-error: true
         run: cargo +stable outdated --workspace --root-deps-only
 
-  # Job 6: Fuzzing (libFuzzer + ASan on the attacker-facing parsers)
+  # Job 7: Fuzzing (libFuzzer + ASan on the driver's attacker-facing parsers)
   fuzz:
     name: Fuzz Parsers
     runs-on: ubuntu-latest
@@ -325,7 +438,7 @@ jobs:
           name: fuzz-artifacts
           path: crates/tropic01-driver/fuzz/artifacts
 
-  # Job 7: SonarQube Analysis
+  # Job 8: SonarQube Analysis
   sonarqube:
     name: SonarQube Analysis
     runs-on: ubuntu-latest

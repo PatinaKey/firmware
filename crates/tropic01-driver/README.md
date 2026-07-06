@@ -6,10 +6,14 @@
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 
-> **BETA - unofficial, NOT silicon-validated.** This is an early `0.0.x`
-> release. The driver has been validated host-side against the official
-> `tropic01_model` emulator, but it has NOT run on real TROPIC01 silicon. Do not
-> use it for production trust decisions yet.
+> **Unofficial. Core proven on silicon, one-way writes conformance-only.**
+> The transport, the Noise KK1 secure channel, attestation, the cryptographic
+> hot path, and the safe read and reversible-state commands have run on real
+> TROPIC01 silicon (part `TR01-C2P-T301`). The irreversible provisioning writes
+> (pairing-key and configuration OTP) are validated against the official
+> `tropic01_model` emulator and libtropic only, because a real burn is
+> destructive and cannot be proven
+> non-destructively. Per-command status is in the [coverage matrix](#coverage).
 
 A `no_std`, heap-free, `unsafe-free` Rust driver for the **TROPIC01** secure
 element (Tropic Square, part `TR01-C2P-T301`), spoken over SPI through an
@@ -70,11 +74,18 @@ Written as a clean-room rewrite with the official C SDK
 **test oracle** (never linked : no C, no mbedTLS in the trusted computing base).
 
 > **Status: under active development.** The secure channel and the cryptographic
-> hot-path commands work. They are tested host-side three ways: an in-repo chip
-> mock (incl. fault injection), a libtropic-derived handshake KAT, and a **live
-> end-to-end suite against the official `tropic01_model` emulator** (real
-> handshake + real AES-GCM, see [Validation](#validation-against-real-libtropic)).
-> The chip's whole command surface is wired, including X.509 chain verification up to the pinned Tropic root, the power / mode / session-lifecycle L2 commands, and the firmware-update bootloader API. None of it has run on real silicon, and the bootloader in particular is golden-byte-tested only (the emulator models none of it) - a hardware power-fault test is a hard gate before any production firmware update. Not production-grade yet.
+> hot-path commands are tested host-side three ways: an in-repo chip mock (incl.
+> fault injection), a libtropic-derived handshake KAT, and a **live end-to-end
+> suite against the official `tropic01_model` emulator** (real handshake + real
+> AES-GCM, see [Coverage](#coverage)). The chip's whole
+> command surface is wired, including X.509 chain verification up to the pinned
+> Tropic root, the power / mode / session-lifecycle L2 commands, and the
+> firmware-update bootloader API. The core of that surface has run on real
+> TROPIC01 silicon, including the firmware update 1.0.0 to 2.0.0. The one-way
+> provisioning writes remain conformance-validated only, and the on-silicon
+> firmware update has been exercised once but still owes a full power-fault
+> recovery test before any production use. The per-command [coverage
+> matrix](#coverage) states where each command stands. Not production-grade yet.
 
 ## What it does
 
@@ -114,46 +125,63 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 | PIN primitive | `mac_and_destroy` (0x90), output wrapped in a zeroize-on-drop secret type |
 | Pairing keys | `pairing_key_write` (0x10), `pairing_key_read` (0x11), `pairing_key_invalidate` (0x12) - provision the chip's 4 host-pairing slots |
 | Config objects | `r_config_write` (0x20), `r_config_read` (0x21), `r_config_erase` (0x22, whole R-Config), `i_config_write` (0x30, irreversible OTP bit-burn), `i_config_read` (0x31) - per-command access privileges (CFG_UAP) and chip behaviour |
-| Firmware update | `enter_bootloader` / `exit_to_application` (type-state transitions via Startup_Req), `mutable_fw_update` (0xB0) / `mutable_fw_update_data` (0xB1), the bounded `FwImageChunks` blob decoder, and the `update_firmware` orchestrator (both bank pairs, the anti-downgrade reboot, and the post-update per-bank and running-firmware version-equality checks - full parity with libtropic `lt_do_mutable_fw_update`). The host is a pure transport: the chip verifies the EdDSA firmware signature. **Golden-byte tested only, not silicon-validated** |
+| Firmware update | `enter_bootloader` / `exit_to_application` (type-state transitions via Startup_Req), `mutable_fw_update` (0xB0) / `mutable_fw_update_data` (0xB1), the bounded `FwImageChunks` blob decoder, and the `update_firmware` orchestrator (both bank pairs, the anti-downgrade reboot, and the post-update per-bank and running-firmware version-equality checks - full parity with libtropic `lt_do_mutable_fw_update`). The host is a pure transport: the chip verifies the EdDSA firmware signature. **Exercised once on silicon (1.0.0 to 2.0.0). A full power-fault recovery test is still owed before production** |
 
 The twenty-two L3 commands are exposed through the public `SeCommands` trait, the only
 surface the FIDO2 / OpenPGP / PKCS#11 layers consume. The bootloader primitives are
 reached through the `Bootloader` type-state, which firmware update gates at compile time.
 
-## Validation against real libtropic
+<a name="coverage"></a>
 
-The driver is exercised end-to-end against the official **TROPIC01 model**
-(Tropic Square `ts-tvl`) over a TCP shim, running its real Noise KK1 handshake and
-real AES-GCM L3 codec against an independent implementation of the chip. No keys
-are pinned and nothing is mocked: a wrong protocol or crypto byte breaks the
-handshake or a GCM tag. The table below tracks what each operation is validated
-against the model for (`scripts/model-itest.sh`, behind the `model-itest`
-feature). Injected faults (corrupt tag/CRC/alarm/truncation) stay in the in-repo
-mock - the model does not misbehave on command. Model = conformance, mock = fault
-robustness.
+## Coverage
 
-| Operation | Validated against the model |
-|-----------|:---:|
-| `reboot` (Startup_Req) | Yes - byte-exact frame KAT + live Start-up -> Application FW |
-| `sleep` (Sleep_Req) | Yes - byte-exact frame KAT + reachable live |
-| `chip_mode` (CHIP_STATUS) | Yes - reports Application after reboot (Start-up not modelled) |
-| `get_log_into` (Get_Log_Req) | Yes - byte-exact frame KAT + recoverable empty reply live |
-| `open_session` (handshake) | Yes - real Noise KK1, every live test depends on it |
-| `abort_session` (Encrypted_Session_Abt_Req) | Yes - the chip drops the session, a later L3 needs a fresh handshake |
-| `ping` | Yes - small + a 600-byte payload (live 3-chunk L2 SEND) |
-| `random_into` | Yes - fills the requested buffer |
-| `rmem_write` / `rmem_read_into` / `rmem_erase` | Yes - round-trips data. Re-write surfaces `SlotNotEmpty` (recoverable). Erase clears a slot for a fresh write |
-| `mcounter_get` / `mcounter_init` / `mcounter_update` | Yes - init/update/get decrements by one. Uninitialized counter and an underflow past zero are both recoverable |
-| `ecc_key_generate` / `ecc_public_key` | Yes - P-256 (64 B) and Ed25519 (32 B). Empty slot surfaces `InvalidKey` (recoverable) |
-| `ecc_key_store` / `ecc_key_erase` | Yes - import a key (distinct seeds give distinct pubkeys), sign with an imported key, erase clears a slot. Import into an occupied slot surfaces `SlotNotEmpty` (recoverable) |
-| `ecdsa_sign` / `eddsa_sign` | Yes - returns a 64-byte signature |
-| `mac_and_destroy` | Yes - returns the 32-byte secret output |
-| `pairing_key_write` / `pairing_key_read` / `pairing_key_invalidate` | Yes - slot 0 reads back the prod0 host pairing pubkey (byte-exact). Write-read-invalidate round-trip on a spare slot. Reading an unprovisioned slot is recoverable |
-| `Get_Info`: cert store / chip id / fw versions | Yes - reads the full 3840-byte cert store, the 128-byte CHIP_ID, and the 4-byte RISCV/SPECT versions. FW_BANK is rejected outside Maintenance Mode (the full read is not yet wired) |
-| `parse_stpub` / `read_chip_stpub` (STPUB) | Yes - extracts STPUB from the live model's real device certificate and asserts it byte-exact against the model's pinned `s_t_pub`. A golden-constant proof that the DER walk is byte-faithful to an independent implementation |
-| `verify_cert_chain` / `read_verified_chip_stpub` | Yes - reads the live store and verifies the full chain up to the pinned model TEST root, end-to-end through the RustCrypto P-384 / P-521 ECDSA stack. A deliberately wrong anchor is rejected. The same chain independently verifies under openssl |
-| `r_config_write` / `r_config_read` / `r_config_erase` | Yes - write a CO value to a safe register, read it back byte-exact, erase the whole R-Config and read back all-ones. I-Config read live. The irreversible I-Config write is mock-only (a real burn is one-way) |
-| Firmware update (`enter_bootloader` / `mutable_fw_update` 0xB0 / `mutable_fw_update_data` 0xB1 / `update_firmware`) | **No - the emulator models none of the bootloader.** Validated by byte-exact golden REQUEST-frame assertions + the bounded blob decoder fuzzed + orchestration-sequence review only. A real-silicon power-fault test is a HARD gate before production |
+Two independent axes back this driver, and the matrix below states both per command.
+
+- **Silicon** - has the command run on real TROPIC01 hardware (part
+  `TR01-C2P-T301`) driven from the PatinaKey firmware. This is the strongest
+  evidence.
+- **Model** - is the command exercised end to end against the official **TROPIC01
+  model** (Tropic Square `ts-tvl`) over a TCP shim, running its real Noise KK1
+  handshake and real AES-GCM L3 codec against an independent implementation of the
+  chip (`scripts/model-itest.sh`, behind the `model-itest` feature). No keys are
+  pinned and nothing is mocked: a wrong protocol or crypto byte breaks the
+  handshake or a GCM tag. Injected faults (corrupt tag / CRC / alarm / truncation)
+  stay in the in-repo mock, so model = conformance and mock = fault robustness.
+
+Legend for the **Silicon** column: **Proven** ran on hardware, **-** safe but not
+yet exercised on hardware, **One-way** an irreversible write that cannot be run on
+the single production part without a permanent change, so it stays
+conformance-validated by design.
+
+| Command | Silicon | Model | Notes |
+|---------|:---:|:---:|-------|
+| `reboot` (Startup_Req) | Proven | Yes | Chip reaches Application FW. Byte-exact frame KAT plus live Start-up to Application |
+| `sleep` (Sleep_Req) | - | Yes | Byte-exact frame KAT plus reachable live |
+| `chip_mode` (CHIP_STATUS) | Proven | Yes | Reads Application on hardware after reboot |
+| `open_session` (Noise KK1 handshake) | Proven | Yes | Full handshake on the factory pairing slot. Real Noise KK1, every live test depends on it |
+| `abort_session` | Proven | Yes | Chip-acknowledged teardown. A later L3 needs a fresh handshake |
+| `ping` | Proven | Yes | Encrypted L3 round trip on hardware. Live small plus 600-byte 3-chunk payload |
+| `random_into` (TRNG) | Proven | Yes | 32 random bytes from the chip TRNG, sanity-checked |
+| `ecc_key_generate` / `ecc_public_key` | Proven | Yes | Ed25519 and P-256 generation on hardware. Empty slot surfaces `InvalidKey` |
+| `ecc_key_store` / `ecc_key_erase` | Proven | Yes | Ed25519 seed import with the on-chip pubkey matching the RFC 8032 vector, sign, then erase. Occupied slot surfaces `SlotNotEmpty` |
+| `eddsa_sign` | Proven | Yes | The SE signs, the MCU verifies strict with ed25519-dalek |
+| `ecdsa_sign` | Proven | Yes | P-256 signature generated on hardware and verified cryptographically on the host |
+| `mac_and_destroy` | Proven | Yes | The 32-byte PIN-primitive output, re-init determinism checked |
+| `mcounter_get` / `mcounter_init` / `mcounter_update` | Proven | Yes | Init / update / get on hardware including the at-zero boundary and the upward re-init (resettable) |
+| `rmem_read_into` (0x41) | Proven | Yes | Reads back written data. An empty slot returns zero bytes |
+| `rmem_erase` (0x42) | Proven | Yes | Clears a slot for a fresh write. Reversible R-Memory, not in any brick list |
+| `rmem_write` (0x40) | One-way | Yes | **Excluded from silicon** pending the vendor errata-5 text. At FW 2.0.0 a documented HARDWARE_FAIL may latch the persistent Alarm, so a live write is treated as brick-class until confirmed. Round-trips against the model |
+| `pairing_key_read` (0x11) | Proven | Yes | Factory slot 0 reads back the prod0 host pairing pubkey byte-exact |
+| `pairing_key_write` (0x10) / `pairing_key_invalidate` (0x12) | One-way | Yes | **Provisioning writes, not run on silicon.** Slot 0 is the shared default and invalidation is permanent, so a live write commits the device. Write-read-invalidate round-trip against the model on a spare slot |
+| `r_config_read` (0x21) | Proven | Yes | Configuration objects dumped from hardware |
+| `r_config_write` (0x20) / `r_config_erase` (0x22) | One-way | Yes | **Not run on silicon (errata 1).** A bad `R_Config_Write` on a factory part is a permanent Alarm brick. Write / read-back / whole-erase validated against the model |
+| `i_config_read` (0x31) | Proven | Yes | I-Config dumped from hardware |
+| `i_config_write` (0x30) | One-way | Yes | **Irreversible OTP bit-burn.** Fuses configuration bits permanently, so it is mock-only by nature. A real burn is one-way |
+| `get_log_into` (Get_Log_Req) | n/a | Yes | Development-only, disabled on production parts. Byte-exact frame KAT plus a recoverable empty reply live |
+| `Get_Info`: cert store / chip id / fw versions | Proven | Yes | Reads the 3840-byte cert store, the 128-byte CHIP_ID, and the RISC-V / SPECT versions on hardware. FW_BANK is rejected outside Maintenance Mode |
+| `parse_stpub` / `read_chip_stpub` (STPUB) | Proven | Yes | Extracts STPUB from the chip's real device certificate on hardware, byte-exact against the model's pinned `s_t_pub` |
+| `verify_cert_chain` / `read_verified_chip_stpub` | Proven | Yes | On silicon: the full four-cert chain verified up to the pinned Tropic Square **production** root. Against the model: the same path up to the pinned TEST root, cross-checked under openssl |
+| Firmware update (`enter_bootloader` / `mutable_fw_update` 0xB0 / `mutable_fw_update_data` 0xB1 / `update_firmware`) | Proven | No | Exercised once on silicon (1.0.0 to 2.0.0). The emulator models none of the bootloader, so the host-side proof is byte-exact golden REQUEST-frame assertions plus the fuzzed blob decoder. A full power-fault recovery test is a HARD gate before production |
 
 The L2 multi-chunk SEND path additionally has a **byte-exact golden KAT**: real
 libtropic frames captured from the model are asserted byte-for-byte against the
@@ -165,12 +193,14 @@ This runs in the normal hermetic test suite.
 The TROPIC01 command surface is fully wired: every L2 request and L3 command,
 attestation, and the firmware-update bootloader are implemented.
 
-Work toward a production `1.0`: validate against real silicon (the
-`tropic01_model` emulator is wired, see
-[Validation](#validation-against-real-libtropic), but no silicon run yet). Move the
-`ecdsa` / `p384` / `p521` curve crates off their release candidates once stable
-versions on the same `digest` generation ship. A type-state `open_session` that
-consumes a chain-verified STPUB and an `embedded-hal-async` path.
+Work toward a production `1.0`. The core is proven on silicon (see
+[Coverage](#coverage)), so what remains is: a full power-fault recovery test for
+the firmware update before any production use, moving the `ecdsa` / `p384` /
+`p521` curve crates off their release candidates once stable versions on the same
+`digest` generation ship, a type-state `open_session` that consumes a
+chain-verified STPUB, and an `embedded-hal-async` path. The one-way provisioning
+writes stay conformance-validated by design, since a live burn commits the single
+production part.
 
 ## Design principles
 
@@ -207,7 +237,7 @@ cargo clippy -p tropic01-driver --target thumbv8m.main-none-eabihf -- -D warning
 
 These run with no external dependencies. A separate **live** suite drives the
 driver against the official `tropic01_model` emulator (see
-[Validation](#validation-against-real-libtropic)). It is behind the `model-itest`
+[Coverage](#coverage)). It is behind the `model-itest`
 feature and started by `scripts/model-itest.sh`, so the normal test run stays
 hermetic.
 

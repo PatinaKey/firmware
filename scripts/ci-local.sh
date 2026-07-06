@@ -160,6 +160,48 @@ fuzz_stage()
     )
 }
 
+embedded_stage()
+{
+    # The real firmware for thumbv8m. Lint every embedded library on the target,
+    # then run the two-image TrustZone build across the feature matrix. RUSTFLAGS
+    # stays UNSET here so the target link-args from .cargo/config.toml (-Tlink.x)
+    # survive: the warning gate rides on clippy (a check pass, no link) instead.
+    local c
+    for c in platform mcu-spi mcu-flash image-verify fw-update tropic01-driver
+    do
+        cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings || return 1
+    done
+    local feats=(default se-session)
+    # se-fw-update embeds gitignored vendor blobs. Build it only if they are here.
+    if [ -f crates/secure/fw_blobs/cpu_fw_2_0_0.bin ] && [ -f crates/secure/fw_blobs/spect_fw_1_0_0.bin ]
+    then
+        feats+=(se-fw-update)
+    else
+        echo "skipping se-fw-update (vendor blobs absent from crates/secure/fw_blobs/)"
+    fi
+    local f
+    for f in "${feats[@]}"
+    do
+        local fa=()
+        [ "$f" != "default" ] && fa=(--features "$f")
+        echo ">> two-stage build [$f]"
+        # Force the shared CMSE import object to regenerate for this feature set.
+        touch crates/secure/csrc/secure_nsc.c
+        cargo build  -p secure    --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" || return 1
+        cargo build  -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" || return 1
+        cargo clippy -p secure    --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" -- -D warnings || return 1
+        cargo clippy -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" -- -D warnings || return 1
+    done
+}
+
+signer_stage()
+{
+    # The offline signing tool is a detached workspace, not a member of the main
+    # one, so it is tested and linted on its own manifest.
+    cargo test   --locked --manifest-path tools/image-signer/Cargo.toml || return 1
+    cargo clippy --locked --manifest-path tools/image-signer/Cargo.toml --all-targets -- -D warnings
+}
+
 # pipeline stages, same order as the workflow
 
 RUSTFLAGS="-D warnings" run "check (host)" cargo check --workspace --locked --all-targets
@@ -172,6 +214,15 @@ unset RUSTFLAGS
 run "test (host)" cargo test --workspace --locked
 
 run "clippy (json report + strict)" clippy_reports
+
+if have clang
+then
+    run "embedded (thumbv8m two-stage)" embedded_stage
+else
+    skip "embedded" "install clang (the CMSE shim needs it)"
+fi
+
+run "image-signer (host tool)" signer_stage
 
 if have cargo-audit
 then
