@@ -175,6 +175,83 @@ enum Settled
     Confirmed,
 }
 
+// Reboots repeatedly from `surviving` until the state settles, driving on_boot
+// recovery and then confirm or revert by `health` on each boot cycle. A cut that
+// survived into the post-reset segment fires inside one of these boots and faults
+// the recovery mid-way. The next boot runs on clean silicon (the cut is spent)
+// and retries, so the loop runs until the state reaches a fixed point with no
+// staged swap and no record. Sets `*fired_anywhere` if a cut fires in any boot,
+// and returns the settled state.
+fn drive_recovery
+(
+    root: &RootKey,
+    mut surviving: PersistentState,
+    health: Health,
+    fired_anywhere: &mut bool,
+)
+    -> PersistentState
+{
+    // Each loop iteration models one boot cycle: a reset (which applies any staged
+    // swap), then on_boot, then confirm or revert by health.
+    let mut guard = 0u32;
+    loop
+    {
+        guard += 1;
+        assert!(guard < 16, "recovery must settle in a bounded number of boots");
+
+        // Each boot after the first applies the staged option load atomically:
+        // a reboot IS a reset. The first iteration already had `reset_applied`
+        // resolved by the caller.
+        if guard > 1
+        {
+            surviving.apply_reset();
+        }
+
+        let before = surviving;
+        let flash2 = FidelityFlash::new(surviving);
+        let se2 = FidelitySeCounter::new(SE_AT_FLOOR);
+        let mut up2 = Updater::new(root, flash2, se2);
+
+        let boot_state = up2.on_boot();
+
+        if let Ok(UpdateState::AwaitingConfirm) = boot_state
+        {
+            match health
+            {
+                Health::Confirm =>
+                {
+                    let _ = up2.confirm(NEW_IMAGE_COUNTER);
+                }
+                Health::Revert =>
+                {
+                    let _ = up2.revert();
+                }
+            }
+        }
+        if up2.flash().outcome() == CutOutcome::Fired
+        {
+            *fired_anywhere = true;
+        }
+
+        surviving = up2.into_flash().into_surviving();
+
+        // The state has settled once no swap is staged, no record dangles, and a
+        // full clean boot cycle changed nothing (a functional fixed point). A
+        // cut countdown may still ride if its armed index is past the LAST
+        // mutation the settled flow ever issues: that cut is genuinely
+        // unreachable for this configuration (recorded as NotReached), so the
+        // fixed point still settles. The leftover countdown is cleared by the
+        // caller.
+        let quiescent = surviving.staged_swap.is_none()
+            && surviving.pending == PendingFlag::None;
+        if quiescent && surviving == before
+        {
+            break;
+        }
+    }
+    surviving
+}
+
 // Drives the WHOLE flow under a single global cut at `cut_index` in `mode`.
 //
 // Segment 1 runs begin -> receive -> accept -> commit with the cut armed. The cut
@@ -234,67 +311,10 @@ fn run_flow
         surviving.staged_swap = None;
     }
 
-    // Drive recovery to a settled state. Each loop iteration models one boot
-    // cycle: a reset (which applies any staged swap), then on_boot, then confirm
-    // or revert by health. A cut that survived into the post-reset segment fires
-    // inside one of these boots and faults the recovery mid-way. The next boot
-    // runs on clean silicon (the cut is spent) and retries, so the loop runs
-    // until the state reaches a fixed point with no staged swap and no record.
-    let mut guard = 0u32;
-    loop
-    {
-        guard += 1;
-        assert!(guard < 16, "recovery must settle in a bounded number of boots");
-
-        // Each boot after the first applies the staged option load atomically:
-        // a reboot IS a reset. The first iteration already had `reset_applied`
-        // resolved above.
-        if guard > 1
-        {
-            surviving.apply_reset();
-        }
-
-        let before = surviving;
-        let flash2 = FidelityFlash::new(surviving);
-        let se2 = FidelitySeCounter::new(SE_AT_FLOOR);
-        let mut up2 = Updater::new(root, flash2, se2);
-
-        let boot_state = up2.on_boot();
-
-        if let Ok(UpdateState::AwaitingConfirm) = boot_state
-        {
-            match health
-            {
-                Health::Confirm =>
-                {
-                    let _ = up2.confirm(NEW_IMAGE_COUNTER);
-                }
-                Health::Revert =>
-                {
-                    let _ = up2.revert();
-                }
-            }
-        }
-        if up2.flash().outcome() == CutOutcome::Fired
-        {
-            fired_anywhere = true;
-        }
-
-        surviving = up2.into_flash().into_surviving();
-
-        // The state has settled once no swap is staged, no record dangles, and a
-        // full clean boot cycle changed nothing (a functional fixed point). A
-        // cut countdown may still ride if its armed index is past the LAST
-        // mutation the settled flow ever issues: that cut is genuinely
-        // unreachable for this configuration (recorded as NotReached), so the
-        // fixed point still settles. The leftover countdown is cleared below.
-        let quiescent = surviving.staged_swap.is_none()
-            && surviving.pending == PendingFlag::None;
-        if quiescent && surviving == before
-        {
-            break;
-        }
-    }
+    // Drive recovery to a settled state across repeated boot cycles. A cut that
+    // survived into the post-reset segment fires inside one of these boots, and
+    // the loop retries on clean silicon until the state reaches a fixed point.
+    surviving = drive_recovery(root, surviving, health, &mut fired_anywhere);
 
     // Clear any unreachable leftover cut so the settled state is clean. The
     // outcome already records NotReached for a cut that never hit a mutation.
@@ -426,6 +446,95 @@ fn assert_invariants
 // reachable for a configuration fires at least once.
 const MUTATION_COUNT: u32 = 9;
 
+// The fault-injection axes the exhaustive census walks. Every cut mode, both
+// option-load-at-reset outcomes (the reset committing the staged swap and a cut
+// before it committed, RM0456 sec 7.5.8), and both health branches (confirm and
+// revert, BLOCKER 2). All three must hold the invariant.
+const CUT_MODES: [CutMode; 3] =
+[
+    CutMode::BeforeMutation,
+    CutMode::AfterMutation,
+    CutMode::TornWrite,
+];
+const RESET_OUTCOMES: [bool; 2] = [true, false];
+const HEALTHS: [Health; 2] = [Health::Confirm, Health::Revert];
+
+// Walks every global cut index for ONE fixed (mode, reset outcome, health)
+// configuration, asserting the safety invariant on each settled state. Returns
+// how many of that config's cuts actually hit a reachable mutation, plus the
+// per-index census of which global mutation indices fired within this config.
+fn census_one_config
+(
+    root: &RootKey,
+    image: &[u8],
+    old_image: &[u8],
+    mode: CutMode,
+    reset_applied: bool,
+    health: Health,
+)
+    -> (u32, [bool; MUTATION_COUNT as usize])
+{
+    let mut fired = 0u32;
+    let mut seen = [false; MUTATION_COUNT as usize];
+    for k in 0..MUTATION_COUNT
+    {
+        let result = run_flow(root, image, k, mode, reset_applied, health);
+        assert_invariants(&result, old_image, image, root);
+
+        if result.outcome == CutOutcome::Fired
+        {
+            fired += 1;
+        }
+        if let Some(idx) = result.fired_index
+            && let Some(slot) = seen.get_mut(idx as usize)
+        {
+            *slot = true;
+        }
+    }
+    (fired, seen)
+}
+
+// Drives the full cross product of cut mode, reset outcome, health branch, and
+// global cut index over one image, asserting the safety invariant on every
+// settled state. Returns the interleaving total, the count of cuts that actually
+// fired, and the per-index census of which global mutation indices ever fired.
+// The census would have caught the earlier gap where no cut fired after the
+// reset.
+fn drive_full_census
+(
+    root: &RootKey,
+    image: &[u8],
+    old_image: &[u8],
+)
+    -> (u32, u32, [bool; MUTATION_COUNT as usize])
+{
+    let mut total = 0u32;
+    let mut fired = 0u32;
+    let mut fired_seen = [false; MUTATION_COUNT as usize];
+
+    for mode in CUT_MODES
+    {
+        for reset_applied in RESET_OUTCOMES
+        {
+            for health in HEALTHS
+            {
+                let (config_fired, config_seen) =
+                    census_one_config(root, image, old_image, mode, reset_applied, health);
+                // One index walked per k, so the config adds MUTATION_COUNT to the
+                // total. Merge its fired count and OR its census into the running
+                // accumulators.
+                total += MUTATION_COUNT;
+                fired += config_fired;
+                for (slot, hit) in fired_seen.iter_mut().zip(config_seen.iter())
+                {
+                    *slot |= *hit;
+                }
+            }
+        }
+    }
+    (total, fired, fired_seen)
+}
+
 #[test]
 fn exhaustive_power_fault_interleavings_hold_the_invariant()
 {
@@ -435,50 +544,8 @@ fn exhaustive_power_fault_interleavings_hold_the_invariant()
     let image = build_image(NEW_IMAGE_COUNTER, &[0xCD; 600]);
     let (_state, old_image) = baseline();
 
-    let modes = [
-        CutMode::BeforeMutation,
-        CutMode::AfterMutation,
-        CutMode::TornWrite,
-    ];
-    // The option-load-at-reset window: when a swap is staged, model both the
-    // reset committing it and a cut before it committed. Both must hold.
-    let reset_outcomes = [true, false];
-    // Drive both the confirm branch and the revert branch (BLOCKER 2).
-    let healths = [Health::Confirm, Health::Revert];
-
-    let mut total = 0u32;
-    let mut fired = 0u32;
-    // Census of which global indices fired, to prove every reachable mutation
-    // point was actually injected (this is the check that would have caught the
-    // earlier gap where no cut ever fired after the reset).
-    let mut fired_seen = [false; MUTATION_COUNT as usize];
-
-    for mode in modes
-    {
-        for reset_applied in reset_outcomes
-        {
-            for health in healths
-            {
-                for k in 0..MUTATION_COUNT
-                {
-                    let result =
-                        run_flow(&root, &image, k, mode, reset_applied, health);
-                    assert_invariants(&result, &old_image, &image, &root);
-
-                    total += 1;
-                    if result.outcome == CutOutcome::Fired
-                    {
-                        fired += 1;
-                    }
-                    if let Some(idx) = result.fired_index
-                        && let Some(slot) = fired_seen.get_mut(idx as usize)
-                    {
-                        *slot = true;
-                    }
-                }
-            }
-        }
-    }
+    let (total, fired, fired_seen) =
+        drive_full_census(&root, &image, &old_image);
 
     // Every global mutation index must have fired at least once across the
     // census. This is the assertion that proves the cut spans the WHOLE flow,
@@ -497,7 +564,7 @@ fn exhaustive_power_fault_interleavings_hold_the_invariant()
     // configurations do not reach a given index (for example a pre-reset cut
     // makes the post-reset branch shorter), so `fired` is below `total` by
     // design, and the per-index census above is the real coverage proof.
-    let configs = (modes.len() * reset_outcomes.len() * healths.len()) as u32;
+    let configs = (CUT_MODES.len() * RESET_OUTCOMES.len() * HEALTHS.len()) as u32;
     std::eprintln!(
         "power-fault harness: {total} interleavings exercised, \
          {fired} cuts fired, every one of {MUTATION_COUNT} global mutation \

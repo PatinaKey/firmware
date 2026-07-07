@@ -14,13 +14,15 @@
 #   (libtropic, pinned to a tag + commit) and drives tropic01-driver against it
 #   end-to-end (real handshake + AES-GCM). These run under coverage so the
 #   library paths they exercise count. The test-harness files are excluded.
-# - cargo audit BLOCKS on findings (no `|| true` on the gate): a known
-#   vulnerability in the dependency tree must stop the line.
+# - cargo-deny BLOCKS on findings (it now also covers the RustSec advisory DB
+#   that cargo-audit used to check, making a separate audit job redundant): a
+#   known vulnerability, a banned or yanked crate, a disallowed license, or an
+#   untrusted source must stop the line.
 #
 # Reports for SonarQube (see sonar-project.properties):
 #   clippy-report.json   clippy lints, raw cargo JSON
 #   lcov.info            line coverage from cargo-llvm-cov
-#   cargo-audit.sarif    advisory findings, native SARIF export
+#   cargo-deny.sarif     advisories/licenses/bans/sources findings, native SARIF
 
 name: 'CI/CD Pipeline PatinaKey'
 
@@ -320,38 +322,12 @@ jobs:
           name: coverage-report
           path: lcov.info
 
-  # Job 5: Security audit (RustSec advisories, blocking)
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
-
-      # Export the SARIF report first, then fail the job on findings.
-      # cargo audit exits non-zero on a vulnerability, so capture the
-      # status instead of discarding it with `|| true`.
-      - name: Run security audit (SARIF, blocking)
-        run: |
-          status=0
-          cargo audit --format sarif > cargo-audit.sarif || status=$?
-          exit $status
-
-      - name: Upload audit report (SARIF)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: audit-report
-          path: cargo-audit.sarif
-
-  # Job 6: Dependency policy (cargo-deny, udeps, outdated)
+  # Job 5: Dependency policy (cargo-deny, udeps, outdated)
+  #
+  # cargo-deny now also owns the advisory gate that cargo-audit used to run:
+  # `deny check` runs the advisories check against the same RustSec database,
+  # so the standalone audit job has been removed as redundant. This job also
+  # exports the deny findings as SARIF for SonarQube.
   dependencies:
     name: Dependency Policy
     runs-on: ubuntu-latest
@@ -379,9 +355,23 @@ jobs:
         with:
           tool: cargo-deny,cargo-udeps,cargo-outdated
 
-      # Licenses, yanked crates, untrusted sources, duplicate versions.
-      - name: Cargo Deny
+      # Advisories (RustSec), licenses, banned/yanked crates, untrusted
+      # sources, duplicate versions. `check` runs all of these and blocks on
+      # any of them. Export SARIF for SonarQube first, non-blocking, so the
+      # readable human-format gate below is the step that actually fails the
+      # job (clean CI logs); then run the blocking gate.
+      - name: Cargo Deny (SARIF export for SonarQube)
+        run: cargo +stable deny --format sarif check > cargo-deny.sarif || true
+
+      - name: Cargo Deny (blocking gate)
         run: cargo +stable deny check
+
+      - name: Upload deny report (SARIF)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deny-report
+          path: cargo-deny.sarif
 
       # Unused dependencies are dead audit surface on a security product.
       - name: Cargo Udeps (nightly)
@@ -393,7 +383,7 @@ jobs:
         continue-on-error: true
         run: cargo +stable outdated --workspace --root-deps-only
 
-  # Job 7: Fuzzing (libFuzzer + ASan on the driver's attacker-facing parsers)
+  # Job 6: Fuzzing (libFuzzer + ASan on the driver's attacker-facing parsers)
   fuzz:
     name: Fuzz Parsers
     runs-on: ubuntu-latest
@@ -438,11 +428,11 @@ jobs:
           name: fuzz-artifacts
           path: crates/tropic01-driver/fuzz/artifacts
 
-  # Job 8: SonarQube Analysis
+  # Job 7: SonarQube Analysis
   sonarqube:
     name: SonarQube Analysis
     runs-on: ubuntu-latest
-    needs: [test, security]
+    needs: [test, dependencies]
     if: success()
 
     steps:
@@ -461,10 +451,10 @@ jobs:
         with:
           name: clippy-report
 
-      - name: Download Audit report
+      - name: Download Deny report
         uses: actions/download-artifact@v4
         with:
-          name: audit-report
+          name: deny-report
 
       - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@master

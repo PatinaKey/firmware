@@ -110,7 +110,7 @@ scripts/ci-local.sh --quick  # skip coverage and fuzz
 | Host tool | `cargo test` in `tools/image-signer` | the detached signing-tool workspace |
 | Model integration | `tropic01_model` (`ts-tvl`) | live end-to-end against the official model, run under coverage |
 | Coverage | `cargo-llvm-cov` | library line coverage floor |
-| Advisories | `cargo audit` | blocks on any RustSec finding, SARIF export |
+| Advisories | `cargo deny` | blocks on any RustSec finding, SARIF export |
 | Dependency policy | `cargo deny` / `cargo udeps` | license allow-list, trusted sources, no yanked or unused crates |
 | Fuzz | `cargo fuzz` | the driver's attacker-facing parsers, longer on the weekly schedule |
 | Quality scan | SonarQube | consumes the reports above |

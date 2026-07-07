@@ -28,6 +28,7 @@ use tropic01_driver::SeCommands;
 use tropic01_driver::SeError;
 
 use crate::se_session::open_bringup_session;
+use crate::se_session::BringupSession;
 use crate::se_session::CERT_SCRATCH_LEN;
 use crate::se_smoke::build_device;
 use crate::se_smoke::se_error_code;
@@ -204,6 +205,158 @@ fn eddsa_verify_host(pubkey: &[u8], signature: &[u8; 64]) -> bool
     verifying_key.verify_strict(MESSAGE, &sig).is_ok()
 }
 
+/// Step 3: draw 32 TRNG bytes and sanity-check them.
+///
+/// A short read or an all-identical draw is a dead bus or stuck RNG. Returns the
+/// packed error word on any fault and never tears the session down, the caller
+/// owns teardown.
+fn run_random_check(session: &mut BringupSession) -> Result<(), u32>
+{
+    let mut rnd = [0u8; 32];
+    match session.random_into(&mut rnd)
+    {
+        Ok(n) if n == rnd.len() => {}
+        Ok(_) => return Err(err_word_code(STEP_RANDOM, SCR_RANDOM_SANITY)),
+        Err(e) => return Err(err_word(STEP_RANDOM, e)),
+    }
+    if rnd.iter().all(|&b| b == rnd[0])
+    {
+        return Err(err_word_code(STEP_RANDOM, SCR_RANDOM_SANITY));
+    }
+    Ok(())
+}
+
+/// Steps 4..9: the Ed25519 generate / read / sign / host-verify / erase round
+/// trip.
+///
+/// Pre-clean, generate, read the 32-byte pubkey, sign MESSAGE, host-verify, then
+/// checked erase. On a fault after generate the slot is erased best-effort before
+/// returning, so the erase-before-teardown order holds once the caller tears
+/// down. Never tears the session down itself.
+fn run_ed25519_kat
+(
+    session: &mut BringupSession,
+    ed_slot: EccSlot,
+)
+    -> Result<(), u32>
+{
+    // Step 4: best-effort pre-clean erase, result IGNORED.
+    let _ = session.ecc_key_erase(ed_slot);
+
+    // Step 5: generate the Ed25519 key. On error erase best-effort then return.
+    if let Err(e) = session.ecc_key_generate(ed_slot, EccCurve::Ed25519)
+    {
+        let _ = session.ecc_key_erase(ed_slot);
+        return Err(err_word(STEP_ED_GENERATE, e));
+    }
+
+    // Step 6: read the Ed25519 public key. Expect exactly 32 bytes.
+    let ed_pubkey = match session.ecc_public_key(ed_slot)
+    {
+        Ok(key) => key,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(ed_slot);
+            return Err(err_word(STEP_ED_PUBKEY, e));
+        }
+    };
+    if ed_pubkey.bytes().len() != 32
+    {
+        let _ = session.ecc_key_erase(ed_slot);
+        return Err(err_word_code(STEP_ED_PUBKEY, SCR_PUBKEY_LEN));
+    }
+    let mut ed_pub_bytes = [0u8; 32];
+    ed_pub_bytes.copy_from_slice(ed_pubkey.bytes());
+
+    // Step 7: sign MESSAGE with the Ed25519 key (EdDSA).
+    let ed_sig = match session.eddsa_sign(ed_slot, MESSAGE)
+    {
+        Ok(sig) => sig,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(ed_slot);
+            return Err(err_word(STEP_ED_SIGN, e));
+        }
+    };
+
+    // Step 8: verify the 64-byte signature on-host under the 32-byte pubkey.
+    if !eddsa_verify_host(&ed_pub_bytes, &ed_sig.0)
+    {
+        let _ = session.ecc_key_erase(ed_slot);
+        return Err(err_word_code(STEP_ED_VERIFY, SCR_EDDSA_REJECT));
+    }
+
+    // Step 9: checked erase of the Ed25519 key.
+    if let Err(e) = session.ecc_key_erase(ed_slot)
+    {
+        return Err(err_word(STEP_ED_ERASE, e));
+    }
+    Ok(())
+}
+
+/// Step 10: the P-256 (ECDSA) generate / sign / shape-check / erase round trip.
+///
+/// No P-256 verifier is linked, so this proves the command round trip and the
+/// signature shape, NOT cryptographic verification. On a fault the slot is erased
+/// best-effort before returning, so the erase-before-teardown order holds once
+/// the caller tears down. Never tears the session down itself.
+fn run_ecdsa_roundtrip
+(
+    session: &mut BringupSession,
+    p256_slot: EccSlot,
+)
+    -> Result<(), u32>
+{
+    let _ = session.ecc_key_erase(p256_slot);
+    if let Err(e) = session.ecc_key_generate(p256_slot, EccCurve::P256)
+    {
+        let _ = session.ecc_key_erase(p256_slot);
+        return Err(err_word(STEP_ECDSA, e));
+    }
+    let p256_sig = match session.ecdsa_sign(p256_slot, &DIGEST)
+    {
+        Ok(sig) => sig,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(p256_slot);
+            return Err(err_word(STEP_ECDSA, e));
+        }
+    };
+    // SHAPE check: 64 bytes with neither the R half (first 32) nor the S half
+    // (last 32) all zero. An all-zero half is a malformed signature.
+    let r_zero = p256_sig.0[..32].iter().all(|&b| b == 0);
+    let s_zero = p256_sig.0[32..].iter().all(|&b| b == 0);
+    if r_zero || s_zero
+    {
+        let _ = session.ecc_key_erase(p256_slot);
+        return Err(err_word_code(STEP_ECDSA, SCR_ECDSA_SHAPE));
+    }
+    if let Err(e) = session.ecc_key_erase(p256_slot)
+    {
+        return Err(err_word(STEP_ECDSA, e));
+    }
+    Ok(())
+}
+
+/// Runs steps 3..10 under the open session, in order.
+///
+/// Returns the packed error word at the first failing step and never tears the
+/// session down. The caller owns the single teardown, so a helper that erased a
+/// slot before returning keeps the erase-before-teardown order.
+fn run_crypto_under_session
+(
+    session: &mut BringupSession,
+    ed_slot: EccSlot,
+    p256_slot: EccSlot,
+)
+    -> Result<(), u32>
+{
+    run_random_check(session)?;
+    run_ed25519_kat(session, ed_slot)?;
+    run_ecdsa_roundtrip(session, p256_slot)?;
+    Ok(())
+}
+
 /// Runs the crypto + attestation bring-up and returns a packed status word.
 ///
 /// Drives the flow step by step so the returned word names WHICH step failed:
@@ -267,138 +420,25 @@ pub extern "C" fn patinakey_se_crypto() -> u32
         Err((_dev, e)) => return err_word(STEP_OPEN_SESSION, e),
     };
 
-    // Step 3: draw 32 TRNG bytes.
-    let mut rnd = [0u8; 32];
-    match session.random_into(&mut rnd)
+    // Steps 3..10 run under the open session. On a failure the session is torn
+    // down and the returned word is surfaced, matching the original per-step
+    // teardown.
+    match run_crypto_under_session(&mut session, ed_slot, p256_slot)
     {
-        Ok(n) if n == rnd.len() => {}
-        Ok(_) =>
+        Err(word) =>
         {
             let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_RANDOM, SCR_RANDOM_SANITY);
+            word
         }
-        Err(e) =>
+        Ok(()) =>
         {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_RANDOM, e);
+            // Step 11: chip-notifying teardown.
+            let (_dev, ack) = session.abort_session();
+            match ack
+            {
+                Ok(()) => SCR_OK | SCR_OK_MARKER,
+                Err(e) => err_word(STEP_SESSION_ABORT, e),
+            }
         }
-    }
-    if rnd.iter().all(|&b| b == rnd[0])
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_RANDOM, SCR_RANDOM_SANITY);
-    }
-
-    // Step 4: best-effort pre-clean erase of the Ed25519 slot, result IGNORED.
-    // The API documentation is silent on the erase-on-an-empty-slot result code,
-    // and the vendor SDK reference sequence erases unconditionally before
-    // generating, so the pre-clean tolerates any outcome. The checked cleanup
-    // erase at step 9 later proves erase works. A transport-dead chip fails the
-    // next step anyway.
-    let _ = session.ecc_key_erase(ed_slot);
-
-    // Step 5: generate the Ed25519 key. On error erase best-effort (the slot may
-    // hold a partial key) then tear down.
-    if let Err(e) = session.ecc_key_generate(ed_slot, EccCurve::Ed25519)
-    {
-        // Best-effort cleanup: the generate may have left a key.
-        let _ = session.ecc_key_erase(ed_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_ED_GENERATE, e);
-    }
-
-    // Step 6: read the Ed25519 public key. Expect exactly 32 bytes.
-    let ed_pubkey = match session.ecc_public_key(ed_slot)
-    {
-        Ok(key) => key,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(ed_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_ED_PUBKEY, e);
-        }
-    };
-    if ed_pubkey.bytes().len() != 32
-    {
-        let _ = session.ecc_key_erase(ed_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_ED_PUBKEY, SCR_PUBKEY_LEN);
-    }
-    let mut ed_pub_bytes = [0u8; 32];
-    ed_pub_bytes.copy_from_slice(ed_pubkey.bytes());
-
-    // Step 7: sign MESSAGE with the Ed25519 key (EdDSA).
-    let ed_sig = match session.eddsa_sign(ed_slot, MESSAGE)
-    {
-        Ok(sig) => sig,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(ed_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_ED_SIGN, e);
-        }
-    };
-
-    // Step 8: verify the 64-byte signature on-host under the 32-byte pubkey with
-    // a standard RFC 8032 verifier.
-    if !eddsa_verify_host(&ed_pub_bytes, &ed_sig.0)
-    {
-        let _ = session.ecc_key_erase(ed_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_ED_VERIFY, SCR_EDDSA_REJECT);
-    }
-
-    // Step 9: checked erase of the Ed25519 key.
-    if let Err(e) = session.ecc_key_erase(ed_slot)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_ED_ERASE, e);
-    }
-
-    // Step 10: the P-256 (ECDSA) round trip. Generate, sign a fixed digest,
-    // SHAPE-check only, then checked erase.
-    //
-    // No P-256 verifier is linked, so
-    // this proves the command round trip and the signature shape, NOT
-    // cryptographic verification.
-    let _ = session.ecc_key_erase(p256_slot);
-    if let Err(e) = session.ecc_key_generate(p256_slot, EccCurve::P256)
-    {
-        let _ = session.ecc_key_erase(p256_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_ECDSA, e);
-    }
-    let p256_sig = match session.ecdsa_sign(p256_slot, &DIGEST)
-    {
-        Ok(sig) => sig,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(p256_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_ECDSA, e);
-        }
-    };
-    // SHAPE check: 64 bytes with neither the R half (first 32) nor the S half
-    // (last 32) all zero. An all-zero half is a malformed signature.
-    let r_zero = p256_sig.0[..32].iter().all(|&b| b == 0);
-    let s_zero = p256_sig.0[32..].iter().all(|&b| b == 0);
-    if r_zero || s_zero
-    {
-        let _ = session.ecc_key_erase(p256_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_ECDSA, SCR_ECDSA_SHAPE);
-    }
-    if let Err(e) = session.ecc_key_erase(p256_slot)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_ECDSA, e);
-    }
-
-    // Step 11: chip-notifying teardown.
-    let (_dev, ack) = session.abort_session();
-    match ack
-    {
-        Ok(()) => SCR_OK | SCR_OK_MARKER,
-        Err(e) => err_word(STEP_SESSION_ABORT, e),
     }
 }

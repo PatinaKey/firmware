@@ -2,7 +2,7 @@
 # Local mirror of the CI/CD pipeline (.github/workflows/ci.yml).
 # Runs the same gates without GitHub. Reports land at the repository
 # root with the same names SonarQube expects: clippy-report.json,
-# lcov.info, cargo-audit.sarif.
+# lcov.info, cargo-deny.sarif.
 #
 # Usage: scripts/ci-local.sh [--quick] [--strict] [--fuzz-secs N]
 #   --quick       skip the slow stages (coverage, fuzz)
@@ -86,11 +86,16 @@ clippy_reports()
     RUSTFLAGS="-D warnings" cargo clippy -p tropic01-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
 }
 
-audit_stage()
+deny_stage()
 {
-    local status=0
-    cargo audit --format sarif > cargo-audit.sarif || status=$?
-    return $status
+    # Advisories (RustSec), licenses, banned/yanked crates, untrusted sources,
+    # duplicate versions. `check` runs all of these and blocks on any of them.
+    # deny now also owns the advisory gate cargo-audit used to run (same RustSec
+    # database), so there is no separate audit stage. Export SARIF for SonarQube
+    # first (non-blocking, so the readable human-format gate below is what fails
+    # the stage with clean output), then run the blocking gate.
+    cargo deny --format sarif check > cargo-deny.sarif || true
+    cargo deny check
 }
 
 coverage_stage()
@@ -224,16 +229,9 @@ fi
 
 run "image-signer (host tool)" signer_stage
 
-if have cargo-audit
-then
-    run "audit (sarif, blocking)" audit_stage
-else
-    skip "audit" "cargo install cargo-audit"
-fi
-
 if have cargo-deny
 then
-    run "deny (licenses, sources, yanked)" cargo deny check
+    run "deny (advisories, licenses, sources, yanked; sarif)" deny_stage
 else
     skip "deny" "cargo install cargo-deny"
 fi

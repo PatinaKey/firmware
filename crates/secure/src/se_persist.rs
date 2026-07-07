@@ -37,6 +37,7 @@ use tropic01_driver::SeError;
 use zeroize::Zeroizing;
 
 use crate::se_session::open_bringup_session;
+use crate::se_session::BringupSession;
 use crate::se_session::CERT_SCRATCH_LEN;
 use crate::se_smoke::build_device;
 use crate::se_smoke::se_error_code;
@@ -242,6 +243,238 @@ fn eddsa_verify_host(pubkey: &[u8; 32], signature: &[u8; 64]) -> bool
     verifying_key.verify_strict(MESSAGE, &sig).is_ok()
 }
 
+/// Steps 2..5: set the counter, read it, decrement it, then upward re-init.
+///
+/// Proves the counter reads back the written value, decrements by one, and is
+/// fully resettable to a higher value. Returns the packed error word on any fault
+/// and never tears the session down, the caller owns teardown.
+fn run_mcounter_set_read
+(
+    session: &mut BringupSession,
+    counter: MCounterIdx,
+)
+    -> Result<(), u32>
+{
+    // Step 2: initialize the counter to 5.
+    if let Err(e) = session.mcounter_init(counter, MCOUNTER_INIT_VALUE)
+    {
+        return Err(err_word(STEP_MCOUNTER_INIT, e));
+    }
+
+    // Step 3: read the counter and expect exactly the init value.
+    match session.mcounter_get(counter)
+    {
+        Ok(v) if v == MCOUNTER_INIT_VALUE => {}
+        Ok(_) => return Err(err_word_code(STEP_MCOUNTER_GET, SPR_MCOUNTER_MISMATCH)),
+        Err(e) => return Err(err_word(STEP_MCOUNTER_GET, e)),
+    }
+
+    // Step 4: decrement the counter, then expect one less than the init value.
+    if let Err(e) = session.mcounter_update(counter)
+    {
+        return Err(err_word(STEP_MCOUNTER_UPDATE, e));
+    }
+    match session.mcounter_get(counter)
+    {
+        Ok(v) if v == MCOUNTER_INIT_VALUE - 1 => {}
+        Ok(_) => return Err(err_word_code(STEP_MCOUNTER_UPDATE, SPR_MCOUNTER_MISMATCH)),
+        Err(e) => return Err(err_word(STEP_MCOUNTER_UPDATE, e)),
+    }
+
+    // Step 5: RE-INIT proof. Init to a HIGHER value and read it back. An upward
+    // re-init succeeding proves the counter is fully resettable, not a one-shot
+    // latch.
+    if let Err(e) = session.mcounter_init(counter, MCOUNTER_REINIT_VALUE)
+    {
+        return Err(err_word(STEP_MCOUNTER_REINIT, e));
+    }
+    match session.mcounter_get(counter)
+    {
+        Ok(v) if v == MCOUNTER_REINIT_VALUE => {}
+        Ok(_) => return Err(err_word_code(STEP_MCOUNTER_REINIT, SPR_MCOUNTER_MISMATCH)),
+        Err(e) => return Err(err_word(STEP_MCOUNTER_REINIT, e)),
+    }
+    Ok(())
+}
+
+/// Step 6: the counter at-zero boundary behaviour.
+///
+/// Init to 1, decrement to 0, confirm the read is 0, then a decrement at zero
+/// must report the under-run (UpdateErr) and keep the session live. Returns the
+/// packed error word on any fault and never tears the session down.
+fn run_mcounter_zero_boundary
+(
+    session: &mut BringupSession,
+    counter: MCounterIdx,
+)
+    -> Result<(), u32>
+{
+    if let Err(e) = session.mcounter_init(counter, 1)
+    {
+        return Err(err_word(STEP_MCOUNTER_ZERO, e));
+    }
+    if let Err(e) = session.mcounter_update(counter)
+    {
+        // A decrement from one to zero must succeed. A failure here is a genuine
+        // fault, surfaced as its own error.
+        return Err(err_word(STEP_MCOUNTER_ZERO, e));
+    }
+    match session.mcounter_get(counter)
+    {
+        Ok(0) => {}
+        Ok(_) => return Err(err_word_code(STEP_MCOUNTER_ZERO, SPR_ZERO_BOUNDARY)),
+        Err(e) => return Err(err_word(STEP_MCOUNTER_ZERO, e)),
+    }
+    match session.mcounter_update(counter)
+    {
+        // The documented at-zero under-run: a decrement below zero is refused with
+        // UpdateErr and the session stays live.
+        Err(SeError::L3(L3Error::Result(L3Status::UpdateErr))) => {}
+        // Any other Err is a genuine fault, surfaced as itself.
+        Err(e) => return Err(err_word(STEP_MCOUNTER_ZERO, e)),
+        // A decrement at zero must not succeed.
+        Ok(()) => return Err(err_word_code(STEP_MCOUNTER_ZERO, SPR_ZERO_BOUNDARY)),
+    }
+    Ok(())
+}
+
+/// Step 7: MAC-and-Destroy repeatability on the slot.
+///
+/// Two identical minimal cycles (initialize, measure) must return identical
+/// measure outputs, proving the destroy is undone by re-initialization. The
+/// init-call outputs are ignored, only the two measure outputs are compared.
+/// Returns the packed error word on any fault and never tears the session down.
+fn run_macdestroy_repeatability
+(
+    session: &mut BringupSession,
+    mac_slot: MacDestroySlot,
+)
+    -> Result<(), u32>
+{
+    // Cycle one: initialize, then measure.
+    if let Err(e) = session.mac_and_destroy(mac_slot, &MAC_INPUT_INIT)
+    {
+        return Err(err_word(STEP_MACDESTROY, e));
+    }
+    let measure_one = match session.mac_and_destroy(mac_slot, &MAC_INPUT_MEASURE)
+    {
+        Ok(out) => out,
+        Err(e) => return Err(err_word(STEP_MACDESTROY, e)),
+    };
+    // Cycle two: re-initialize the destroyed slot, then measure again.
+    if let Err(e) = session.mac_and_destroy(mac_slot, &MAC_INPUT_INIT)
+    {
+        return Err(err_word(STEP_MACDESTROY, e));
+    }
+    let measure_two = match session.mac_and_destroy(mac_slot, &MAC_INPUT_MEASURE)
+    {
+        Ok(out) => out,
+        Err(e) => return Err(err_word(STEP_MACDESTROY, e)),
+    };
+    if measure_one.expose() != measure_two.expose()
+    {
+        return Err(err_word_code(STEP_MACDESTROY, SPR_MACDESTROY_MISMATCH));
+    }
+    Ok(())
+}
+
+/// Steps 8..13: the imported-Ed25519 known-answer test through ECC_Key_Store.
+///
+/// Pre-clean, import the RFC 8032 seed, check the pubkey KAT, sign and host-verify,
+/// checked erase, then a post-erase sign that must fail. On a fault after import
+/// the slot is erased best-effort before returning, so the erase-before-teardown
+/// order holds once the caller tears down. Never tears the session down itself.
+fn run_ecc_store_kat
+(
+    session: &mut BringupSession,
+    ecc_slot: EccSlot,
+)
+    -> Result<(), u32>
+{
+    // Step 8: best-effort pre-clean erase, result IGNORED.
+    let _ = session.ecc_key_erase(ecc_slot);
+
+    // Step 9: import the RFC 8032 seed with ECC_Key_Store. On error erase
+    // best-effort (the slot may hold a partial key) then return.
+    let seed = Zeroizing::new(ED25519_SEED);
+    if let Err(e) = session.ecc_key_store(ecc_slot, EccCurve::Ed25519, &seed)
+    {
+        let _ = session.ecc_key_erase(ecc_slot);
+        return Err(err_word(STEP_ECC_STORE, e));
+    }
+
+    // Step 10: read the public key and check it against the RFC 8032 known answer.
+    let pubkey = match session.ecc_public_key(ecc_slot)
+    {
+        Ok(key) => key,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(ecc_slot);
+            return Err(err_word(STEP_ECC_PUBKEY, e));
+        }
+    };
+    if pubkey.bytes() != ED25519_EXPECTED_PUBKEY.as_slice()
+    {
+        let _ = session.ecc_key_erase(ecc_slot);
+        return Err(err_word_code(STEP_ECC_PUBKEY, SPR_PUBKEY_KAT));
+    }
+    let mut pub_bytes = [0u8; 32];
+    pub_bytes.copy_from_slice(pubkey.bytes());
+
+    // Step 11: sign MESSAGE with the imported key, then host-verify.
+    let sig = match session.eddsa_sign(ecc_slot, MESSAGE)
+    {
+        Ok(sig) => sig,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(ecc_slot);
+            return Err(err_word(STEP_ECC_SIGN, e));
+        }
+    };
+    if !eddsa_verify_host(&pub_bytes, &sig.0)
+    {
+        let _ = session.ecc_key_erase(ecc_slot);
+        return Err(err_word_code(STEP_ECC_SIGN, SPR_EDDSA_REJECT));
+    }
+
+    // Step 12: checked erase of the imported key.
+    if let Err(e) = session.ecc_key_erase(ecc_slot)
+    {
+        return Err(err_word(STEP_ECC_ERASE, e));
+    }
+
+    // Step 13: a post-erase sign MUST fail. ANY Err is accepted as the expected
+    // outcome and only an unexpected Ok is a fault. This proves the erase removed
+    // the key.
+    match session.eddsa_sign(ecc_slot, MESSAGE)
+    {
+        Err(_) => {}
+        Ok(_) => return Err(err_word_code(STEP_POST_ERASE, SPR_POST_ERASE_SIGN)),
+    }
+    Ok(())
+}
+
+/// Runs steps 2..13 under the open session, in order.
+///
+/// Returns the packed error word at the first failing step and never tears the
+/// session down. The caller owns the single teardown, so a helper that erased a
+/// slot before returning keeps the erase-before-teardown order.
+fn run_persist_under_session
+(
+    session: &mut BringupSession,
+    counter: MCounterIdx,
+    mac_slot: MacDestroySlot,
+    ecc_slot: EccSlot,
+)
+    -> Result<(), u32>
+{
+    run_mcounter_set_read(session, counter)?;
+    run_mcounter_zero_boundary(session, counter)?;
+    run_macdestroy_repeatability(session, mac_slot)?;
+    run_ecc_store_kat(session, ecc_slot)?;
+    Ok(())
+}
+
 /// Runs the persistent-but-reversible state bring-up and returns a packed status
 /// word.
 ///
@@ -315,255 +548,25 @@ pub extern "C" fn patinakey_se_persist() -> u32
         Err((_dev, e)) => return err_word(STEP_OPEN_SESSION, e),
     };
 
-    // Step 2: initialize the counter to 5.
-    if let Err(e) = session.mcounter_init(counter, MCOUNTER_INIT_VALUE)
+    // Steps 2..13 run under the open session. On a failure the session is torn
+    // down and the returned word is surfaced, matching the original per-step
+    // teardown.
+    match run_persist_under_session(&mut session, counter, mac_slot, ecc_slot)
     {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MCOUNTER_INIT, e);
-    }
-
-    // Step 3: read the counter and expect exactly the init value.
-    match session.mcounter_get(counter)
-    {
-        Ok(v) if v == MCOUNTER_INIT_VALUE => {}
-        Ok(_) =>
+        Err(word) =>
         {
             let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_MCOUNTER_GET, SPR_MCOUNTER_MISMATCH);
+            word
         }
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MCOUNTER_GET, e);
-        }
-    }
-
-    // Step 4: decrement the counter, then expect one less than the init value.
-    if let Err(e) = session.mcounter_update(counter)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MCOUNTER_UPDATE, e);
-    }
-    match session.mcounter_get(counter)
-    {
-        Ok(v) if v == MCOUNTER_INIT_VALUE - 1 => {}
-        Ok(_) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_MCOUNTER_UPDATE, SPR_MCOUNTER_MISMATCH);
-        }
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MCOUNTER_UPDATE, e);
-        }
-    }
-
-    // Step 5: RE-INIT proof. Init the counter to a HIGHER value and read it back.
-    // An upward re-init succeeding proves the counter is fully resettable, not a
-    // one-shot latch.
-    if let Err(e) = session.mcounter_init(counter, MCOUNTER_REINIT_VALUE)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MCOUNTER_REINIT, e);
-    }
-    match session.mcounter_get(counter)
-    {
-        Ok(v) if v == MCOUNTER_REINIT_VALUE => {}
-        Ok(_) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_MCOUNTER_REINIT, SPR_MCOUNTER_MISMATCH);
-        }
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MCOUNTER_REINIT, e);
-        }
-    }
-
-    // Step 6: zero-boundary. Init to 1, decrement once (Ok, value now 0), confirm
-    // the read is 0, then decrement AGAIN. The decrement at zero must report the
-    // under-run (UpdateErr) and keep the session live, and nothing is burned. An
-    // Ok on the at-zero decrement, or a wrong value at the boundary, is a
-    // zero-boundary surprise. A genuine transport SeError surfaces as itself.
-    if let Err(e) = session.mcounter_init(counter, 1)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MCOUNTER_ZERO, e);
-    }
-    if let Err(e) = session.mcounter_update(counter)
-    {
-        // A decrement from one to zero must succeed. A failure here is a genuine
-        // fault, surfaced as its own error.
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MCOUNTER_ZERO, e);
-    }
-    match session.mcounter_get(counter)
-    {
-        Ok(0) => {}
-        Ok(_) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_MCOUNTER_ZERO, SPR_ZERO_BOUNDARY);
-        }
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MCOUNTER_ZERO, e);
-        }
-    }
-    match session.mcounter_update(counter)
-    {
-        // The documented at-zero under-run: a decrement below zero is refused with
-        // UpdateErr and the session stays live.
-        Err(SeError::L3(L3Error::Result(L3Status::UpdateErr))) => {}
-        // Any other Err is a genuine fault, surfaced as itself.
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MCOUNTER_ZERO, e);
-        }
-        // A decrement at zero must not succeed.
         Ok(()) =>
         {
-            let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_MCOUNTER_ZERO, SPR_ZERO_BOUNDARY);
+            // Step 14: chip-notifying teardown.
+            let (_dev, ack) = session.abort_session();
+            match ack
+            {
+                Ok(()) => SPR_OK | SPR_OK_MARKER,
+                Err(e) => err_word(STEP_SESSION_ABORT, e),
+            }
         }
-    }
-
-    // Step 7: MAC-and-Destroy repeatability on the slot. Per the TROPIC01
-    // PIN-verification app note (New PIN Setup, steps 6.1, 6.2, 6.5), a call with
-    // the INIT input drives the slot to a fixed state that depends only on the
-    // input and index, and a call with the MEASURE input from that state returns
-    // a deterministic output and destroys the slot. Two IDENTICAL minimal cycles
-    // must therefore return IDENTICAL measure outputs: cycle one initializes and
-    // measures, cycle two re-initializes the just-destroyed slot and measures
-    // again. Equal outputs prove the destroy is undone by re-initialization, so
-    // the slot fully re-initializes (reversible). The init-call outputs are
-    // ignored, only the two measure outputs are compared.
-    //
-    // Cycle one: initialize, then measure.
-    if let Err(e) = session.mac_and_destroy(mac_slot, &MAC_INPUT_INIT)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MACDESTROY, e);
-    }
-    let measure_one = match session.mac_and_destroy(mac_slot, &MAC_INPUT_MEASURE)
-    {
-        Ok(out) => out,
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MACDESTROY, e);
-        }
-    };
-    // Cycle two: re-initialize the destroyed slot, then measure again.
-    if let Err(e) = session.mac_and_destroy(mac_slot, &MAC_INPUT_INIT)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_MACDESTROY, e);
-    }
-    let measure_two = match session.mac_and_destroy(mac_slot, &MAC_INPUT_MEASURE)
-    {
-        Ok(out) => out,
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_MACDESTROY, e);
-        }
-    };
-    if measure_one.expose() != measure_two.expose()
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_MACDESTROY, SPR_MACDESTROY_MISMATCH);
-    }
-
-    // Step 8: best-effort pre-clean erase of the ECC slot, result IGNORED. The API
-    // documentation is silent on the erase-on-an-empty-slot result code, and the
-    // vendor SDK reference sequence erases unconditionally before storing, so the
-    // pre-clean tolerates any outcome. The checked erase at step 12 later proves
-    // erase works. A transport-dead chip fails the next step anyway.
-    let _ = session.ecc_key_erase(ecc_slot);
-
-    // Step 9: import the RFC 8032 seed with ECC_Key_Store. The seed is a public
-    // test vector, wrapped in Zeroizing as the store API requires. On error erase
-    // best-effort (the slot may hold a partial key) then tear down.
-    let seed = Zeroizing::new(ED25519_SEED);
-    if let Err(e) = session.ecc_key_store(ecc_slot, EccCurve::Ed25519, &seed)
-    {
-        let _ = session.ecc_key_erase(ecc_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_ECC_STORE, e);
-    }
-
-    // Step 10: read the public key and check it against the RFC 8032 known answer.
-    // Expect exactly 32 bytes for Ed25519. A mismatch means the import or the
-    // on-chip expansion diverged from the standard.
-    let pubkey = match session.ecc_public_key(ecc_slot)
-    {
-        Ok(key) => key,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(ecc_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_ECC_PUBKEY, e);
-        }
-    };
-    if pubkey.bytes() != ED25519_EXPECTED_PUBKEY.as_slice()
-    {
-        let _ = session.ecc_key_erase(ecc_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_ECC_PUBKEY, SPR_PUBKEY_KAT);
-    }
-    let mut pub_bytes = [0u8; 32];
-    pub_bytes.copy_from_slice(pubkey.bytes());
-
-    // Step 11: sign MESSAGE with the imported key, then host-verify the 64-byte
-    // signature under the read 32-byte pubkey with a standard RFC 8032 verifier.
-    let sig = match session.eddsa_sign(ecc_slot, MESSAGE)
-    {
-        Ok(sig) => sig,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(ecc_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_ECC_SIGN, e);
-        }
-    };
-    if !eddsa_verify_host(&pub_bytes, &sig.0)
-    {
-        let _ = session.ecc_key_erase(ecc_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_ECC_SIGN, SPR_EDDSA_REJECT);
-    }
-
-    // Step 12: checked erase of the imported key.
-    if let Err(e) = session.ecc_key_erase(ecc_slot)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_ECC_ERASE, e);
-    }
-
-    // Step 13: a post-erase sign MUST fail. The docs do not pin the exact result
-    // code for a sign on an empty slot, so ANY Err is accepted as the expected
-    // outcome (it keeps the session live) and only an unexpected Ok is a fault.
-    // This proves the erase removed the key.
-    match session.eddsa_sign(ecc_slot, MESSAGE)
-    {
-        Err(_) => {}
-        Ok(_) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_POST_ERASE, SPR_POST_ERASE_SIGN);
-        }
-    }
-
-    // Step 14: chip-notifying teardown.
-    let (_dev, ack) = session.abort_session();
-    match ack
-    {
-        Ok(()) => SPR_OK | SPR_OK_MARKER,
-        Err(e) => err_word(STEP_SESSION_ABORT, e),
     }
 }

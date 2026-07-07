@@ -42,6 +42,7 @@ use tropic01_driver::SeCommands;
 use tropic01_driver::SeError;
 
 use crate::se_session::open_bringup_session;
+use crate::se_session::BringupSession;
 use crate::se_session::CERT_SCRATCH_LEN;
 use crate::se_session::SH0_PUB;
 use crate::se_smoke::build_device;
@@ -267,6 +268,196 @@ fn err_word_code(step: u32, code: u32) -> u32
     RDO_ERR | (step << 8) | (code & 0xFF)
 }
 
+/// Step 3: read pairing slot 0 (expect the prod0 SH0 pubkey) and slots 1..3
+/// (expect empty).
+///
+/// Writes slot 0 into the record. Returns the packed error word on any fault and
+/// never tears the session down, the caller owns teardown.
+fn read_pairing_slots
+(
+    session: &mut BringupSession,
+    record: &mut [u8; RECORD_LEN],
+)
+    -> Result<(), u32>
+{
+    let slot0 = match PairingKeySlot::new(0)
+    {
+        Ok(slot) => slot,
+        Err(e) => return Err(err_word(STEP_PAIRING, e)),
+    };
+    match session.pairing_key_read(slot0)
+    {
+        Ok(key) =>
+        {
+            if key != SH0_PUB
+            {
+                return Err(err_word_code(STEP_PAIRING, RDO_PROD0_MISMATCH));
+            }
+            record[OFF_PAIRING0..OFF_PAIRING0 + key.len()].copy_from_slice(&key);
+        }
+        Err(e) => return Err(err_word(STEP_PAIRING, e)),
+    }
+    // Slots 1, 2, 3 must be empty. The chip reports an empty slot as a recoverable
+    // SlotEmpty result, so that Err is the EXPECTED outcome and maps to success. An
+    // Ok (the slot holds a key) is a surprise, and any other Err is a genuine
+    // fault surfaced as itself.
+    for raw_slot in 1u8..=3u8
+    {
+        let slot = match PairingKeySlot::new(raw_slot)
+        {
+            Ok(slot) => slot,
+            Err(e) => return Err(err_word(STEP_PAIRING, e)),
+        };
+        match session.pairing_key_read(slot)
+        {
+            Err(SeError::L3(L3Error::Result(L3Status::SlotEmpty))) => {}
+            Ok(_) => return Err(err_word_code(STEP_PAIRING, RDO_SLOT_NOT_EMPTY)),
+            Err(e) => return Err(err_word(STEP_PAIRING, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Steps 4 and 5: dump the R-Config then the I-Config objects (read only).
+///
+/// Each read returns a u32 stored little-endian at its fixed record offset.
+/// Returns the packed error word on any fault and never tears the session down.
+fn dump_config_objects
+(
+    session: &mut BringupSession,
+    record: &mut [u8; RECORD_LEN],
+)
+    -> Result<(), u32>
+{
+    for (i, addr) in CONFIG_OBJECTS.iter().enumerate()
+    {
+        match session.r_config_read(*addr)
+        {
+            Ok(value) =>
+            {
+                let off = OFF_R_CONFIG + i * 4;
+                record[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Err(e) => return Err(err_word(STEP_R_CONFIG, e)),
+        }
+    }
+    for (i, addr) in CONFIG_OBJECTS.iter().enumerate()
+    {
+        match session.i_config_read(*addr)
+        {
+            Ok(value) =>
+            {
+                let off = OFF_I_CONFIG + i * 4;
+                record[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Err(e) => return Err(err_word(STEP_I_CONFIG, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Steps 6 and 7: read the high R-Memory slot (expect empty) then erase it.
+///
+/// The erase is the one reversible mutation in the sweep. Returns the packed
+/// error word on any fault and never tears the session down.
+fn read_and_erase_rmem
+(
+    session: &mut BringupSession,
+    rmem_slot: RMemSlot,
+)
+    -> Result<(), u32>
+{
+    let mut rmem_buf = [0u8; RMEM_READ_BUF];
+    match session.rmem_read_into(rmem_slot, &mut rmem_buf)
+    {
+        Ok(0) => {}
+        Ok(_) => return Err(err_word_code(STEP_RMEM_READ, RDO_SLOT_NOT_EMPTY)),
+        Err(e) => return Err(err_word(STEP_RMEM_READ, e)),
+    }
+    if let Err(e) = session.rmem_erase(rmem_slot)
+    {
+        return Err(err_word(STEP_RMEM_ERASE, e));
+    }
+    Ok(())
+}
+
+/// Step 8: the P-256 (ECDSA) export.
+///
+/// Best-effort pre-clean erase, generate, read the 64-byte public key, sign the
+/// fixed digest, export pubkey / signature / digest into the record, then checked
+/// erase. On any fault the slot is erased before returning the packed error word,
+/// so the erase-before-teardown order holds once the caller tears down. Never
+/// tears the session down itself.
+fn p256_export
+(
+    session: &mut BringupSession,
+    p256_slot: EccSlot,
+    record: &mut [u8; RECORD_LEN],
+)
+    -> Result<(), u32>
+{
+    let _ = session.ecc_key_erase(p256_slot);
+    if let Err(e) = session.ecc_key_generate(p256_slot, EccCurve::P256)
+    {
+        let _ = session.ecc_key_erase(p256_slot);
+        return Err(err_word(STEP_P256, e));
+    }
+    let pubkey = match session.ecc_public_key(p256_slot)
+    {
+        Ok(key) => key,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(p256_slot);
+            return Err(err_word(STEP_P256, e));
+        }
+    };
+    if pubkey.bytes().len() != 64
+    {
+        let _ = session.ecc_key_erase(p256_slot);
+        return Err(err_word_code(STEP_P256, RDO_LEN_SURPRISE));
+    }
+    record[OFF_P256_PUB..OFF_P256_PUB + 64].copy_from_slice(pubkey.bytes());
+
+    let sig = match session.ecdsa_sign(p256_slot, &DIGEST)
+    {
+        Ok(sig) => sig,
+        Err(e) =>
+        {
+            let _ = session.ecc_key_erase(p256_slot);
+            return Err(err_word(STEP_P256, e));
+        }
+    };
+    record[OFF_P256_SIG..OFF_P256_SIG + 64].copy_from_slice(&sig.0);
+    record[OFF_DIGEST..OFF_DIGEST + DIGEST.len()].copy_from_slice(&DIGEST);
+
+    if let Err(e) = session.ecc_key_erase(p256_slot)
+    {
+        return Err(err_word(STEP_P256, e));
+    }
+    Ok(())
+}
+
+/// Runs steps 3..8 under the open session, in order, writing into the record.
+///
+/// Returns the packed error word at the first failing step and never tears the
+/// session down. The caller owns the single teardown plus the commit, so a helper
+/// that erased a slot before returning keeps the erase-before-teardown order.
+fn run_readonly_under_session
+(
+    session: &mut BringupSession,
+    p256_slot: EccSlot,
+    rmem_slot: RMemSlot,
+    record: &mut [u8; RECORD_LEN],
+)
+    -> Result<(), u32>
+{
+    read_pairing_slots(session, record)?;
+    dump_config_objects(session, record)?;
+    read_and_erase_rmem(session, rmem_slot)?;
+    p256_export(session, p256_slot, record)?;
+    Ok(())
+}
+
 /// Runs the read-only sweep plus the P-256 export and returns a packed status
 /// word.
 ///
@@ -352,203 +543,45 @@ pub extern "C" fn patinakey_se_readonly() -> u32
         Err((_dev, e)) => return err_word(STEP_OPEN_SESSION, e),
     };
 
-    // Step 3: read pairing slot 0 and expect the embedded prod0 SH0 public key,
-    // then read slots 1..3 and expect each to be empty (never provisioned).
-    let slot0 = match PairingKeySlot::new(0)
+    // Steps 3..8 run under the open session. On a failure the session is torn down
+    // and the returned word is surfaced, matching the original per-step teardown.
+    match run_readonly_under_session(&mut session, p256_slot, rmem_slot, &mut record)
     {
-        Ok(slot) => slot,
-        Err(e) =>
+        Err(word) =>
         {
             let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_PAIRING, e);
+            word
         }
-    };
-    match session.pairing_key_read(slot0)
-    {
-        Ok(key) =>
+        Ok(()) =>
         {
-            if key != SH0_PUB
+            // Step 9: chip-notifying teardown, then commit the record. The write
+            // happens ONLY on this fully-successful path, so there is a single
+            // write site and a failed teardown writes nothing.
+            let (_dev, ack) = session.abort_session();
+            if let Err(e) = ack
             {
-                let (_dev, _ack) = session.abort_session();
-                return err_word_code(STEP_PAIRING, RDO_PROD0_MISMATCH);
+                return err_word(STEP_SESSION_ABORT, e);
             }
-            record[OFF_PAIRING0..OFF_PAIRING0 + key.len()].copy_from_slice(&key);
-        }
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_PAIRING, e);
-        }
-    }
-    // Slots 1, 2, 3 must be empty. The chip reports an empty slot as a recoverable
-    // SlotEmpty result, so that Err is the EXPECTED outcome and maps to success. An
-    // Ok (the slot holds a key) is a surprise, and any other Err is a genuine
-    // fault surfaced as itself.
-    for raw_slot in 1u8..=3u8
-    {
-        let slot = match PairingKeySlot::new(raw_slot)
-        {
-            Ok(slot) => slot,
-            Err(e) =>
+
+            // SAFETY: SHARED_OUT_ADDR is a FIXED compile-time address, the base of
+            // the pinned shared non-secure output window that the secure MPU maps
+            // RW + XN (the 4th region in platform map.rs). RECORD_LEN <=
+            // SHARED_OUT_LEN is static-asserted, so this copies exactly RECORD_LEN
+            // bytes inside that mapped window and writes nothing outside it. No
+            // non-secure input influences the address or the length, so there is no
+            // injection surface. The bytes are PUBLIC (magic tag, chip id, pairing
+            // and ECC public keys, an ECDSA signature, the signed digest, and the
+            // config dumps), never a secret or session key.
+            unsafe
             {
-                let (_dev, _ack) = session.abort_session();
-                return err_word(STEP_PAIRING, e);
+                core::ptr::copy_nonoverlapping(
+                    record.as_ptr(),
+                    SHARED_OUT_ADDR as *mut u8,
+                    RECORD_LEN,
+                );
             }
-        };
-        match session.pairing_key_read(slot)
-        {
-            Err(SeError::L3(L3Error::Result(L3Status::SlotEmpty))) => {}
-            Ok(_) =>
-            {
-                let (_dev, _ack) = session.abort_session();
-                return err_word_code(STEP_PAIRING, RDO_SLOT_NOT_EMPTY);
-            }
-            Err(e) =>
-            {
-                let (_dev, _ack) = session.abort_session();
-                return err_word(STEP_PAIRING, e);
-            }
+
+            RDO_OK | RDO_OK_MARKER
         }
     }
-
-    // Step 4: dump the R-Config objects (read only, never write or erase). Each
-    // read returns a u32 stored little-endian at its fixed offset.
-    for (i, addr) in CONFIG_OBJECTS.iter().enumerate()
-    {
-        match session.r_config_read(*addr)
-        {
-            Ok(value) =>
-            {
-                let off = OFF_R_CONFIG + i * 4;
-                record[off..off + 4].copy_from_slice(&value.to_le_bytes());
-            }
-            Err(e) =>
-            {
-                let (_dev, _ack) = session.abort_session();
-                return err_word(STEP_R_CONFIG, e);
-            }
-        }
-    }
-
-    // Step 5: dump the I-Config objects (read only, never write). Same layout as
-    // the R-Config dump.
-    for (i, addr) in CONFIG_OBJECTS.iter().enumerate()
-    {
-        match session.i_config_read(*addr)
-        {
-            Ok(value) =>
-            {
-                let off = OFF_I_CONFIG + i * 4;
-                record[off..off + 4].copy_from_slice(&value.to_le_bytes());
-            }
-            Err(e) =>
-            {
-                let (_dev, _ack) = session.abort_session();
-                return err_word(STEP_I_CONFIG, e);
-            }
-        }
-    }
-
-    // Step 6: read the high R-Memory slot and expect it empty. rmem_read_into
-    // returns Ok(0) for an empty slot (a stored slot is never zero-length). Any
-    // non-zero length is a surprise, any Err a genuine fault.
-    let mut rmem_buf = [0u8; RMEM_READ_BUF];
-    match session.rmem_read_into(rmem_slot, &mut rmem_buf)
-    {
-        Ok(0) => {}
-        Ok(_) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word_code(STEP_RMEM_READ, RDO_SLOT_NOT_EMPTY);
-        }
-        Err(e) =>
-        {
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_RMEM_READ, e);
-        }
-    }
-
-    // Step 7: erase the high R-Memory slot. This is the ONE mutation in the sweep,
-    // reversible R-Memory on a guaranteed-empty slot (not in any errata brick
-    // list), the same reset primitive libtropic's own tests use.
-    if let Err(e) = session.rmem_erase(rmem_slot)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_RMEM_ERASE, e);
-    }
-
-    // Step 8: the P-256 (ECDSA) export. Best-effort pre-clean erase (result
-    // ignored, the API is silent on erase-on-empty), generate, read the 64-byte
-    // public key, sign the fixed digest, export all three, then checked erase.
-    let _ = session.ecc_key_erase(p256_slot);
-    if let Err(e) = session.ecc_key_generate(p256_slot, EccCurve::P256)
-    {
-        let _ = session.ecc_key_erase(p256_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_P256, e);
-    }
-    let pubkey = match session.ecc_public_key(p256_slot)
-    {
-        Ok(key) => key,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(p256_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_P256, e);
-        }
-    };
-    if pubkey.bytes().len() != 64
-    {
-        let _ = session.ecc_key_erase(p256_slot);
-        let (_dev, _ack) = session.abort_session();
-        return err_word_code(STEP_P256, RDO_LEN_SURPRISE);
-    }
-    record[OFF_P256_PUB..OFF_P256_PUB + 64].copy_from_slice(pubkey.bytes());
-
-    let sig = match session.ecdsa_sign(p256_slot, &DIGEST)
-    {
-        Ok(sig) => sig,
-        Err(e) =>
-        {
-            let _ = session.ecc_key_erase(p256_slot);
-            let (_dev, _ack) = session.abort_session();
-            return err_word(STEP_P256, e);
-        }
-    };
-    record[OFF_P256_SIG..OFF_P256_SIG + 64].copy_from_slice(&sig.0);
-    record[OFF_DIGEST..OFF_DIGEST + DIGEST.len()].copy_from_slice(&DIGEST);
-
-    if let Err(e) = session.ecc_key_erase(p256_slot)
-    {
-        let (_dev, _ack) = session.abort_session();
-        return err_word(STEP_P256, e);
-    }
-
-    // Step 9: chip-notifying teardown, then commit the record. The write happens
-    // ONLY on this fully-successful path, so there is a single write site and a
-    // failed teardown writes nothing.
-    let (_dev, ack) = session.abort_session();
-    if let Err(e) = ack
-    {
-        return err_word(STEP_SESSION_ABORT, e);
-    }
-
-    // SAFETY: SHARED_OUT_ADDR is a FIXED compile-time address, the base of the
-    // pinned shared non-secure output window that the secure MPU maps RW + XN (the
-    // 4th region in platform map.rs). RECORD_LEN <= SHARED_OUT_LEN is
-    // static-asserted, so this copies exactly RECORD_LEN bytes inside that mapped
-    // window and writes nothing outside it. No non-secure input influences the
-    // address or the length, so there is no injection surface. The bytes are
-    // PUBLIC (magic tag, chip id, pairing and ECC public keys, an ECDSA signature,
-    // the signed digest, and the config dumps), never a secret or session key.
-    unsafe
-    {
-        core::ptr::copy_nonoverlapping(
-            record.as_ptr(),
-            SHARED_OUT_ADDR as *mut u8,
-            RECORD_LEN,
-        );
-    }
-
-    RDO_OK | RDO_OK_MARKER
 }

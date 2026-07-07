@@ -336,6 +336,195 @@ mod firmware
         }
     }
 
+    /// Logs the decoded SE chip-mode smoke word over RTT.
+    fn report_smoke(smoke: u32)
+    {
+        if smoke & SMOKE_ERR != 0
+        {
+            defmt::warn!("SE chip-mode probe failed, error code {=u8:#04x}", smoke as u8);
+        }
+        else if smoke & SMOKE_OK != 0
+        {
+            defmt::info!("SE chip mode: {=str}", mode_label(smoke & 0xFF));
+        }
+        else
+        {
+            defmt::warn!("SE chip-mode word unrecognized {=u32:#010x}", smoke);
+        }
+    }
+
+    /// Logs the decoded fw-update outcome over RTT.
+    ///
+    /// On success reads the running versions back over the existing veneers so the
+    /// log shows the new firmware, not just the ok marker.
+    #[cfg(feature = "se-fw-update")]
+    #[allow(unsafe_code)]
+    fn report_fw_update(fwu: u32)
+    {
+        if fwu & FWU_ERR != 0
+        {
+            let (label, recovers) = fwu_step((fwu >> 8) & 0xFF);
+            defmt::error!
+            (
+                "SE fw-update FAILED at step {=str}, error code {=u8:#04x} \
+                 (re-run recovers: {=bool})",
+                label,
+                fwu as u8,
+                recovers
+            );
+        }
+        else if fwu & FWU_OK != 0
+        {
+            // Read the running versions back over the existing veneers so the
+            // log shows the new firmware, not just the ok marker.
+            // SAFETY: value-out CMSE entries, same contract as the other veneers.
+            let (new_riscv, new_spect) = unsafe
+            {
+                (
+                    patinakey_nsc_se_riscv_fw_version(),
+                    patinakey_nsc_se_spect_fw_version(),
+                )
+            };
+            defmt::info!
+            (
+                "SE fw-update OK (updated to 2.0.0), marker {=u8:#04x}, \
+                 RISC-V now {=u32:#010x}, SPECT now {=u32:#010x}",
+                fwu as u8,
+                new_riscv,
+                new_spect
+            );
+        }
+        else
+        {
+            defmt::warn!("SE fw-update word unrecognized {=u32:#010x}", fwu);
+        }
+    }
+
+    /// Logs the decoded L3-session outcome over RTT.
+    #[cfg(feature = "se-session")]
+    fn report_session(ses: u32)
+    {
+        if ses & SES_ERR != 0
+        {
+            // The low byte is the SeError code, or 0xF0 = echo mismatch (a
+            // good L3 reply that did not echo the Ping payload).
+            defmt::error!
+            (
+                "SE L3 session FAILED at step {=str}, error code {=u8:#04x}",
+                ses_step((ses >> 8) & 0xFF),
+                ses as u8
+            );
+        }
+        else if ses & SES_OK != 0
+        {
+            defmt::info!("SE L3 session + Ping OK, marker {=u8:#04x}", ses as u8);
+        }
+        else
+        {
+            defmt::warn!("SE L3 session word unrecognized {=u32:#010x}", ses);
+        }
+    }
+
+    /// Logs the decoded crypto + attestation outcome over RTT.
+    #[cfg(feature = "se-session")]
+    fn report_crypto(scr: u32)
+    {
+        if scr & SCR_ERR != 0
+        {
+            // The low byte is the SeError code, or a RESERVED code: 0xF1
+            // EdDSA verify reject, 0xF2 random sanity, 0xF3 ECDSA shape, 0xF4
+            // pubkey length.
+            defmt::error!
+            (
+                "SE crypto FAILED at step {=str}, error code {=u8:#04x}",
+                crypto_step((scr >> 8) & 0xFF),
+                scr as u8
+            );
+        }
+        else if scr & SCR_OK != 0
+        {
+            defmt::info!("SE crypto + attestation OK, marker {=u8:#04x}", scr as u8);
+        }
+        else
+        {
+            defmt::warn!("SE crypto word unrecognized {=u32:#010x}", scr);
+        }
+    }
+
+    /// Logs the decoded persistent-state outcome over RTT.
+    #[cfg(feature = "se-session")]
+    fn report_persist(spr: u32)
+    {
+        if spr & SPR_ERR != 0
+        {
+            // The low byte is the SeError code, or a RESERVED code: 0xF5
+            // mcounter value mismatch, 0xF6 mcounter zero-boundary surprise,
+            // 0xF7 MAC-and-Destroy determinism mismatch, 0xF8 pubkey KAT
+            // mismatch, 0xF9 EdDSA verify reject, 0xFA post-erase sign Ok.
+            defmt::error!
+            (
+                "SE persistent state FAILED at step {=str}, error code {=u8:#04x}",
+                persist_step((spr >> 8) & 0xFF),
+                spr as u8
+            );
+        }
+        else if spr & SPR_OK != 0
+        {
+            defmt::info!("SE persistent state OK, marker {=u8:#04x}", spr as u8);
+        }
+        else
+        {
+            defmt::warn!("SE persistent state word unrecognized {=u32:#010x}", spr);
+        }
+    }
+
+    /// Logs the decoded read-only sweep outcome over RTT.
+    ///
+    /// On success logs each record field as hex so the operator copies the P-256
+    /// fields to the host verifier. All bytes are public.
+    #[cfg(feature = "se-session")]
+    fn report_readonly(rdo: u32, record: &[u8; 1024])
+    {
+        if rdo & RDO_ERR != 0
+        {
+            // The low byte is the SeError code, or a RESERVED code: 0xFB prod0
+            // pubkey mismatch, 0xFD slot not empty, 0xFE length surprise.
+            defmt::error!
+            (
+                "SE read-only sweep FAILED at step {=str}, error code {=u8:#04x}",
+                rdo_step((rdo >> 8) & 0xFF),
+                rdo as u8
+            );
+        }
+        else if rdo & RDO_OK != 0 && record[0..RDO_MAGIC.len()] != RDO_MAGIC
+        {
+            // The status word says OK, but the record does not carry the magic
+            // tag: a corrupt or stale buffer. Do NOT log the fields as valid.
+            defmt::error!
+            (
+                "SE read-only sweep OK but record magic mismatch, first bytes {=[u8]:02x}",
+                record[0..RDO_MAGIC.len()]
+            );
+        }
+        else if rdo & RDO_OK != 0
+        {
+            defmt::info!("SE read-only sweep OK, marker {=u8:#04x}", rdo as u8);
+            // Log each record field over RTT as hex so the operator copies the
+            // P-256 fields to the host verifier. All bytes are public.
+            defmt::info!("chip id: {=[u8]:02x}", record[RDO_OFF_CHIP_ID..RDO_OFF_PAIRING0]);
+            defmt::info!("pairing0 pubkey: {=[u8]:02x}", record[RDO_OFF_PAIRING0..RDO_OFF_P256_PUB]);
+            defmt::info!("p256 pubkey X||Y: {=[u8]:02x}", record[RDO_OFF_P256_PUB..RDO_OFF_P256_SIG]);
+            defmt::info!("p256 signature r||s: {=[u8]:02x}", record[RDO_OFF_P256_SIG..RDO_OFF_DIGEST]);
+            defmt::info!("p256 digest: {=[u8]:02x}", record[RDO_OFF_DIGEST..RDO_OFF_R_CONFIG]);
+            defmt::info!("r-config dump: {=[u8]:02x}", record[RDO_OFF_R_CONFIG..RDO_OFF_I_CONFIG]);
+            defmt::info!("i-config dump: {=[u8]:02x}", record[RDO_OFF_I_CONFIG..RDO_RECORD_LEN]);
+        }
+        else
+        {
+            defmt::warn!("SE read-only sweep word unrecognized {=u32:#010x}", rdo);
+        }
+    }
+
     /// Non-secure entry: run the SE bring-up chain over the veneers and report.
     ///
     /// Calls the version veneer, then the three SE veneers, logging the NSC
@@ -366,18 +555,7 @@ mod firmware
 
         defmt::info!("NSC interface version {=u32:#010x}", version);
 
-        if smoke & SMOKE_ERR != 0
-        {
-            defmt::warn!("SE chip-mode probe failed, error code {=u8:#04x}", smoke as u8);
-        }
-        else if smoke & SMOKE_OK != 0
-        {
-            defmt::info!("SE chip mode: {=str}", mode_label(smoke & 0xFF));
-        }
-        else
-        {
-            defmt::warn!("SE chip-mode word unrecognized {=u32:#010x}", smoke);
-        }
+        report_smoke(smoke);
 
         defmt::info!("SE RISC-V FW version word {=u32:#010x}", riscv);
         defmt::info!("SE SPECT FW version word {=u32:#010x}", spect);
@@ -394,43 +572,7 @@ mod firmware
             // shared, so there is nothing to validate on either side.
             let fwu = unsafe { patinakey_nsc_se_fw_update() };
 
-            if fwu & FWU_ERR != 0
-            {
-                let (label, recovers) = fwu_step((fwu >> 8) & 0xFF);
-                defmt::error!
-                (
-                    "SE fw-update FAILED at step {=str}, error code {=u8:#04x} \
-                     (re-run recovers: {=bool})",
-                    label,
-                    fwu as u8,
-                    recovers
-                );
-            }
-            else if fwu & FWU_OK != 0
-            {
-                // Read the running versions back over the existing veneers so the
-                // log shows the new firmware, not just the ok marker.
-                // SAFETY: value-out CMSE entries, same contract as above.
-                let (new_riscv, new_spect) = unsafe
-                {
-                    (
-                        patinakey_nsc_se_riscv_fw_version(),
-                        patinakey_nsc_se_spect_fw_version(),
-                    )
-                };
-                defmt::info!
-                (
-                    "SE fw-update OK (updated to 2.0.0), marker {=u8:#04x}, \
-                     RISC-V now {=u32:#010x}, SPECT now {=u32:#010x}",
-                    fwu as u8,
-                    new_riscv,
-                    new_spect
-                );
-            }
-            else
-            {
-                defmt::warn!("SE fw-update word unrecognized {=u32:#010x}", fwu);
-            }
+            report_fw_update(fwu);
         }
 
         // Feature-gated: run the L3 secure-channel bring-up and log the decoded
@@ -444,25 +586,7 @@ mod firmware
             // shared, so there is nothing to validate on either side.
             let ses = unsafe { patinakey_nsc_se_session_ping() };
 
-            if ses & SES_ERR != 0
-            {
-                // The low byte is the SeError code, or 0xF0 = echo mismatch (a
-                // good L3 reply that did not echo the Ping payload).
-                defmt::error!
-                (
-                    "SE L3 session FAILED at step {=str}, error code {=u8:#04x}",
-                    ses_step((ses >> 8) & 0xFF),
-                    ses as u8
-                );
-            }
-            else if ses & SES_OK != 0
-            {
-                defmt::info!("SE L3 session + Ping OK, marker {=u8:#04x}", ses as u8);
-            }
-            else
-            {
-                defmt::warn!("SE L3 session word unrecognized {=u32:#010x}", ses);
-            }
+            report_session(ses);
 
             // Crypto + attestation bring-up, run AFTER the session ping. It
             // verifies the chain to the pinned root, opens a session on the
@@ -474,26 +598,7 @@ mod firmware
             // so there is nothing to validate on either side.
             let scr = unsafe { patinakey_nsc_se_crypto() };
 
-            if scr & SCR_ERR != 0
-            {
-                // The low byte is the SeError code, or a RESERVED code: 0xF1
-                // EdDSA verify reject, 0xF2 random sanity, 0xF3 ECDSA shape, 0xF4
-                // pubkey length.
-                defmt::error!
-                (
-                    "SE crypto FAILED at step {=str}, error code {=u8:#04x}",
-                    crypto_step((scr >> 8) & 0xFF),
-                    scr as u8
-                );
-            }
-            else if scr & SCR_OK != 0
-            {
-                defmt::info!("SE crypto + attestation OK, marker {=u8:#04x}", scr as u8);
-            }
-            else
-            {
-                defmt::warn!("SE crypto word unrecognized {=u32:#010x}", scr);
-            }
+            report_crypto(scr);
 
             // Persistent-but-reversible state bring-up, run after the crypto
             // veneer. It opens a session and exercises the monotonic counters,
@@ -504,27 +609,7 @@ mod firmware
             // so there is nothing to validate on either side.
             let spr = unsafe { patinakey_nsc_se_persist() };
 
-            if spr & SPR_ERR != 0
-            {
-                // The low byte is the SeError code, or a RESERVED code: 0xF5
-                // mcounter value mismatch, 0xF6 mcounter zero-boundary surprise,
-                // 0xF7 MAC-and-Destroy determinism mismatch, 0xF8 pubkey KAT
-                // mismatch, 0xF9 EdDSA verify reject, 0xFA post-erase sign Ok.
-                defmt::error!
-                (
-                    "SE persistent state FAILED at step {=str}, error code {=u8:#04x}",
-                    persist_step((spr >> 8) & 0xFF),
-                    spr as u8
-                );
-            }
-            else if spr & SPR_OK != 0
-            {
-                defmt::info!("SE persistent state OK, marker {=u8:#04x}", spr as u8);
-            }
-            else
-            {
-                defmt::warn!("SE persistent state word unrecognized {=u32:#010x}", spr);
-            }
+            report_persist(spr);
 
             // Read-only sweep plus P-256 export, run after the persist veneer. It
             // takes no argument: the secure side writes the exported record to the
@@ -545,44 +630,7 @@ mod firmware
             // before returning. Only public bytes are read.
             let record: [u8; 1024] = unsafe { core::ptr::read_volatile(&raw const SHARED_OUT) };
 
-            if rdo & RDO_ERR != 0
-            {
-                // The low byte is the SeError code, or a RESERVED code: 0xFB prod0
-                // pubkey mismatch, 0xFD slot not empty, 0xFE length surprise.
-                defmt::error!
-                (
-                    "SE read-only sweep FAILED at step {=str}, error code {=u8:#04x}",
-                    rdo_step((rdo >> 8) & 0xFF),
-                    rdo as u8
-                );
-            }
-            else if rdo & RDO_OK != 0 && record[0..RDO_MAGIC.len()] != RDO_MAGIC
-            {
-                // The status word says OK, but the record does not carry the magic
-                // tag: a corrupt or stale buffer. Do NOT log the fields as valid.
-                defmt::error!
-                (
-                    "SE read-only sweep OK but record magic mismatch, first bytes {=[u8]:02x}",
-                    record[0..RDO_MAGIC.len()]
-                );
-            }
-            else if rdo & RDO_OK != 0
-            {
-                defmt::info!("SE read-only sweep OK, marker {=u8:#04x}", rdo as u8);
-                // Log each record field over RTT as hex so the operator copies the
-                // P-256 fields to the host verifier. All bytes are public.
-                defmt::info!("chip id: {=[u8]:02x}", record[RDO_OFF_CHIP_ID..RDO_OFF_PAIRING0]);
-                defmt::info!("pairing0 pubkey: {=[u8]:02x}", record[RDO_OFF_PAIRING0..RDO_OFF_P256_PUB]);
-                defmt::info!("p256 pubkey X||Y: {=[u8]:02x}", record[RDO_OFF_P256_PUB..RDO_OFF_P256_SIG]);
-                defmt::info!("p256 signature r||s: {=[u8]:02x}", record[RDO_OFF_P256_SIG..RDO_OFF_DIGEST]);
-                defmt::info!("p256 digest: {=[u8]:02x}", record[RDO_OFF_DIGEST..RDO_OFF_R_CONFIG]);
-                defmt::info!("r-config dump: {=[u8]:02x}", record[RDO_OFF_R_CONFIG..RDO_OFF_I_CONFIG]);
-                defmt::info!("i-config dump: {=[u8]:02x}", record[RDO_OFF_I_CONFIG..RDO_RECORD_LEN]);
-            }
-            else
-            {
-                defmt::warn!("SE read-only sweep word unrecognized {=u32:#010x}", rdo);
-            }
+            report_readonly(rdo, &record);
 
             // defmt-rtt is non-blocking and the core reaching wfi immediately
             // after the final line can drop it before the host drains RTT. Busy

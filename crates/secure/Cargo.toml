@@ -9,6 +9,12 @@ license.workspace = true
 publish = false
 description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone partition bring-up."
 
+# platform is used only on the embedded target (apply_partition, apply_secure_mpu,
+# MmioBus), behind cfg(target_os = "none"). On the host build this crate is an
+# empty main, so cargo-udeps (host-only) reads platform as unused. It is not.
+[package.metadata.cargo-udeps.ignore]
+normal = ["platform"]
+
 [features]
 # se-fw-update: adds the one-shot SE firmware-update path (secure body plus its
 # NSC veneer and the two vendor blobs). OFF by default, so the product firmware
