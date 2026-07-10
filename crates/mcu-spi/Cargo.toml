@@ -1,0 +1,28 @@
+[package]
+name = "mcu-spi"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "STM32U545 blocking SPI1 master driver for the TROPIC01 secure element, behind a host-testable register seam."
+
+[dependencies]
+embedded-hal = { workspace = true }
+tropic01-driver = { path = "../tropic01-driver", default-features = false }
+
+# mcu-arch: the Armv8-M cycle delay backing SeWait. Not target-gated, because
+# mcu-arch already carries its own bare-metal and host halves.
+mcu-arch = { path = "../mcu-arch" }
+
+# This crate owns the volatile SPI1 / GPIO / RCC MMIO 
+# (word reads/writes for config and STATUS registers, byte reads/writes for TXDR/RXDR). 
+# Every unsafe block must carry a `// SAFETY:` justification.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

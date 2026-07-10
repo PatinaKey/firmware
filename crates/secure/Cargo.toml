@@ -1,0 +1,65 @@
+[package]
+name = "secure"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "STM32U545 secure-world (TZ-S) firmware binary: runs the TrustZone partition bring-up."
+
+# platform is used only on the embedded target (apply_partition, apply_secure_mpu,
+# MmioBus), behind cfg(target_os = "none"). On the host build this crate is an
+# empty main, so cargo-udeps (host-only) reads platform as unused. It is not.
+[package.metadata.cargo-udeps.ignore]
+normal = ["platform"]
+
+[features]
+# se-fw-update: adds the one-shot SE firmware-update path (secure body plus its
+# NSC veneer and the two vendor blobs). OFF by default, so the product firmware
+# is byte-unchanged. Build both bin crates with --features se-fw-update to turn
+# the whole path on.
+default = []
+se-fw-update = []
+# se-session: adds the L3 secure-channel bring-up path (secure body plus its NSC
+# veneer). Reads STPUB, opens a Noise KK1 session against slot 0, runs one L3
+# Ping with an echo compare, then aborts.
+# Also adds a crypto + attestation bring-up path (se_crypto.rs): it turns on the
+# driver attestation feature (chain verify to the pinned root) and links
+# ed25519-dalek to verify an SE-produced EdDSA signature on-host.
+se-session = ["tropic01-driver/attestation", "dep:ed25519-dalek"]
+
+[dependencies]
+platform = { path = "../platform" }
+
+# cc: compiles the C -mcmse NSC veneer shim (secure_nsc.c) at build time. It is
+# the de-facto, mature, mainstream build-script C compiler driver for Rust.
+[build-dependencies]
+cc = "1.2"
+
+# Embedded-only deps. On the host the bin
+# is an empty stub (see src/main.rs), so these compile only for the target.
+[target.'cfg(target_os = "none")'.dependencies]
+# mcu-arch: the DSB/ISB pair the MPU enable publishes through before the BXNS
+# hand-off. The source also wedges on WFI in its two fail-closed error arms. Fat
+# LTO const-folds the region tables, proves both arms unreachable, and drops them,
+# so the linked secure image carries no WFI instruction.
+mcu-arch = { path = "../mcu-arch" }
+cortex-m-rt = { workspace = true }
+panic-halt = { workspace = true }
+mcu-spi = { path = "../mcu-spi" }
+tropic01-driver = { path = "../tropic01-driver", default-features = false }
+zeroize = { workspace = true }
+# Pulled in only by the se-session feature.
+ed25519-dalek = { workspace = true, optional = true }
+
+# Lint quarantine: this bin holds the untestable MMIO wiring (it instantiates the
+# real MmioBus), so it overrides the workspace `unsafe_code = forbid` to `deny`
+# Keeps every unsafe behind a `// SAFETY:` note.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

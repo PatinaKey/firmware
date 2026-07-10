@@ -1,0 +1,32 @@
+[package]
+name = "image-verify"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "no_std Ed25519 verifier for the patina_key signed firmware-image format."
+# Dev-only fuzz harness kept out of the published package. It has its own
+# detached workspace and needs nightly instrumentation.
+exclude = ["/fuzz"]
+
+[features]
+# Exposes the `fuzz` module (the attacker-facing verify seam) to libFuzzer
+# harnesses. Not for production. Enabled only by the fuzz crate.
+_fuzz = []
+# Exposes the host-side header encoder (`encode_header`). OFF by default so the
+# on-device build never pulls it in. Enabled only by the host signing tool.
+encode = []
+
+[dependencies]
+# Ed25519 verify path only. default-features = false keeps it no_std and
+# heap-free. Tests additionally use its SigningKey to mint fixtures.
+ed25519-dalek = { workspace = true }
+
+# This crate is pure parsing plus one dalek verify call. It has NO unsafe, so it
+# INHERITS the workspace lints (unsafe_code = forbid). A local [lints] table
+# would DOWNGRADE forbid to deny, which is not wanted here.
+[lints]
+workspace = true

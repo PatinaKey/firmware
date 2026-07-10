@@ -1,0 +1,55 @@
+[package]
+name = "image-signer"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+authors = ["PatinaKey <contact@patinakey.fr>"]
+license = "GPL-3.0-or-later"
+description = "Host-only tool that signs patina_key firmware images with an Ed25519 key."
+publish = false
+
+# Detach from the firmware workspace: this is a HOST tool, never built for the
+# MCU target and never a member of the firmware workspace. An empty [workspace]
+# table makes it its own root, like the fuzz crate.
+[workspace]
+
+[lib]
+name = "image_signer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "image-signer"
+path = "src/main.rs"
+
+[dependencies]
+# The shared on-wire layout. The `encode` feature gives the SINGLE source of
+# truth for the header bytes, and verify_image gives the round-trip self-check.
+image-verify = { path = "../../crates/image-verify", features = ["encode"] }
+
+# Ed25519 signing from a raw 32-byte seed. The zeroize feature wipes the
+# SigningKey on drop, so no plaintext key scalar lingers in memory.
+ed25519-dalek = { version = "3.0", default-features = false, features = ["zeroize"] }
+
+# Wipes the intermediate plaintext seed buffer on drop. 
+# The alloc feature lets a Vec<u8> seed buffer be wiped too.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# The integration tests verify the signed output through the real verify path,
+# so they read it back exactly as the device would.
+image-verify = { path = "../../crates/image-verify", features = ["encode"] }
+
+# End-to-end test only: drive the tool's signed output through the real
+# dual-bank update machine, which pins the dev root key. This edge runs ONLY in
+# the signer's host tests. The update machine never depends on this tool, so the
+# MCU target build is untouched.
+#
+# The `_fuzz` feature is what exposes the host MockFlash / MockSeCounter seams to
+# an external test consumer (they are otherwise gated to fw-update's own tests).
+fw-update = { path = "../../crates/fw-update", features = ["_fuzz"] }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

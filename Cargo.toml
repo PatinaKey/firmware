@@ -1,6 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["crates/tropic01-driver"]
+members = [
+    "crates/tropic01-driver",
+    "crates/platform",
+    "crates/mcu-arch",
+    "crates/mcu-spi",
+    "crates/mcu-flash",
+    "crates/secure",
+    "crates/nonsecure",
+    "crates/image-verify",
+    "crates/fw-update",
+]
 
 [workspace.package]
 edition = "2024"
@@ -14,26 +24,41 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 embedded-hal = "1.0"
 zeroize = { version = "1.9", default-features = false, features = ["derive"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
-aes-gcm = { version = "0.11.0", default-features = false, features = ["aes"] }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 # ECDSA verification of the TROPIC01 X.509 attestation chain (P-384/SHA-384 on
 # the lower links, P-521/SHA-512 up to the Tropic root). Verification only: no
 # secret key and no secret-dependent path runs here, so the inputs are public
 # certificates and the failure modes are correctness, not side-channel leakage.
+ecdsa = { version = "0.17", default-features = false }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+
+# Ed25519 verification of the signed firmware-image header (image-verify crate).
+# Verify-only on the device: the pinned root public key is the trust input and
+# no secret key runs here, so the failure modes are correctness, not
+# side-channel leakage. default-features = false keeps it no_std and heap-free.
 #
-# These are RELEASE CANDIDATES on purpose. The crate tree already sits on the
-# RustCrypto digest 0.11 / crypto-common 0.2 generation (sha2 0.11, hmac 0.13).
-# The matching p384/p521/ecdsa releases that speak that same generation are still
-# release candidates. the last STABLE curve releases (p384 0.13, ecdsa 0.16) speak the older
-# digest 0.10 generation and would pull a SECOND copy of sha2/digest into the
-# binary. Pinning the rc keeps a single crypto generation, which is the smaller
-# audit and flash surface.
-# TODO: drop the -rc pins once p384/p521 0.14 and ecdsa 0.17 ship stable.
-ecdsa = { version = "0.17.0-rc.23", default-features = false }
-p384 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
-p521 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa"] }
+# NOTE: ed25519-dalek 2.2 pins sha2 0.10 while the workspace otherwise sits on
+# sha2 0.11. This second sha2 copy is accepted.
+ed25519-dalek = { version = "3.0", default-features = false }
+
+# MCU platform / firmware-binary dependencies
+
+# cortex-m-rt: the de-facto reset-vector + .data/.bss init + linker glue for
+# Cortex-M. Provides #[entry] and the link.x script the two bins build against.
+cortex-m-rt = "0.7"
+# critical-section: the one-impl-per-link registry that defmt-rtt uses to guard
+# its RTT ring buffer.
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+# panic-halt: minimal panicking-aborts-by-spinning handler.
+panic-halt = "1.0"
+# defmt + defmt-rtt: the SE bring-up report channel (defmt over RTT, read by
+# probe-rs over SWD).
+defmt = "1.1"
+defmt-rtt = "1.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -41,3 +66,8 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = "deny"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

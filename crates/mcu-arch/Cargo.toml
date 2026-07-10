@@ -1,0 +1,19 @@
+[package]
+name = "mcu-arch"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Armv8-M (Cortex-M33) core instruction wrappers: barriers, NOP, WFI, cycle delay, PRIMASK."
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

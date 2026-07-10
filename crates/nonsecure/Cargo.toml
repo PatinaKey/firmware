@@ -1,0 +1,49 @@
+[package]
+name = "nonsecure"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "STM32U545 non-secure (TZ-NS) firmware binary: minimal skeleton (becomes the embassy app)."
+
+[features]
+# se-fw-update: declares and calls the fw-update NSC veneer and logs the decoded
+# outcome. OFF by default, so the NS entry is unchanged. Must be built together
+# with the secure crate's matching feature (the veneer is emitted secure-side).
+default = []
+se-fw-update = []
+# se-session: declares and calls the L3 session NSC veneer and logs the decoded
+# outcome, then busy-drains RTT so the final line is not dropped before the host
+# reads it. OFF by default, so the NS entry is unchanged. Must be built together
+# with the secure crate's matching feature (the veneer is emitted secure-side).
+se-session = []
+
+[dependencies]
+
+# Embedded-only deps. On the host the bin is an empty stub, so these compile only
+# for the target. embassy is not a dependency yet (the NS app is still a skeleton).
+#
+# defmt + defmt-rtt: the SE bring-up report channel (defmt over RTT, read by
+# probe-rs over SWD).
+[target.'cfg(target_os = "none")'.dependencies]
+mcu-arch = { path = "../mcu-arch" }
+critical-section = { workspace = true }
+cortex-m-rt = { workspace = true }
+panic-halt = { workspace = true }
+defmt = { workspace = true }
+defmt-rtt = { workspace = true }
+
+# Lint quarantine: the NS entry declares + calls the secure-gateway veneer
+# through an unsafe extern block (the only unsafe here), so this bin overrides the
+# workspace `unsafe_code = forbid` to `deny` (own [lints] table = no workspace
+# inheritance) and keeps every unsafe behind a `// SAFETY:` note. Same clippy
+# denial as the workspace.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

@@ -2,7 +2,7 @@
 # Local mirror of the CI/CD pipeline (.github/workflows/ci.yml).
 # Runs the same gates without GitHub. Reports land at the repository
 # root with the same names SonarQube expects: clippy-report.json,
-# lcov.info, cargo-audit.sarif.
+# lcov.info, cargo-deny.sarif.
 #
 # Usage: scripts/ci-local.sh [--quick] [--strict] [--fuzz-secs N]
 #   --quick       skip the slow stages (coverage, fuzz)
@@ -86,11 +86,16 @@ clippy_reports()
     RUSTFLAGS="-D warnings" cargo clippy -p tropic01-driver --locked --target thumbv8m.main-none-eabihf -- -D warnings
 }
 
-audit_stage()
+deny_stage()
 {
-    local status=0
-    cargo audit --format sarif > cargo-audit.sarif || status=$?
-    return $status
+    # Advisories (RustSec), licenses, banned/yanked crates, untrusted sources,
+    # duplicate versions. `check` runs all of these and blocks on any of them.
+    # deny now also owns the advisory gate cargo-audit used to run (same RustSec
+    # database), so there is no separate audit stage. Export SARIF for SonarQube
+    # first (non-blocking, so the readable human-format gate below is what fails
+    # the stage with clean output), then run the blocking gate.
+    cargo deny --format sarif check > cargo-deny.sarif || true
+    cargo deny check
 }
 
 coverage_stage()
@@ -160,6 +165,49 @@ fuzz_stage()
     )
 }
 
+embedded_stage()
+{
+    # The real firmware for thumbv8m. Lint every embedded library on the target,
+    # then run the two-image TrustZone build across the feature matrix. RUSTFLAGS
+    # stays UNSET here so the target link-args from .cargo/config.toml (-Tlink.x)
+    # survive: the warning gate rides on clippy (a check pass, no link) instead.
+    local c
+    for c in platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
+    do
+        cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings || return 1
+    done
+    local feats=(default se-session)
+    # se-fw-update embeds gitignored vendor blobs. Build it only if they are here.
+    if [ -f crates/secure/fw_blobs/cpu_fw_2_0_0.bin ] && [ -f crates/secure/fw_blobs/spect_fw_1_0_0.bin ]
+    then
+        feats+=(se-fw-update)
+    else
+        echo "skipping se-fw-update (vendor blobs absent from crates/secure/fw_blobs/)"
+    fi
+    local f
+    for f in "${feats[@]}"
+    do
+        local fa=()
+        [ "$f" != "default" ] && fa=(--features "$f")
+        echo ">> two-stage build [$f]"
+        # Force the shared CMSE import object to regenerate for this feature set.
+        touch crates/secure/csrc/secure_nsc.c
+        cargo build  -p secure    --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" || return 1
+        cargo build  -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" || return 1
+        cargo clippy -p secure    --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" -- -D warnings || return 1
+        cargo clippy -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${fa[@]}" -- -D warnings || return 1
+        bash scripts/asm-gate.sh "$f" || return 1
+    done
+}
+
+signer_stage()
+{
+    # The offline signing tool is a detached workspace, not a member of the main
+    # one, so it is tested and linted on its own manifest.
+    cargo test   --locked --manifest-path tools/image-signer/Cargo.toml || return 1
+    cargo clippy --locked --manifest-path tools/image-signer/Cargo.toml --all-targets -- -D warnings
+}
+
 # pipeline stages, same order as the workflow
 
 RUSTFLAGS="-D warnings" run "check (host)" cargo check --workspace --locked --all-targets
@@ -173,16 +221,18 @@ run "test (host)" cargo test --workspace --locked
 
 run "clippy (json report + strict)" clippy_reports
 
-if have cargo-audit
+if have clang
 then
-    run "audit (sarif, blocking)" audit_stage
+    run "embedded (thumbv8m two-stage)" embedded_stage
 else
-    skip "audit" "cargo install cargo-audit"
+    skip "embedded" "install clang (the CMSE shim needs it)"
 fi
+
+run "image-signer (host tool)" signer_stage
 
 if have cargo-deny
 then
-    run "deny (licenses, sources, yanked)" cargo deny check
+    run "deny (advisories, licenses, sources, yanked; sarif)" deny_stage
 else
     skip "deny" "cargo install cargo-deny"
 fi

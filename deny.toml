@@ -17,6 +17,11 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The workspace crates depend on each other by path, which cargo-deny counts as
+# a wildcard requirement. Those internal path dependencies are legitimate and
+# resolved inside the workspace, so allow them. An external wildcard dependency
+# stays denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
