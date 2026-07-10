@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 description = "STM32U545 non-secure (TZ-NS) firmware binary: minimal skeleton (becomes the embassy app)."
 
 [features]
@@ -28,10 +29,8 @@ se-session = []
 # defmt + defmt-rtt: the SE bring-up report channel (defmt over RTT, read by
 # probe-rs over SWD).
 [target.'cfg(target_os = "none")'.dependencies]
-# critical-section-single-core supplies the single-hart critical-section impl
-# that defmt-rtt's RTT encoder needs. The non-secure world is the single-core
-# Armv8-M context, so the interrupt-masking critical section is sound here.
-cortex-m = { workspace = true, features = ["critical-section-single-core"] }
+mcu-arch = { path = "../mcu-arch" }
+critical-section = { workspace = true }
 cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
 defmt = { workspace = true }

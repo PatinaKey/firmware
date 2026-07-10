@@ -3,7 +3,7 @@
 //! The TROPIC01 L1 seam polls `CHIP_STATUS` on a 25 ms cadence and bounds each
 //! command with a millisecond timeout. Neither needs a precise clock: an
 //! approximate busy delay is enough, and it keeps this bring-up free of a timer
-//! peripheral and an interrupt. [`CycleWait`] spins `cortex_m::asm::delay` for an
+//! peripheral and an interrupt. [`CycleWait`] spins `mcu_arch::delay` for an
 //! estimated cycle count per millisecond.
 //!
 //! The SE GPO ready line (PB1) is NOT used here: `wait_ready` falls back to a
@@ -70,15 +70,16 @@ impl SeWait for CycleWait
     }
 }
 
-/// Busy-spins `cycles` core-clock cycles (host build: a no-op stub).
-#[cfg(not(target_os = "none"))]
-fn delay_cycles(_cycles: u32)
-{
-}
-
-/// Busy-spins `cycles` core-clock cycles via the Cortex-M cycle-accurate delay.
-#[cfg(target_os = "none")]
+/// Busy-spins `cycles` core-clock cycles via the Armv8-M countdown loop.
+///
+/// This is the single seam where cycle-calibrated timing enters the SE driver.
+/// The whole `CHIP_STATUS` poll cadence rests on it, and a miscompiled spin is a
+/// silicon-only fault no host test can observe.
+///
+/// The disassembly gate in scripts/asm-gate.sh anchors on this symbol. Dropping
+/// `inline(never)` fails the gate.
+#[inline(never)]
 fn delay_cycles(cycles: u32)
 {
-    cortex_m::asm::delay(cycles);
+    mcu_arch::delay(cycles);
 }

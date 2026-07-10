@@ -28,7 +28,7 @@ image-verify = { path = "../../crates/image-verify", features = ["encode"] }
 
 # Ed25519 signing from a raw 32-byte seed. The zeroize feature wipes the
 # SigningKey on drop, so no plaintext key scalar lingers in memory.
-ed25519-dalek = { version = "2.2", default-features = false, features = ["zeroize"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["zeroize"] }
 
 # Wipes the intermediate plaintext seed buffer on drop. 
 # The alloc feature lets a Vec<u8> seed buffer be wiped too.

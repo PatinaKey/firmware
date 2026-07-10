@@ -46,7 +46,7 @@ mod se_session;
 #[cfg(all(target_os = "none", feature = "se-session"))]
 mod se_crypto;
 
-// The persistent-but-reversible state bring-up path. 
+// The persistent-but-reversible state bring-up path.
 // Feature-gated under the se-session feature: OFF by default, so the
 // product firmware is byte-unchanged and never references it.
 #[cfg(all(target_os = "none", feature = "se-session"))]
@@ -105,7 +105,7 @@ mod firmware
                 // in a tight loop that no NS transition can follow.
                 loop
                 {
-                    cortex_m::asm::wfi();
+                    mcu_arch::wfi();
                 }
             }
         }
@@ -166,14 +166,15 @@ mod firmware
         {
             loop
             {
-                cortex_m::asm::wfi();
+                mcu_arch::wfi();
             }
         }
 
         // Architectural barriers so the freshly enabled MPU config is in effect
-        // before any subsequent access or the branch.
-        cortex_m::asm::dsb();
-        cortex_m::asm::isb();
+        // before any subsequent access or the branch. Both are bracketed by a
+        // SeqCst compiler fence.
+        mcu_arch::dsb();
+        mcu_arch::isb();
 
         // SAFETY: the architectural S->NS entry. MSP_NS is set then BXNS branches
         // to the NS reset, clearing the low bit to enter the non-secure state. The

@@ -2,15 +2,6 @@
 
 [advisories]
 yanked = "deny"
-# bare-metal is unmaintained (RUSTSEC-2026-0110, every version is flagged, no
-# patched or unaffected release exists). It reaches the tree ONLY transitively
-# through cortex-m 0.7.7, the latest cortex-m release, which depends on it
-# non-optionally.
-# There is no upstream fix until a cortex-m release drops bare-metal.
-# It is an unmaintained advisory (informational), not a vulnerability.
-# TODO: drop this ignore once a cortex-m release removes the bare-metal
-#       dependency.
-ignore = ["RUSTSEC-2026-0110"]
 
 [licenses]
 allow = [

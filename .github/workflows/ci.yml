@@ -9,6 +9,8 @@
 #   feature matrix (default, se-session, se-fw-update). The secure crate MUST
 #   link before the non-secure crate so its CMSE import object exists, so the
 #   order is enforced and the shared object is forced to regenerate per feature.
+#   An asm gate disassembles the built images and asserts the hand-rolled
+#   inline asm compiled to the right instructions, since no host lint sees it.
 # - The host signing tool is a detached workspace, so it has its own job.
 # - Live model integration: the coverage job clones the official TROPIC01 model
 #   (libtropic, pinned to a tag + commit) and drives tropic01-driver against it
@@ -117,7 +119,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv8m.main-none-eabihf
-          components: clippy
+          components: clippy, llvm-tools
 
       # The secure crate's build.rs compiles the C -mcmse NSC veneer shim with
       # clang and emits the CMSE import object with rust-lld. clang ships on the
@@ -192,6 +194,12 @@ jobs:
           fi
           cargo clippy -p secure    --locked --release --target thumbv8m.main-none-eabihf "${feat[@]}" -- -D warnings
           cargo clippy -p nonsecure --locked --release --target thumbv8m.main-none-eabihf "${feat[@]}" -- -D warnings
+
+      # This disassembles the images just built and asserts the critical instructions are
+      # what they must be (the cpsid/cpsie masking pair, the dsb/isb/bxns boot
+      # order, the delay countdown loop).
+      - name: Assert the emitted machine code (asm gate)
+        run: scripts/asm-gate.sh "${{ matrix.feature }}"
 
   # Job 3: Host signing tool (detached workspace)
   image-signer:

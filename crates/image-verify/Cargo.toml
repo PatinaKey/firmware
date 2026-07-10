@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 description = "no_std Ed25519 verifier for the patina_key signed firmware-image format."
 # Dev-only fuzz harness kept out of the published package. It has its own
 # detached workspace and needs nightly instrumentation.

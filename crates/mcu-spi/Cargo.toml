@@ -13,20 +13,13 @@ description = "STM32U545 blocking SPI1 master driver for the TROPIC01 secure ele
 embedded-hal = { workspace = true }
 tropic01-driver = { path = "../tropic01-driver", default-features = false }
 
-# Embedded-only: the cortex-m cycle delay backing SeWait compiles only for the
-# bare-metal target. On the host the delay is a no-op stub, so the seam stays
-# host-testable without a core-clock dependency.
-[target.'cfg(target_os = "none")'.dependencies]
-cortex-m = { workspace = true }
+# mcu-arch: the Armv8-M cycle delay backing SeWait. Not target-gated, because
+# mcu-arch already carries its own bare-metal and host halves.
+mcu-arch = { path = "../mcu-arch" }
 
-# Lint QUARANTINE (per-crate override of the workspace `unsafe_code = forbid`).
-#
-# The workspace forbids unsafe entirely. This crate owns the volatile SPI1 / GPIO
-# / RCC MMIO (word reads/writes for config and STATUS registers, byte reads/writes
-# for TXDR/RXDR), so it defines its OWN [lints.rust] table to DOWNGRADE the forbid
-# to deny: unsafe is still denied by default and every unsafe block must carry a
-# `// SAFETY:` justification.
-# The clippy denial matches the workspace policy.
+# This crate owns the volatile SPI1 / GPIO / RCC MMIO 
+# (word reads/writes for config and STATUS registers, byte reads/writes for TXDR/RXDR). 
+# Every unsafe block must carry a `// SAFETY:` justification.
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"

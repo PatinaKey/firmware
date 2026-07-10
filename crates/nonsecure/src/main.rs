@@ -12,6 +12,11 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
+// The critical-section implementation defmt-rtt links against. 
+// Target-only: the host stub has no interrupt mask and no defmt-rtt.
+#[cfg(target_os = "none")]
+mod critical_section_impl;
+
 #[cfg(target_os = "none")]
 mod firmware
 {
@@ -631,20 +636,11 @@ mod firmware
             let record: [u8; 1024] = unsafe { core::ptr::read_volatile(&raw const SHARED_OUT) };
 
             report_readonly(rdo, &record);
-
-            // defmt-rtt is non-blocking and the core reaching wfi immediately
-            // after the final line can drop it before the host drains RTT. Busy
-            // spin a bounded count (about 4 s at 4 MHz MSI) so the host has time
-            // to read the buffer. Bring-up only, gated with the feature.
-            for _ in 0..16_000_000u32
-            {
-                cortex_m::asm::nop();
-            }
         }
 
         loop
         {
-            cortex_m::asm::wfi();
+            mcu_arch::wfi();
         }
     }
 }

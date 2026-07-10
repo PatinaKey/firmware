@@ -23,9 +23,10 @@ use crate::regs;
 
 /// A bus-side fault from the SPI1 driver.
 ///
-/// The byte loop can stall (the status flag never settles within the budget) or
-/// the receiver can overrun. Both map to an `embedded-hal` [`ErrorKind`] so the
-/// TROPIC01 L1 seam erases them to `L1Error::Bus`.
+/// The byte loop can stall (the status flag never settles within the budget), the
+/// receiver can overrun, or the caller can ask for an operation this device does
+/// not implement. All map to an `embedded-hal` [`ErrorKind`] so the TROPIC01 L1
+/// seam erases them to `L1Error::Bus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spi1Error
 {
@@ -34,6 +35,10 @@ pub enum Spi1Error
     Timeout,
     /// The receiver reported an overrun (`SR.OVR`).
     Overrun,
+    /// The caller requested `Operation::DelayNs`, which this device cannot
+    /// honour. No timer is wired, and a busy-wait carries no timing guarantee on
+    /// this core, so the request fails instead of silently over-waiting.
+    Unsupported,
 }
 
 impl SpiError for Spi1Error
@@ -44,6 +49,7 @@ impl SpiError for Spi1Error
         {
             Spi1Error::Timeout => ErrorKind::Other,
             Spi1Error::Overrun => ErrorKind::Overrun,
+            Spi1Error::Unsupported => ErrorKind::Other,
         }
     }
 }
@@ -150,8 +156,7 @@ where
     ///
     /// `Write` clocks each byte and discards the read. `Read` clocks a dummy byte
     /// per slot and stores the read. `Transfer` / `TransferInPlace` send and store
-    /// per byte. `DelayNs` busy-spins a bounded count (an approximate delay, the
-    /// L1 cadence does not need a precise one).
+    /// per byte. `DelayNs` is refused: see [`Spi1Error::Unsupported`].
     fn run_operation(&mut self, op: &mut Operation<'_, u8>) -> Result<(), Spi1Error>
     {
         match op
@@ -196,10 +201,15 @@ where
                 }
                 Ok(())
             }
-            Operation::DelayNs(ns) =>
+            Operation::DelayNs(_) =>
             {
-                spin_delay_ns(*ns);
-                Ok(())
+                // FAIL CLOSED. No timer peripheral is wired, and PM0264 sec 3.11.9
+                // states a `NOP` "is not necessarily a time-consuming NOP" because
+                // the core "might remove it from the pipeline before it reaches the
+                // execution stage", so a NOP busy-wait carries no lower bound this
+                // driver could honour. Refusing is safer than silently waiting
+                // hundreds of times the requested span.
+                Err(Spi1Error::Unsupported)
             }
         }
     }
@@ -439,27 +449,3 @@ where
     bus.modify32(regs::SPI1_CR1, 0, regs::SPI_CR1_CSTART);
 }
 
-/// Busy-spins an approximate `ns`-nanosecond delay (host build: a counted loop).
-///
-/// Only the `Operation::DelayNs` path uses it, which the TROPIC01 L1 sequence
-/// does not exercise. The count is a coarse upper bound, not a calibrated delay.
-#[cfg(not(target_os = "none"))]
-fn spin_delay_ns(_ns: u32)
-{
-}
-
-/// Busy-spins an approximate `ns`-nanosecond delay using a NOP loop.
-///
-/// An approximate busy-wait, NOT a calibrated delay: it spins one NOP per
-/// requested nanosecond, so at any real core clock a NOP costs well under one
-/// nanosecond and the loop under-waits. The TROPIC01 L1 path never exercises it
-/// (the poll cadence uses `SeWait`, not SPI `DelayNs`), so the coarse bound is
-/// acceptable here. A precise delay would scale by the known core clock.
-#[cfg(target_os = "none")]
-fn spin_delay_ns(ns: u32)
-{
-    for _ in 0..ns
-    {
-        cortex_m::asm::nop();
-    }
-}
