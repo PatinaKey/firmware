@@ -16,9 +16,7 @@
 //!
 //! The user-facing feature is `attestation` (ON by default): it enables X.509
 //! chain verification and pulls the ECDSA curve crates (`ecdsa`, `p384`,
-//! `p521`). Those are PRE-RELEASE (`-rc`) crates today, pinned to keep one
-//! `digest` generation in the tree, so a default build drags in release-candidate
-//! crypto. Disable the feature via `default-features = false` to drop them when
+//! `p521`). Disable the feature via `default-features = false` to drop them when
 //! only STPUB extraction is needed. The other two features are development-only
 //! and a consumer leaves them off. `_fuzz` exposes the attacker-facing parsers to
 //! the libFuzzer harnesses. `model-itest` compiles the live integration tests

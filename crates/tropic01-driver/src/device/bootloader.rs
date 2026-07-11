@@ -12,14 +12,15 @@
 //! fields. It validates only the framing LENGTH bounds needed for safe wire
 //! framing. The chip's own signature check validates the payload semantics.
 //!
-//! SECURITY: this whole surface is NOT silicon-validated. The official TROPIC01
-//! emulator models none of the bootloader, so the host tests are golden
-//! request-byte assertions plus review, weaker than the model-backed command
-//! tranches. A power-fault test on real hardware (interrupt an update mid-write
-//! and confirm the chip's dual-bank design leaves a bootable bank) is a HARD
-//! GATE before any production use. The chip is dual-bank, so an aborted or
-//! rejected update is recoverable (no brick), but that is the CHIP's guarantee,
-//! not something this driver can assert on untested silicon.
+//! SECURITY: this surface has been exercised ONCE on real silicon (a firmware
+//! update from 1.0.0 to 2.0.0), but it is not yet fully silicon-validated. The
+//! official TROPIC01 emulator models none of the bootloader, so the host tests
+//! are golden request-byte assertions plus review, weaker than the model-backed
+//! command tranches. A full power-fault test on real hardware (interrupt an
+//! update mid-write and confirm the chip's dual-bank design leaves a bootable
+//! bank) is a HARD GATE before any production use. The chip is dual-bank, so an
+//! aborted or rejected update is recoverable (no brick), but that is the CHIP's
+//! guarantee, not something this driver has yet proven under a power fault.
 
 use embedded_hal::spi::SpiDevice;
 
