@@ -26,9 +26,10 @@ use tropic01_driver::SessionConfig;
 use tropic01_driver::Tropic01;
 use zeroize::Zeroizing;
 
-use mcu_spi::CycleWait;
 use mcu_spi::MmioSpiBus;
 use mcu_spi::Spi1Device;
+use mcu_spi::SysTickWait;
+use platform::MmioBus;
 
 use crate::se_smoke::build_device;
 use crate::se_smoke::se_error_code;
@@ -157,9 +158,11 @@ fn err_word_code(step: u32, code: u32) -> u32
 }
 
 /// The bring-up device handle with no session open (over the real SPI1).
-pub(crate) type BringupNoSession = Tropic01<Spi1Device<MmioSpiBus>, CycleWait, NoSession>;
+pub(crate) type BringupNoSession =
+    Tropic01<Spi1Device<MmioSpiBus>, SysTickWait<MmioBus>, NoSession>;
 /// The bring-up device handle with an active L3 session (over the real SPI1).
-pub(crate) type BringupSession = Tropic01<Spi1Device<MmioSpiBus>, CycleWait, ActiveSession>;
+pub(crate) type BringupSession =
+    Tropic01<Spi1Device<MmioSpiBus>, SysTickWait<MmioBus>, ActiveSession>;
 
 /// Opens the Noise KK1 bring-up session against slot 0 on a supplied STPUB.
 ///

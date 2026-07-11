@@ -20,22 +20,17 @@
 //! hazard. Each export carries its own per-item `#[allow(unsafe_code)]`, matching
 //! the per-item pattern in main.rs / the veneer declarations.
 
-use mcu_spi::CycleWait;
 use mcu_spi::MmioSpiBus;
 use mcu_spi::Spi1Device;
+use mcu_spi::SysTickWait;
+use platform::MmioBus;
+use platform::SysTick;
 use tropic01_driver::ChipMode;
 use tropic01_driver::L1Error;
 use tropic01_driver::L2Error;
 use tropic01_driver::NoSession;
 use tropic01_driver::SeError;
 use tropic01_driver::Tropic01;
-
-/// Estimated core-clock cycles per millisecond for the busy-loop [`CycleWait`].
-///
-/// The MCU boots on MSI. A conservative 4 MHz MSI gives 4000 cycles per
-/// millisecond. An over-estimate only lengthens the L1 poll cadence, which is
-/// safe. The exact rate is refined when the clock tree is brought up.
-const CYCLES_PER_MS: u32 = 4_000;
 
 // Status-word encoding (value-out, no pointer crosses the boundary).
 //
@@ -134,10 +129,11 @@ fn l1_diag_code(l1: L1Error) -> u8
 ///
 /// Shared with the fw-update path (se_fw_update.rs) so both build the handle the
 /// same way over the real SPI1.
-pub(crate) fn build_device() -> Tropic01<Spi1Device<MmioSpiBus>, CycleWait, NoSession>
+pub(crate) fn build_device()
+    -> Tropic01<Spi1Device<MmioSpiBus>, SysTickWait<MmioBus>, NoSession>
 {
     let spi = Spi1Device::new(MmioSpiBus::new());
-    let wait = CycleWait::new(CYCLES_PER_MS);
+    let wait = SysTickWait::new(SysTick::new(MmioBus::new(), platform::HCLK_HZ));
     Tropic01::new(spi, wait)
 }
 

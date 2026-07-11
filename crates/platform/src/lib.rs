@@ -11,6 +11,11 @@
 //! BOOT_LOCK / WRP). Those silicon-lifecycle steps wait on the hardware
 //! power-fault validation.
 //!
+//! The crate also owns [`HCLK_HZ`], the on ([`SysTick`]), both behind the same
+//! [`RegisterBus`] seam. [`SysTick`] runs e core-clock source of truth, and a
+//! polled secure SysTick millisecond delaythe 24-bit down counter with TICKINT =
+//! 0 and no exception armed, so it never perturbs the isolation state above.
+//!
 //! # Design for testability
 //!
 //! The whole sequence is written against the [`RegisterBus`] port, so the logic
@@ -39,17 +44,21 @@
 #![cfg_attr(not(test), no_std)]
 
 mod bus;
+mod clock;
 mod error;
 mod map;
 mod mpu;
 mod partition;
 mod regs;
+mod systick;
 
 pub use crate::bus::RegisterBus;
 #[cfg(target_os = "none")]
 pub use crate::bus::MmioBus;
+pub use crate::clock::HCLK_HZ;
 pub use crate::error::PartitionError;
 pub use crate::map::SauRegion;
 pub use crate::map::SAU_PROGRAMMED_REGIONS;
 pub use crate::mpu::apply_secure_mpu;
 pub use crate::partition::apply_partition;
+pub use crate::systick::SysTick;

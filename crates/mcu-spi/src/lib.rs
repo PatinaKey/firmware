@@ -1,7 +1,7 @@
 //! STM32U545 blocking SPI1 master driver for the TROPIC01 secure element.
 //!
 //! Provides an `embedded-hal` 1.0 `SpiDevice` ([`Spi1Device`]) and a blocking
-//! `SeWait` ([`CycleWait`]) the TROPIC01 driver consumes, all behind a
+//! `SeWait` ([`SysTickWait`]) the TROPIC01 driver consumes, all behind a
 //! host-testable register seam ([`SpiBusAccess`]). The driver is a polled-I/O
 //! SPI1 master plus a software GPIO chip-select on PA4 (active-low), in SPI mode
 //! 0, MSB-first, 8-bit frames. It does the FUNCTIONAL bring-up the TrustZone
@@ -42,7 +42,7 @@ pub use crate::bus::MmioSpiBus;
 pub use crate::bus::SpiBusAccess;
 pub use crate::spi::Spi1Device;
 pub use crate::spi::Spi1Error;
-pub use crate::wait::CycleWait;
+pub use crate::wait::SysTickWait;
 
 #[cfg(test)]
 mod tests;

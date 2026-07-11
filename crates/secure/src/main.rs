@@ -137,6 +137,11 @@ mod firmware
     // This targeted allow opts in just the volatile NS-vector reads, the SCB_NS
     // write, and the MSR/BXNS hand-off below, each carrying its own `// SAFETY:`.
     #[allow(unsafe_code)]
+    // The asm-gate anchors its dsb -> isb -> bxns hand-off check on this symbol.
+    // `#[inline(never)]` holds the symbol against LTO so the gate never breaks
+    // for no defect. It is a diverging one-shot boot fn, so the attribute costs
+    // nothing at runtime.
+    #[inline(never)]
     fn start_nonsecure(bus: &mut MmioBus) -> !
     {
         // Stage the NS hand-off inputs while the MPU is still OFF. These reads and
