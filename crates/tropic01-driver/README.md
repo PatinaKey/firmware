@@ -63,9 +63,9 @@ fn run(spi: impl embedded_hal::spi::SpiDevice, wait: impl tropic01_driver::SeWai
 
 The `attestation` feature (ON by default) enables X.509 chain verification
 (`verify_cert_chain` / `read_verified_chip_stpub`) and pulls the ECDSA curve
-crates (`ecdsa` / `p384` / `p521`), which are PRE-RELEASE (`-rc`) today (pinned to
-keep one `digest` generation in the tree). Build with `default-features = false`
-to drop those dependencies when only STPUB extraction is needed.
+crates (`ecdsa` / `p384` / `p521`). 
+Build with `default-features = false` to drop those dependencies when only 
+STPUB extraction is needed.
 
 **Disclaimer:** This is an unofficial, community-driven project. It is not affiliated with, endorsed by, or officially supported by Tropic Square. For the official SDK, please refer to Tropic Square's libtropic.
 
@@ -195,12 +195,10 @@ attestation, and the firmware-update bootloader are implemented.
 
 Work toward a production `1.0`. The core is proven on silicon (see
 [Coverage](#coverage)), so what remains is: a full power-fault recovery test for
-the firmware update before any production use, moving the `ecdsa` / `p384` /
-`p521` curve crates off their release candidates once stable versions on the same
-`digest` generation ship, a type-state `open_session` that consumes a
-chain-verified STPUB, and an `embedded-hal-async` path. The one-way provisioning
-writes stay conformance-validated by design, since a live burn commits the single
-production part.
+the firmware update before any production use, a type-state `open_session` that
+consumes a chain-verified STPUB, and an `embedded-hal-async` path. The one-way
+provisioning writes stay conformance-validated by design, since a live burn
+commits the single production part.
 
 ## Design principles
 
@@ -214,9 +212,7 @@ production part.
   is a typed `Result`. Attacker-facing parsers use only bounds-checked combinators.
 - **Minimal supply chain** - audited `no_std` crypto crates only (x25519-dalek,
   aes-gcm, sha2, hmac, zeroize, and ecdsa / p384 / p521 for chain verification).
-  A small rewrite is preferred over a non-essential dependency. The ECDSA curve
-  crates are pinned to RustCrypto release candidates to keep a single `digest`
-  generation in the tree. The `Cargo.toml` comment tracks moving to stable.
+  A small rewrite is preferred over a non-essential dependency.
 
 ## Testing
 
