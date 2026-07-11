@@ -295,6 +295,60 @@ pub(crate) const MPU_MAIR0_VALUE: u32 =
 /// (`0x1F`). PM0264 sec 4.5.13/4.5.15, Armv8-M PMSAv8 region encoding.
 pub(crate) const MPU_ALIGN_MASK: u32 = SAU_ALIGN_MASK;
 
+// ===========================================================================
+// SysTick: Armv8-M architectural, in the secure System Control Space. These are
+// the SECURE view of the banked SysTick (the instance the secure core sees at
+// these addresses). PM0264 Table 83. The non-secure alias adds +0x0002_0000 and
+// is a separate banked instance this driver never touches.
+//
+// SysTick lives in the PPB / System Control Space, outside the SAU and GTZC
+// (RM0456 Figure 8 and sec 3.5.2), so the non-secure world cannot address the
+// secure instance. Every address and key bit is pinned to a primary-source
+// literal in `regs_pin_tests`.
+// ===========================================================================
+
+/// `SYST_CSR` (control and status). PM0264 Table 83.
+pub(crate) const SYST_CSR: u32 = 0xE000_E010;
+/// `SYST_RVR` (reload value, RELOAD[23:0]). PM0264 Table 83 / Table 85.
+pub(crate) const SYST_RVR: u32 = 0xE000_E014;
+/// `SYST_CVR` (current value, CURRENT[23:0]). PM0264 Table 83 / Table 86.
+pub(crate) const SYST_CVR: u32 = 0xE000_E018;
+/// `SYST_CALIB` (calibration). PM0264 Table 83.
+///
+/// This driver NEVER reads it. TENMS reads 0 on this part (NOREF = 1, SKEW = 1,
+/// reset 0xC0000000), so it carries no usable ten-millisecond count. RM0456's
+/// STCALIB = 0x3E8 is a documentation-only constant, NOT a hardware read: the
+/// two names clash, so the reload count is derived from the known HCLK, never
+/// from SYST_CALIB. Named so the block layout is explicit.
+#[allow(dead_code)]
+pub(crate) const SYST_CALIB: u32 = 0xE000_E01C;
+
+/// `SYST_CSR.ENABLE` bit 0: enable the counter. PM0264 Table 84.
+pub(crate) const SYST_CSR_ENABLE: u32 = 1 << 0;
+/// `SYST_CSR.TICKINT` bit 1: raise a SysTick exception on wrap. NEVER set here.
+///
+/// Left 0 so the counter is polled and no exception is armed, which keeps
+/// AIRCR.PRIS neutral for it. Used by the test that asserts this bit is absent
+/// from every CSR write. PM0264 Table 84.
+#[allow(dead_code)]
+pub(crate) const SYST_CSR_TICKINT: u32 = 1 << 1;
+/// `SYST_CSR.CLKSOURCE` bit 2: 1 = processor clock (HCLK) directly. PM0264
+/// Table 84. Selecting HCLK needs no RCC step (CLKSOURCE = 0 would route through
+/// RCC_CCIPR1.SYSTICKSEL, which this driver does not touch).
+pub(crate) const SYST_CSR_CLKSOURCE: u32 = 1 << 2;
+/// `SYST_CSR.COUNTFLAG` bit 16: set when the counter reaches 0, cleared by
+/// reading SYST_CSR. PM0264 Table 84.
+pub(crate) const SYST_CSR_COUNTFLAG: u32 = 1 << 16;
+
+/// `SYST_RVR.RELOAD` field mask (bits [23:0]). PM0264 Table 85.
+pub(crate) const SYST_RVR_RELOAD_MASK: u32 = 0x00FF_FFFF;
+/// `SYST_CVR.CURRENT` field mask (bits [23:0]). PM0264 Table 86.
+///
+/// The driver only ever writes 0 to CVR (any write clears it), so this mask is
+/// pinned for completeness and named so the field width is explicit.
+#[allow(dead_code)]
+pub(crate) const SYST_CVR_CURRENT_MASK: u32 = 0x00FF_FFFF;
+
 #[cfg(test)]
 #[path = "regs_pin_tests.rs"]
 mod regs_pin_tests;

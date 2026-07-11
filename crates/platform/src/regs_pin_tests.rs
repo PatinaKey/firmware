@@ -192,3 +192,30 @@ fn tzic_ier_offsets()
     assert_eq!(TZIC_IER3_OFF, 0x008, "TZIC_IER3 offset");
     assert_eq!(TZIC_IER4_OFF, 0x00C, "TZIC_IER4 offset");
 }
+
+// ===========================================================================
+// SysTick (Armv8-M, secure view). Pin every address and bit to the canonical
+// PM0264 Table 83 / 84 literal so a shifted block or transposed bit fails here.
+// ===========================================================================
+
+#[test]
+fn systick_register_addresses_are_canonical()
+{
+    assert_eq!(SYST_CSR, 0xE000_E010, "SYST_CSR");
+    assert_eq!(SYST_RVR, 0xE000_E014, "SYST_RVR");
+    assert_eq!(SYST_CVR, 0xE000_E018, "SYST_CVR");
+    assert_eq!(SYST_CALIB, 0xE000_E01C, "SYST_CALIB");
+}
+
+#[test]
+fn systick_bit_positions_are_canonical()
+{
+    // SYST_CSR: ENABLE bit0, TICKINT bit1, CLKSOURCE bit2, COUNTFLAG bit16.
+    assert_eq!(SYST_CSR_ENABLE, 0x0000_0001, "SYST_CSR.ENABLE bit0");
+    assert_eq!(SYST_CSR_TICKINT, 0x0000_0002, "SYST_CSR.TICKINT bit1");
+    assert_eq!(SYST_CSR_CLKSOURCE, 0x0000_0004, "SYST_CSR.CLKSOURCE bit2");
+    assert_eq!(SYST_CSR_COUNTFLAG, 0x0001_0000, "SYST_CSR.COUNTFLAG bit16");
+    // RVR / CVR count fields are the low 24 bits.
+    assert_eq!(SYST_RVR_RELOAD_MASK, 0x00FF_FFFF, "SYST_RVR.RELOAD [23:0]");
+    assert_eq!(SYST_CVR_CURRENT_MASK, 0x00FF_FFFF, "SYST_CVR.CURRENT [23:0]");
+}

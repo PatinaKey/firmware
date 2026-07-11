@@ -448,7 +448,7 @@ name = "mcu-spi"
 version = "0.0.1"
 dependencies = [
  "embedded-hal",
- "mcu-arch",
+ "platform",
  "tropic01-driver",
 ]
 

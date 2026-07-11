@@ -25,9 +25,3 @@ pub(crate) fn isb()
 {
     compiler_fence(Ordering::SeqCst);
 }
-
-/// Does nothing. A host build has no core-clock cycle to count.
-#[inline]
-pub(crate) fn delay(_cycles: u32)
-{
-}

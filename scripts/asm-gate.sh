@@ -81,65 +81,6 @@ ordered_in_block()
     ' "$1"
 }
 
-has_countdown_loop()
-{
-    # Succeeds when the symbol block $1 holds the `subs <reg>, #1` plus the `bne`
-    # that branches back to that same `subs`, which is what mcu_arch::delay emits.
-    #
-    # Shape only. The count is out of reach: the secure image reaches delay through
-    # the SPI poll cadence, which passes the cycle budget in a register, never as an
-    # immediate. Scoping to one symbol is what keeps the check honest, because the
-    # whole secure image also holds countdown loops belonging to curve arithmetic.
-    #
-    # A three-operand `subs rd, rn, #1` with rd different from rn is a subtraction,
-    # not a countdown, and is rejected. Both disassembler operand styles are read
-    # (`#1` or `#0x1`, `bne` or `bne.n`).
-    awk '
-        {
-            if (!match($0, /^[ \t]*[0-9a-fA-F]+:/)) next
-            a = substr($0, RSTART, RLENGTH - 1)
-            gsub(/[ \t]/, "", a)
-            sub(/^0+/, "", a)
-            if (a == "") a = "0"
-            addr = tolower(a)
-
-            line = $0
-            sub(/@.*$/, "", line)
-
-            if (line ~ /(^|[ \t])subs(\.w)?[ \t]/)
-            {
-                ops = line
-                sub(/^.*[ \t]subs(\.w)?[ \t]+/, "", ops)
-                gsub(/[ \t]/, "", ops)
-                n = split(ops, o, ",")
-                if ((n == 2 && o[2] ~ /^#(0x)?0*1$/) ||
-                    (n == 3 && o[1] == o[2] && o[3] ~ /^#(0x)?0*1$/))
-                {
-                    subs_addr = addr
-                }
-                next
-            }
-
-            if (subs_addr != "" && line ~ /(^|[ \t])bne(\.[nw])?[ \t]/)
-            {
-                t = line
-                sub(/^.*[ \t]bne(\.[nw])?[ \t]+/, "", t)
-                split(t, tk, /[ \t<]/)
-                g = tolower(tk[1])
-                sub(/^0x/, "", g)
-                sub(/^0+/, "", g)
-                if (g == "") g = "0"
-                if (g == subs_addr)
-                {
-                    found = 1
-                    exit
-                }
-            }
-        }
-        END { exit(found ? 0 : 1) }
-    ' "$1"
-}
-
 asm_expect()
 {
     # asm_expect <what> <extended-regex> <file>
@@ -198,18 +139,17 @@ asm_gate()
     sym_block "$out/nonsecure.s" '<_defmt_acquire>'                       > "$out/acquire.s"
     sym_block "$out/nonsecure.s" '<_defmt_release>'                       > "$out/release.s"
     sym_block "$out/secure.s"    "<[^>]*start_nonsecure${rs_tail}"        > "$out/handoff.s"
-    sym_block "$out/secure.s"    "<[^>]*delay_cycles${rs_tail}"           > "$out/delay.s"
 
     local f
-    for f in acquire release handoff delay
+    for f in acquire release handoff
     do
         if [ ! -s "$out/$f.s" ]
         then
             echo "  FAIL  $f: symbol block not found in the ELF" >&2
-            echo "        The gate anchors on _defmt_acquire, _defmt_release," >&2
-            echo "        secure::firmware::start_nonsecure and mcu_spi::wait::delay_cycles." >&2
-            echo "        The last two carry an #[inline(never)] to hold the anchor. If one" >&2
-            echo "        was inlined or renamed, re-anchor rather than dropping it." >&2
+            echo "        The gate anchors on _defmt_acquire, _defmt_release and" >&2
+            echo "        secure::firmware::start_nonsecure. The last carries an" >&2
+            echo "        #[inline(never)] to hold the anchor. If one was inlined or" >&2
+            echo "        renamed, re-anchor rather than dropping it." >&2
             return 1
         fi
     done
@@ -232,20 +172,6 @@ asm_gate()
         echo "  ok    start_nonsecure emits dsb then isb then bxns"
     else
         echo "  FAIL  start_nonsecure: dsb -> isb -> bxns not found in that order" >&2
-        rc=1
-    fi
-
-    # mcu_arch::delay must still compile to the countdown loop its cycle budget
-    # assumes. The secure image reaches it only through mcu_spi::wait::delay_cycles,
-    # the SPI poll cadence. Scoped to that symbol: the whole secure image also holds
-    # countdown loops belonging to the curve arithmetic, and an image-wide search
-    # would accept one of those as proof. Shape only, no count: delay_cycles takes
-    # its cycle budget in a register, so no immediate to read.
-    if has_countdown_loop "$out/delay.s"
-    then
-        echo "  ok    secure: delay emits the subs / bne countdown loop"
-    else
-        echo "  FAIL  secure: no subs #1 / bne-to-self countdown loop in delay_cycles" >&2
         rc=1
     fi
 

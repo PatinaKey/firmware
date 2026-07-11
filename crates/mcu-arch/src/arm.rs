@@ -5,7 +5,6 @@ use core::arch::asm;
 use core::sync::atomic::compiler_fence;
 use core::sync::atomic::Ordering;
 
-use crate::delay_iterations;
 use crate::interrupts_enabled_from_primask;
 
 /// Suspends the core until an interrupt or an event wakes it.
@@ -54,29 +53,6 @@ pub(crate) fn isb()
     }
 
     compiler_fence(Ordering::SeqCst);
-}
-
-/// Busy-spins a countdown loop sized for `cycles` core-clock cycles.
-#[inline]
-#[allow(unsafe_code)]
-pub(crate) fn delay(cycles: u32)
-{
-    let iterations = delay_iterations(cycles);
-
-    // SAFETY: the block owns one scratch register holding the countdown. Reads
-    // and writes no memory and no stack slot. `preserves_flags` is absent because
-    // `subs` writes the condition flags that `bne` then reads.
-    unsafe
-    {
-        asm!
-        (
-            "1:",
-            "subs {}, #1",
-            "bne 1b",
-            inout(reg) iterations => _,
-            options(nomem, nostack),
-        );
-    }
 }
 
 /// Reads PRIMASK and reports whether maskable interrupts are enabled.
