@@ -1,12 +1,11 @@
 //! The partition MAP: every address, region, pin and channel assignment as a
-//! named, cited constant. This is the single place the device's security layout
-//! is declared, and the sequence in `partition` only consumes these.
+//! named, cited constant. This is the place the device's security layout
+//! is declared, and the sequence in `partition` consumes these.
 //!
 //! Source anchors are RM0456 (memory map and per-peripheral register sections),
 //! AN5347 (TrustZone bring-up application note), the Armv8-M Architecture Reference
 //! Manual (SAU region encoding), and the board pin map (SE SPI1 on PA4-7 + PB1,
-//! USB on PA11/PA12, TSC on PB4/PB6). Where a value is PROVISIONAL (open decision),
-//! it is marked so and kept easy to retune.
+//! USB on PA11/PA12, TSC on PB4/PB6).
 
 use crate::error::PartitionError;
 use crate::regs::SAU_ALIGN_MASK;
@@ -18,9 +17,9 @@ use crate::regs::SAU_RLAR_NSC;
 //
 // SRAM1 is 192 KB at 0x2000_0000 (MPCBB1, 384 blocks of 512 B, 12 super-blocks).
 // The LOWER 128 KB is provisionally secure, the UPPER 64 KB non-secure.
-// This is a TUNABLE skeleton value, not a final security decision. It drives both
-// SAU region 2 (CPU view) and MPCBB1 SECCFGR8..11 (DMA/bus view), which MUST stay
-// consistent. Retune both together when the real secure-RAM budget is known.
+// This is a tunable skeleton value, not a final security decision. It drives both
+// SAU region 2 (CPU view) and MPCBB1 SECCFGR8..11 (DMA/bus view). 
+// Retune both together when the real secure-RAM budget is known.
 // ===========================================================================
 
 /// SRAM1 base address. RM0456 memory map.
@@ -64,14 +63,29 @@ pub(crate) const MPCBB4_CFGLOCK_MASK: u32 = 1;
 // the top 8 KB of secure Bank 1, where the toolchain places `.gnu.sgstubs`.
 // ===========================================================================
 
-/// NSC veneer window base: top 8 KB of secure Bank 1 (.gnu.sgstubs lands here).
-pub(crate) const NSC_VENEER_BASE: u32 = 0x0C03_E000;
-/// NSC veneer window inclusive limit (8 KB).
-pub(crate) const NSC_VENEER_LIMIT: u32 = 0x0C03_FFFF;
+/// NSC veneer window base: page 19 of the secure app band (.gnu.sgstubs lands
+/// here). Layout L1 moves the veneer from the top of the bank to page 19, the
+/// top page of the secure image sub-band. RM0456 sec 7.5.8 identical-per-bank
+/// layout. Matches crates/secure/memory.x + build.rs `--section-start`.
+pub(crate) const NSC_VENEER_BASE: u32 = 0x0C02_6000;
+/// NSC veneer window inclusive limit (8 KB, page 19).
+pub(crate) const NSC_VENEER_LIMIT: u32 = 0x0C02_7FFF;
 
-/// Non-secure flash (Bank 2) base. RM0456 memory map.
-pub(crate) const FLASH_NS_BASE: u32 = 0x0804_0000;
-/// Non-secure flash inclusive limit (256 KB). RM0456 memory map.
+/// Non-secure flash alias base: the whole non-secure flash alias, not just the
+/// high bank.
+///
+/// (RM0456 sec 2.2 Table 8 + sec 3.5.3): a memory space not covered by an
+/// SAU region is fixed SECURE, so an uncovered 0x08.. address is promoted to
+/// secure. Under the A/B layout the ACTIVE bank's non-secure pages sit at the LOW
+/// non-secure alias (0x0802_8000..), which a region starting at 0x0804_0000 would
+/// leave uncovered, so a secure-tagged write to a SECWM-nonsecure page is
+/// Write-Ignored plus WRPERR (RM0456 Table 68). Covering the whole 0x0800_0000..
+/// 0x0807_FFFF alias tags both banks' non-secure pages NS under either SWAP_BANK
+/// value. SECWM still makes a non-secure read of a secure page RAZ plus an
+/// illegal event, so this does not weaken isolation. RM0456 memory map.
+pub(crate) const FLASH_NS_BASE: u32 = 0x0800_0000;
+/// Non-secure flash alias inclusive limit (whole 512 KB alias). RM0456 memory
+/// map.
 pub(crate) const FLASH_NS_LIMIT: u32 = 0x0807_FFFF;
 
 /// Non-secure peripheral APB/AHB alias base. RM0456 memory map.
@@ -213,24 +227,79 @@ pub(crate) fn sau_table() -> Result<[SauRegion; SAU_PROGRAMMED_REGIONS], Partiti
 }
 
 // ===========================================================================
-// Secure MPU region table (PMSAv8, banked secure bank). Four regions over the
-// addresses the CPU ACTUALLY emits in the secure state: secure FLASH at
-// 0x0C00_0000, secure SRAM at 0x2000_0000 (NOT the 0x0E / 0x0C SRAM alias), the
-// pinned non-secure shared output window near the top of the NS SRAM half, and
-// the secure peripheral aliases at 0x5xxx_xxxx. These match crates/secure/
-// memory.x and crates/nonsecure/memory.x. RM0456 memory map.
+// Secure MPU region table (PMSAv8, banked secure bank). Layout L1 (b2): SEVEN
+// regions over the addresses the CPU ACTUALLY emits in the secure state, one
+// spare of the eight implemented. RM0456 memory map, RM0456 sec 7.5.8
+// (identical-per-bank layout, the inactive bank ALWAYS at the high alias).
 //
-// W^X / DEP intent: code is RX read-only (XN = 0), data, the shared output
-// window, and peripherals are RW execute-never (XN = 1). With PRIVDEFENA = 0
-// there is no background map, so any secure access outside these four regions
-// faults.
+//   R0 0x0C004000..0x0C027FFF  RX     active secure code, pages 2-19
+//   R1 metadata SWAP-DERIVED   RW+XN  physical Bank 1 pages 0-1 (see below)
+//   R2 secure SRAM             RW+XN
+//   R3 NS shared-out window    RW+XN
+//   R4 secure peripherals      RW+XN  (Device)
+//   R5 0x0C052000..0x0C067FFF  RW+XN  inactive bank secure image pages 9-19
+//   R6 0x08068000..0x0807FFFF  RW+XN  inactive bank NS image pages 20-31
+//
+// Least privilege: R5/R6 start at page 9, so the MPU PHYSICALLY blocks an updater
+// bug from storing into the inactive bank's metadata (pages 0-1) or its immutable
+// boot stage (pages 2-8, which no region maps at the high alias). R0 excludes the
+// metadata pages (0-1) so a metadata WRITE cannot land in the RX code region: the
+// metadata is a separate RW region. W^X / DEP: R0 is the ONLY executable region
+// (XN = 0), every writable region is execute-never (XN = 1). With PRIVDEFENA = 0
+// there is no background map, so any secure access outside these regions faults.
+// R5/R6 are FIXED (the inactive bank is always at the high alias). Only R1 is
+// swap-derived, re-read from OPTR.SWAP_BANK on every boot's MPU apply.
 // ===========================================================================
 
-/// Secure code region base: secure FLASH Bank 1 alias. RM0456 memory map.
-pub(crate) const MPU_CODE_BASE: u32 = 0x0C00_0000;
-/// Secure code region inclusive limit: 256 KB (covers the NSC veneer window at
-/// 0x0C03_E000). RM0456 memory map.
-pub(crate) const MPU_CODE_LIMIT: u32 = 0x0C03_FFFF;
+/// Secure LOW alias base: the ACTIVE bank at 0x0C00_0000. RM0456 sec 7.5.8.
+const FLASH_SECURE_LOW_BASE: u32 = 0x0C00_0000;
+/// Secure HIGH alias base: the INACTIVE bank at 0x0C04_0000 (512 KB U545, two
+/// contiguous 256 KB banks). RM0456 sec 7.5.8, AN5347 Table 2.
+const FLASH_SECURE_HIGH_BASE: u32 = 0x0C04_0000;
+/// The non-secure alias sits this far below the secure alias. AN5347 Table 2.
+const FLASH_SECURE_ALIAS_OFFSET: u32 = 0x0400_0000;
+/// One 8 KB flash page. RM0456 sec 7.3.1 Table 51 (DUALBANK=1).
+const FLASH_PAGE: u32 = 0x2000;
+
+/// Secure code region base: page 2 of the active bank (the immutable boot
+/// stage), the first page after the metadata band. Layout L1.
+pub(crate) const MPU_CODE_BASE: u32 = FLASH_SECURE_LOW_BASE + 2 * FLASH_PAGE;
+/// Secure code region inclusive limit: through page 19 (the NSC veneer), pages
+/// 2-19 of the active bank. Layout L1.
+pub(crate) const MPU_CODE_LIMIT: u32 = FLASH_SECURE_LOW_BASE + 20 * FLASH_PAGE - 1;
+
+/// Boot-metadata region size: pages 0-1 (16 KB). Layout L1.
+const MPU_META_SIZE: u32 = 2 * FLASH_PAGE;
+/// Metadata region base when SWAP_BANK is CLEAR: physical Bank 1 at the low
+/// alias. RM0456 sec 7.5.8 (the metadata is pinned to physical Bank 1).
+pub(crate) const MPU_META_LOW_BASE: u32 = FLASH_SECURE_LOW_BASE;
+/// Metadata region base when SWAP_BANK is SET: physical Bank 1 at the high alias.
+pub(crate) const MPU_META_HIGH_BASE: u32 = FLASH_SECURE_HIGH_BASE;
+/// Metadata region inclusive limit when SWAP_BANK is CLEAR (16 KB).
+pub(crate) const MPU_META_LOW_LIMIT: u32 = MPU_META_LOW_BASE + MPU_META_SIZE - 1;
+/// Metadata region inclusive limit when SWAP_BANK is SET (16 KB).
+pub(crate) const MPU_META_HIGH_LIMIT: u32 = MPU_META_HIGH_BASE + MPU_META_SIZE - 1;
+
+/// Inactive-bank SECURE image region base: pages 9-19 at the secure HIGH alias.
+/// The inactive bank is ALWAYS at the high alias (RM0456 sec 7.5.8), so this is
+/// FIXED across swaps. Grants the updater store / read-back into the secure
+/// image sub-band, never into the inactive metadata (pages 0-1) or boot stage
+/// (pages 2-8), which no high-alias region maps.
+pub(crate) const MPU_INACTIVE_SECURE_BASE: u32 =
+    FLASH_SECURE_HIGH_BASE + 9 * FLASH_PAGE;
+/// Inactive-bank secure image region inclusive limit: through page 19 (88 KB).
+pub(crate) const MPU_INACTIVE_SECURE_LIMIT: u32 =
+    FLASH_SECURE_HIGH_BASE + 20 * FLASH_PAGE - 1;
+
+/// Inactive-bank NON-SECURE image region base: pages 20-31 at the NS HIGH alias.
+/// FIXED across swaps. The non-secure image sub-band MUST be driven through the
+/// non-secure alias (0x08..), or a secure-alias access is RAZ / WRPERR (RM0456
+/// Table 68), so the updater's store / read-back of this band uses this region.
+pub(crate) const MPU_INACTIVE_NS_BASE: u32 =
+    FLASH_SECURE_HIGH_BASE - FLASH_SECURE_ALIAS_OFFSET + 20 * FLASH_PAGE;
+/// Inactive-bank NS image region inclusive limit: through page 31 (96 KB).
+pub(crate) const MPU_INACTIVE_NS_LIMIT: u32 =
+    FLASH_SECURE_HIGH_BASE - FLASH_SECURE_ALIAS_OFFSET + 32 * FLASH_PAGE - 1;
 
 /// Secure SRAM region base: SRAM1 secure half. Reuses `SRAM1_BASE`.
 ///
@@ -411,13 +480,55 @@ mod tests
         assert_eq!(MPU_SRAM_BASE, 0x2000_0000);
         assert_eq!(MPU_SRAM_LIMIT, SRAM1_NS_BASE - 1);
         assert_eq!(MPU_SRAM_LIMIT, 0x2001_FFFF);
-        // Code region spans the full secure FLASH bank, including the NSC window.
-        assert_eq!(MPU_CODE_BASE, 0x0C00_0000);
-        assert_eq!(MPU_CODE_LIMIT, 0x0C03_FFFF);
-        // The NSC veneer window is contained in the secure code region.
+        // Layout L1: the code region is pages 2-19 of the active bank, excluding
+        // the metadata band (pages 0-1) so a metadata WRITE never lands in the RX
+        // region. It includes the NSC veneer window (page 19).
+        assert_eq!(MPU_CODE_BASE, 0x0C00_4000);
+        assert_eq!(MPU_CODE_LIMIT, 0x0C02_7FFF);
         let veneer_in_code = NSC_VENEER_BASE >= MPU_CODE_BASE
             && NSC_VENEER_LIMIT <= MPU_CODE_LIMIT;
         assert!(veneer_in_code, "NSC veneer must lie inside the code region");
+        assert_eq!(NSC_VENEER_BASE, 0x0C02_6000);
+        assert_eq!(NSC_VENEER_LIMIT, 0x0C02_7FFF);
+        // The swap-derived metadata region is pages 0-1 (16 KB) of physical Bank
+        // 1, at the low alias when SWAP_BANK is clear and the high alias when set.
+        assert_eq!(MPU_META_LOW_BASE, 0x0C00_0000);
+        assert_eq!(MPU_META_LOW_LIMIT, 0x0C00_3FFF);
+        assert_eq!(MPU_META_HIGH_BASE, 0x0C04_0000);
+        assert_eq!(MPU_META_HIGH_LIMIT, 0x0C04_3FFF);
+        // The low-alias metadata region ends one byte below the code region base,
+        // so R1 (SWAP clear) and R0 are adjacent, never overlapping.
+        assert_eq!(MPU_META_LOW_LIMIT + 1, MPU_CODE_BASE);
+        // The inactive-bank secure image region is pages 9-19 (88 KB) at the
+        // secure high alias, fixed across swaps.
+        assert_eq!(MPU_INACTIVE_SECURE_BASE, 0x0C05_2000);
+        assert_eq!(MPU_INACTIVE_SECURE_LIMIT, 0x0C06_7FFF);
+        // The inactive-bank NS image region is pages 20-31 (96 KB) at the NS high
+        // alias, fixed across swaps.
+        assert_eq!(MPU_INACTIVE_NS_BASE, 0x0806_8000);
+        assert_eq!(MPU_INACTIVE_NS_LIMIT, 0x0807_FFFF);
+        // Every region base is 32-byte aligned and every limit is an inclusive
+        // 32-byte top (low 5 bits set), the ARMv8-M MPU granule.
+        for base in [
+            MPU_CODE_BASE,
+            MPU_META_LOW_BASE,
+            MPU_META_HIGH_BASE,
+            MPU_INACTIVE_SECURE_BASE,
+            MPU_INACTIVE_NS_BASE,
+        ]
+        {
+            assert_eq!(base & 0x1F, 0, "MPU base must be 32-byte aligned");
+        }
+        for limit in [
+            MPU_CODE_LIMIT,
+            MPU_META_LOW_LIMIT,
+            MPU_META_HIGH_LIMIT,
+            MPU_INACTIVE_SECURE_LIMIT,
+            MPU_INACTIVE_NS_LIMIT,
+        ]
+        {
+            assert_eq!(limit & 0x1F, 0x1F, "MPU limit must be an inclusive top");
+        }
         // Peripheral region covers the secure peripheral aliases.
         assert_eq!(MPU_PERIPH_BASE, 0x5000_0000);
         assert_eq!(MPU_PERIPH_LIMIT, 0x5FFF_FFFF);

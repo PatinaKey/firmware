@@ -1,10 +1,9 @@
 //! Ground-truth pinning tests for `regs`.
 //!
-//! Every assertion compares a symbolic constant against a HARD-CODED
-//! primary-source LITERAL, never against another symbol or an expression built
-//! from other symbols. 
-//! The source is RM0456 ch.7 (registers, sequences, geometry) 
-//! plus AN5347 Table 2 (the secure-alias offset).
+//! Every assertion compares a symbolic constant against a hard-coded primary-source
+//! literal, never against another symbol or an expression built from other symbols.
+//! The source is RM0456 ch.7 (registers, sequences, geometry) plus AN5347 Table 2
+//! (the secure-alias offset).
 
 use super::*;
 
@@ -95,6 +94,15 @@ fn optr_bits_are_canonical()
 }
 
 #[test]
+fn secwm_readback_registers_are_canonical()
+{
+    // RM0456 sec 7.9.17 (SECWM1R1, offset 0x50) / sec 7.9.21 (SECWM2R1, offset
+    // 0x60), secure alias base 0x5002_2000.
+    assert_eq!(FLASH_SECWM1R1, 0x5002_2050, "FLASH_SECWM1R1 secure address");
+    assert_eq!(FLASH_SECWM2R1, 0x5002_2060, "FLASH_SECWM2R1 secure address");
+}
+
+#[test]
 fn geometry_is_canonical()
 {
     // RM0456 sec 7.3.1 Table 51 (DUALBANK=1), AN5347 Table 2.
@@ -161,23 +169,70 @@ fn running_and_inactive_bank_track_swap()
 #[test]
 fn image_band_layout_is_canonical()
 {
-    // The metadata band is pages 0-1, the image band is pages 2-31, all HARD
-    // literals so a layout change must be re-pinned deliberately.
+    // Layout L1 descriptor-page form, all hard
+    // literals so a layout change must be re-pinned deliberately:
+    //   pages 0-1   metadata (physical Bank 1 only)
+    //   pages 2-8   immutable boot stage (SECBOOTADD0 = 0x0C004000)
+    //   page  9     image descriptor (header [0:24], signature [24:88])
+    //   pages 10-19 secure app + NSC veneer
+    //   pages 20-31 non-secure app
     assert_eq!(META_PAGE_FIRST, 0, "metadata band first page");
     assert_eq!(META_PAGE_COUNT, 2, "metadata band 2 pages (16 KB)");
-    assert_eq!(IMAGE_PAGE_FIRST, 2, "image band first page");
-    assert_eq!(IMAGE_PAGE_COUNT, 30, "image band 30 pages");
-    assert_eq!(IMAGE_REGION_OFFSET, 0x0000_4000, "image band offset 16 KB");
-    // 30 pages of 8 KB. The literal atom, not a 30 * 0x2000 expression.
-    assert_eq!(IMAGE_REGION_SIZE, 0x0003_C000, "image band 240 KB");
+    assert_eq!(BOOT_STAGE_PAGE_FIRST, 2, "boot-stage band first page");
+    assert_eq!(BOOT_STAGE_PAGE_COUNT, 7, "boot-stage band 7 pages (56 KB)");
+    assert_eq!(IMAGE_PAGE_FIRST, 9, "image band first page");
+    assert_eq!(IMAGE_PAGE_COUNT, 23, "image band 23 pages");
+    assert_eq!(IMAGE_REGION_OFFSET, 0x0001_2000, "image band offset page 9");
+    // 23 pages of 8 KB. The literal atom, not a 23 * 0x2000 expression.
+    assert_eq!(IMAGE_REGION_SIZE, 0x0002_E000, "image band 184 KB");
+
+    // The descriptor occupies page 9, holding the 24-byte header and 64-byte
+    // signature at the front.
+    assert_eq!(IMAGE_DESCRIPTOR_OFFSET, 0x0001_2000, "descriptor offset page 9");
+    assert_eq!(IMAGE_DESCRIPTOR_LEN, 88, "descriptor 88 bytes (header + sig)");
+
+    // The payload occupies pages 10-31, splitting at the SECWM boundary into a
+    // secure sub-band (pages 10-19) and a non-secure sub-band (pages 20-31).
+    assert_eq!(SECWM_PEND, 19, "SECWM last secure page (inclusive)");
+    assert_eq!(IMAGE_PAYLOAD_PAGE_FIRST, 10, "first payload page");
+    assert_eq!(IMAGE_PAYLOAD_OFFSET, 0x0001_4000, "payload offset page 10");
+    assert_eq!(IMAGE_PAYLOAD_SIZE, 0x0002_C000, "payload 176 KB");
+    assert_eq!(IMAGE_PAYLOAD_SECURE_SIZE, 0x0001_4000, "secure payload 80 KB");
+    assert_eq!(IMAGE_NS_PAGE_FIRST, 20, "first non-secure image page");
+    assert_eq!(IMAGE_NS_BAND_OFFSET, 0x0002_8000, "non-secure sub-band offset");
+    assert_eq!(IMAGE_NS_BAND_SIZE, 0x0001_8000, "non-secure sub-band 96 KB");
+    // The descriptor page plus the payload tile the image band exactly.
+    assert_eq!(
+        PAGE_SIZE + IMAGE_PAYLOAD_SIZE,
+        IMAGE_REGION_SIZE,
+        "descriptor page plus payload tile the image band"
+    );
+    // The two payload sub-bands tile the payload exactly, no gap or overlap.
+    assert_eq!(
+        IMAGE_PAYLOAD_SECURE_SIZE + IMAGE_NS_BAND_SIZE,
+        IMAGE_PAYLOAD_SIZE,
+        "payload sub-bands tile the payload"
+    );
+    // The secure payload begins one page after the descriptor and ends where the
+    // non-secure sub-band begins.
+    assert_eq!(
+        IMAGE_DESCRIPTOR_OFFSET + PAGE_SIZE,
+        IMAGE_PAYLOAD_OFFSET,
+        "payload begins one page after the descriptor"
+    );
+    assert_eq!(
+        IMAGE_PAYLOAD_OFFSET + IMAGE_PAYLOAD_SECURE_SIZE,
+        IMAGE_NS_BAND_OFFSET,
+        "secure payload ends where the non-secure sub-band begins"
+    );
 }
 
 #[test]
 fn metadata_layout_is_canonical()
 {
-    // The metadata records live at fixed offsets inside PHYSICAL Bank 1, pinned
-    // to HARD literal byte offsets (the driver re-derives the live alias address
-    // from SWAP_BANK on every access).
+    // The metadata records live at fixed offsets inside physical Bank 1, pinned to
+    // hard literal byte offsets (the driver re-derives the live alias address from
+    // SWAP_BANK on every access).
     assert_eq!(META_NVCNT_OFFSET, 0x0000_0000, "NVCNT log offset");
     assert_eq!(META_BOOT_OFFSET, 0x0000_1000, "boot-count log offset");
     assert_eq!(META_PENDING_OFFSET, 0x0000_2000, "pending record offset");

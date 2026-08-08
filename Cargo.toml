@@ -10,6 +10,7 @@ members = [
     "crates/nonsecure",
     "crates/image-verify",
     "crates/fw-update",
+    "crates/boot-stage",
 ]
 
 [workspace.package]
@@ -36,13 +37,12 @@ ecdsa = { version = "0.17", default-features = false }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 
-# Ed25519 verification of the signed firmware-image header (image-verify crate).
-# Verify-only on the device: the pinned root public key is the trust input and
-# no secret key runs here, so the failure modes are correctness, not
-# side-channel leakage. default-features = false keeps it no_std and heap-free.
-ed25519-dalek = { version = "3.0", default-features = false }
+# ECDSA P-256 over SHA-256: the firmware-image signature algorithm
+# (image-verify, and the host signing tool).
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 
-# MCU platform / firmware-binary dependencies
+# Ed25519 for the TROPIC01 Ed25519 signatures (the SSH ed25519-sk and PGP path).
+ed25519-dalek = { version = "3.0", default-features = false }
 
 # cortex-m-rt: the de-facto reset-vector + .data/.bss init + linker glue for
 # Cortex-M. Provides #[entry] and the link.x script the two bins build against.

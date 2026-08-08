@@ -74,9 +74,9 @@ byte chunks) plus a 16-byte Random_Get (one 20-byte chunk).
 tag). It is an external, read-only reference and is NOT part of this repository.
 
 ```
-# 1. Install the model (downloads the ts-tvl wheel into a venv).
+# 1. Install the model (downloads the pinned ts-tvl wheel into a venv).
 LT=/path/to/libtropic
-"$LT/scripts/tropic01_model/install_linux.sh"
+LIBTROPIC="$LT" crates/tropic01-driver/scripts/install-model.sh
 
 # 2. Drop l2_frame_capture.c into a model example and build with SPI printing.
 mkdir -p "$LT/examples/model/kat_capture"

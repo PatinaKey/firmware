@@ -55,7 +55,7 @@ The workspace is a mix of one host-testable library published to crates.io, the 
 | [`platform`](crates/platform) | library | TrustZone partition logic (SAU / GTZC / secure MPU), the address map, and the non-secure pointer checks. Host-tested |
 | [`mcu-spi`](crates/mcu-spi) | library | The SPI1 MMIO master driving the TROPIC01 |
 | [`mcu-flash`](crates/mcu-flash) | library | The on-target dual-bank flash driver behind the update seam |
-| [`image-verify`](crates/image-verify) | library | The signed firmware-image header verifier (Ed25519) |
+| [`image-verify`](crates/image-verify) | library | The signed firmware-image verifier (ECDSA P-256 over SHA-256, streamed across a segmented image) |
 | [`fw-update`](crates/fw-update) | library | The MCU A/B update state machine (verify then swap-as-commit) |
 | [`secure`](crates/secure) | binary (TZ-S) | The secure-world image: partition bring-up, the SE driver, and the CMSE non-secure-callable veneers |
 | [`nonsecure`](crates/nonsecure) | binary (TZ-NS) | The non-secure image: the entry that calls the veneers and reports over defmt-RTT |

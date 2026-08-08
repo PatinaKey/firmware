@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
-description = "no_std Ed25519 verifier for the patina_key signed firmware-image format."
+description = "no_std ECDSA P-256 verifier for the patina_key signed firmware-image format."
 # Dev-only fuzz harness kept out of the published package. It has its own
 # detached workspace and needs nightly instrumentation.
 exclude = ["/fuzz"]
@@ -21,11 +21,16 @@ _fuzz = []
 encode = []
 
 [dependencies]
-# Ed25519 verify path only. default-features = false keeps it no_std and
+# ECDSA P-256 verify path only. default-features = false keeps it no_std and
 # heap-free. Tests additionally use its SigningKey to mint fixtures.
-ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
 
-# This crate is pure parsing plus one dalek verify call. It has NO unsafe, so it
+# SHA-256 streamed across the image segments. ECDSA is prehash-native, so the
+# digest is computed here and handed to the verifier, which is what lets a
+# non-contiguous image be verified with no copy.
+sha2 = { workspace = true }
+
+# This crate is pure parsing plus one ECDSA verify call. It has NO unsafe, so it
 # INHERITS the workspace lints (unsafe_code = forbid). A local [lints] table
 # would DOWNGRADE forbid to deny, which is not wanted here.
 [lints]

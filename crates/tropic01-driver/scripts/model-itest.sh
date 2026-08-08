@@ -8,11 +8,11 @@
 #
 # HOST TEST ONLY. Validates protocol byte-exactness, not physical security.
 #
-# Prerequisite (one-time): install the model into a venv with the official
-# installer, then point LIBTROPIC at your libtropic checkout:
+# Prerequisite (one-time): point LIBTROPIC at your libtropic checkout, then
+# install the pinned model wheel into its venv:
 #
-#   "$LIBTROPIC/scripts/tropic01_model/install_linux.sh"
 #   export LIBTROPIC=/path/to/libtropic
+#   crates/tropic01-driver/scripts/install-model.sh
 #   crates/tropic01-driver/scripts/model-itest.sh
 #
 # The model server pins the chip secrets from model_cfg.yml (chip static key +
@@ -22,21 +22,32 @@ set -euo pipefail
 
 LT="${LIBTROPIC:?set LIBTROPIC to your libtropic checkout (the model lives at scripts/tropic01_model)}"
 MODEL_DIR="$LT/scripts/tropic01_model"
-MODEL_SERVER="$MODEL_DIR/.venv/bin/model_server"
+MODEL_VENV="$MODEL_DIR/.venv"
+MODEL_SERVER="$MODEL_VENV/bin/model_server"
 MODEL_CFG="$MODEL_DIR/model_cfg.yml"
 MODEL_HOST="127.0.0.1"
 MODEL_PORT="28992"
 
+# Resolve the driver crate root. This script lives in
+# crates/tropic01-driver/scripts, so the crate manifest is one level up.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CRATE_DIR="$(dirname "$SCRIPT_DIR")"
+INSTALLER="$SCRIPT_DIR/install-model.sh"
+
 if [[ ! -x "$MODEL_SERVER" ]]; then
     echo "model_server not found at $MODEL_SERVER" >&2
-    echo "Run $MODEL_DIR/install_linux.sh first." >&2
+    echo "Run $INSTALLER first." >&2
     exit 1
 fi
 
-# Resolve the firmware crate root (this script lives in firmware/scripts).
-# This script lives in crates/tropic01-driver/scripts; the crate manifest is one level up.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CRATE_DIR="$(dirname "$SCRIPT_DIR")"
+# The version pin lives in install-model.sh, this only enforces it.
+WANT_VERSION="$(sed -n 's/^TVL_VERSION="\(.*\)"$/\1/p' "$INSTALLER")"
+HAVE_VERSION="$("$MODEL_VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("tvl"))')"
+if [[ "$WANT_VERSION" != "$HAVE_VERSION" ]]; then
+    echo "model venv has ts-tvl $HAVE_VERSION, this repository pins $WANT_VERSION" >&2
+    echo "Run $INSTALLER to update it." >&2
+    exit 1
+fi
 
 SERVER_PID=""
 cleanup() {

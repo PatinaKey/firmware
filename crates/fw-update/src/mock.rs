@@ -3,7 +3,7 @@
 //! [`MockFlash`] models the inactive bank as an in-RAM byte array plus the
 //! persistent counters, records, and the bank-select state. [`MockSeCounter`]
 //! models the secure-element down-counter. Both expose fault-injection switches
-//! so a test can prove every seam error collapses to a state that keeps the OLD
+//! so a test can prove every seam error collapses to a state that keeps the old
 //! bank bootable.
 //!
 //! Compiled only for host tests and the fuzz harness. Production never links
@@ -23,11 +23,30 @@ use crate::seam::UpdateOutcome;
 /// The modelled page size in bytes.
 pub const PAGE_LEN: usize = 256;
 
-/// The modelled inactive-bank size in bytes.
+/// The modelled inactive-bank payload size in bytes.
 ///
-/// Sized to hold a representative update image in host tests. The real bank
+/// Sized to hold a representative update payload in host tests. The real bank
 /// geometry comes from the hardware-gated flash driver, not this mock.
 pub const BANK_LEN: usize = 4096;
+
+/// The modelled secure payload sub-band length in bytes (a multiple of
+/// [`PAGE_LEN`]).
+///
+/// The payload spans a SECWM boundary. This mock stores one contiguous payload
+/// store and exposes the first [`SECURE_BAND_LEN`] bytes as the secure sub-band
+/// and the rest as the non-secure sub-band, so their logical concatenation is
+/// exactly the bytes `write_inactive_page` produced. The real per-page alias and
+/// RAZ semantics live in the hardware-gated flash driver's controller model, not
+/// this abstract page-index mock, so this mock proves the machine plumbing, not
+/// the alias behaviour.
+pub const SECURE_BAND_LEN: usize = 2048;
+
+/// The modelled descriptor store length in bytes.
+///
+/// The descriptor holds the 24-byte header and the 64-byte signature (88 bytes).
+/// The store is a little larger, the rest staying erased, matching the real
+/// descriptor page whose tail stays erased.
+pub const DESCRIPTOR_LEN: usize = 128;
 
 /// Where a seam call should be forced to fail, for fail-closed tests.
 ///
@@ -58,11 +77,12 @@ pub enum FaultPoint
 /// A host model of the inactive bank and the persistent update records.
 ///
 /// `committed` and `reverted` record whether the matching seam call was issued,
-/// so a test can assert the OLD bank stays bootable on any failure path. The
-/// mock writes NO real flash and arms NO real SWAP_BANK.
+/// so a test can assert the old bank stays bootable on any failure path. The
+/// mock writes no real flash and arms no real SWAP_BANK.
 pub struct MockFlash
 {
     bank: [u8; BANK_LEN],
+    descriptor: [u8; DESCRIPTOR_LEN],
     nvcnt: u32,
     pending: PendingFlag,
     boot_count: u32,
@@ -78,13 +98,14 @@ impl MockFlash
 {
     /// Builds an erased bank with the given starting flash counter.
     ///
-    /// Models the OLD bank as [`BankId::Bank1`] running and [`BankId::Bank2`] as
+    /// Models the old bank as [`BankId::Bank1`] running and [`BankId::Bank2`] as
     /// the inactive target the swap would make bootable.
     pub fn new(nvcnt: u32) -> MockFlash
     {
         MockFlash
         {
             bank: [0xFF; BANK_LEN],
+            descriptor: [0xFF; DESCRIPTOR_LEN],
             nvcnt,
             pending: PendingFlag::None,
             boot_count: 0,
@@ -127,10 +148,16 @@ impl MockFlash
         self.reverted
     }
 
-    /// Reads back the modelled bank contents (test inspection only).
+    /// Reads back the modelled payload bank contents (test inspection only).
     pub fn bank(&self) -> &[u8]
     {
         &self.bank
+    }
+
+    /// Reads back the modelled descriptor contents (test inspection only).
+    pub fn descriptor(&self) -> &[u8]
+    {
+        &self.descriptor
     }
 
     /// The stored flash anti-rollback counter (test inspection only).
@@ -153,9 +180,31 @@ impl MockFlash
 
 impl FlashSeam for MockFlash
 {
-    fn inactive_bank(&self) -> &[u8]
+    fn inactive_descriptor(&self) -> &[u8]
     {
-        &self.bank
+        // The descriptor store: header at [0:24], signature at [24:88]. On silicon
+        // this is page 9 read through the secure alias.
+        &self.descriptor
+    }
+
+    fn inactive_secure_band(&self) -> &[u8]
+    {
+        // The first SECURE_BAND_LEN bytes of the contiguous payload store. On
+        // silicon this is the secure payload sub-band read through the secure
+        // alias.
+        self.bank
+            .get(..SECURE_BAND_LEN)
+            .unwrap_or(&self.bank)
+    }
+
+    fn inactive_ns_band(&self) -> &[u8]
+    {
+        // The remainder of the payload store. On silicon this is the non-secure
+        // payload sub-band read through the non-secure alias. Concatenated after
+        // the secure band it reproduces the whole written payload.
+        self.bank
+            .get(SECURE_BAND_LEN..)
+            .unwrap_or(&[])
     }
 
     fn erase_inactive(&mut self) -> Result<(), FlashError>
@@ -165,6 +214,7 @@ impl FlashSeam for MockFlash
             return Err(FlashError::Hardware);
         }
         self.bank = [0xFF; BANK_LEN];
+        self.descriptor = [0xFF; DESCRIPTOR_LEN];
         Ok(())
     }
 
@@ -195,6 +245,20 @@ impl FlashSeam for MockFlash
             .get_mut(start..end)
             .ok_or(FlashError::OutOfRange)?;
         slot.copy_from_slice(data);
+        Ok(())
+    }
+
+    fn write_descriptor(&mut self, descriptor: &[u8]) -> Result<(), FlashError>
+    {
+        if self.take_fault(FaultPoint::WritePage)
+        {
+            return Err(FlashError::WriteFailed);
+        }
+        let slot = self
+            .descriptor
+            .get_mut(..descriptor.len())
+            .ok_or(FlashError::OutOfRange)?;
+        slot.copy_from_slice(descriptor);
         Ok(())
     }
 

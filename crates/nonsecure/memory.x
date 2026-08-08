@@ -1,10 +1,14 @@
 /* Non-secure (TZ-NS) memory layout for cortex-m-rt's link.x.
  *
- * FLASH is the NS flash bank (Bank 2 NS alias) at 0x0804_0000, 256 KB. RAM is
- * the upper 64 KB of SRAM1 at 0x2002_0000, the provisional NS half matching the
- * partition map's SRAM1 split (SAU region 1 + region 2 in platform's map.rs).
- * The secure world hands off here by pointing SCB_NS->VTOR at this FLASH base.
- * RM0456 memory map.
+ * FLASH is the non-secure app band, pages 20-31 of a 256 KB bank, at the low NS
+ * alias 0x0802_8000, LENGTH 96 KB (12 pages x 8 KB). The active bank presents
+ * this band at the low NS alias, the inactive bank at the high NS alias
+ * 0x0806_8000, so SAU never changes on a bank swap (SAU region 1 covers the
+ * whole NS flash alias, see platform map.rs). RAM is the upper 64 KB of SRAM1 at
+ * 0x2002_0000, the NS half matching the partition map's SRAM1 split (SAU region
+ * 2 in platform's map.rs). The secure world hands off here by pointing
+ * SCB_NS->VTOR at this FLASH base. RM0456 memory map (sec 7.5.8 identical layout
+ * per bank).
  *
  * SHARED_OUT is the pinned non-secure shared OUTPUT window: the top 1 KiB of the
  * NS half, carved out of RAM so no stack, static, or embassy allocation can land
@@ -20,7 +24,7 @@
  */
 MEMORY
 {
-  FLASH (rx)       : ORIGIN = 0x08040000, LENGTH = 256K
+  FLASH (rx)       : ORIGIN = 0x08028000, LENGTH = 96K
   RAM (rwx)        : ORIGIN = 0x20020000, LENGTH = 63K
   SHARED_OUT (rw)  : ORIGIN = 0x2002FC00, LENGTH = 1K
 }

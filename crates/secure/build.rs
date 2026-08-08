@@ -38,10 +38,12 @@ use std::path::PathBuf;
 const TARGET_TRIPLE: &str = "thumbv8m.main-none-eabihf";
 /// The stable file name of the CMSE import object under the target triple dir.
 const IMPLIB_FILE: &str = "patinakey_nsc_implib.o";
-/// The pinned NSC veneer window base: top 8 KB of secure Bank 1. The CMSE
-/// secure-gateway veneers (.gnu.sgstubs) are forced here so the SAU-marked NSC
-/// address is stable across builds. RM0456 memory map matches platform map.rs.
-const NSC_VENEER_BASE: &str = "0x0C03E000";
+/// The pinned NSC veneer window base: page 19, the top page of the secure app
+/// band (pages 10-19). The CMSE secure-gateway veneers (.gnu.sgstubs) are forced
+/// here so the SAU-marked NSC address is stable across builds. It sits inside
+/// the secure FLASH region [0x0C014000, 0x0C028000). RM0456 memory map matches
+/// platform map.rs.
+const NSC_VENEER_BASE: &str = "0x0C026000";
 
 /// Derives the cargo target-root directory from `OUT_DIR`.
 ///
