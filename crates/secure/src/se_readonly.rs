@@ -50,8 +50,8 @@ use crate::se_smoke::se_error_code;
 
 /// ECC slot for the P-256 test key.
 ///
-/// 28 keeps this key off slots 29 (se_persist.rs) and 30, 31 (se_crypto.rs), so
-/// the feature-gated tests never share an ECC slot.
+/// 28 keeps this key off slot 29 (se_persist.rs), so the feature-gated bring-up
+/// paths never share an ECC slot.
 const P256_SLOT: u8 = 28;
 
 /// High user R-Memory slot read then erased.
@@ -72,7 +72,7 @@ const RMEM_READ_BUF: usize = 512;
 
 /// Fixed 32-byte digest signed by the P-256 (ECDSA) path.
 ///
-/// An arbitrary byte pattern, the same one se_crypto.rs uses. The chip
+/// An arbitrary documented byte pattern. The chip
 /// signs a caller-supplied digest (the host pre-hashes with SHA-256 in
 /// production), so any fixed 32 bytes prove the command round trip. The host
 /// verifier re-checks the exported signature over exactly these bytes.

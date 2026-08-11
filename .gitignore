@@ -9,12 +9,7 @@
 # TROPIC01 model server runtime artifact (default config-out dump)
 .model_config_save.yaml
 
-# Signing key material and signing artifacts: never commit a private key.
-# Key material lives under a keys/ directory OR carries a key extension, and
-# exactly that set is ignored. The patterns stay narrow on purpose: a broad
-# pattern like *seed* would also swallow a future source file such as
-# seed_tests.rs, so each form is listed explicitly. The detached signer build
-# dir is kept out too.
+# Signing key material and signing artifacts.
 /keys/
 **/keys/
 *.seed
@@ -29,3 +24,9 @@ seed.bin
 
 # Vendor SE firmware-update blobs (Tropic Square signed, from the libtropic SDK)
 crates/secure/fw_blobs/
+
+# Bank / signing / flashing artifacts.
+/tools/image-signer/*.bin
+/tools/image-signer/*.hex
+/tools/image-signer/sig.raw
+/tools/image-signer/manifest.txt

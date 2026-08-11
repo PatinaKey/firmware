@@ -1,85 +1,57 @@
 //! Host tests for the dual-bank update machine, driven through the mocks.
 //!
-//! Every irreversible seam op (commit, revert) is asserted to fire ONLY on the
-//! intended path. Every fault path is asserted to keep the OLD bank bootable
+//! Every irreversible seam op (commit, revert) is asserted to fire only on the
+//! intended path. Every fault path is asserted to keep the old bank bootable
 //! (no commit), which is the fail-closed contract. The image streams through the
 //! seam into the mock inactive bank, and verify reads that same bank back, so a
 //! test proves verify and commit act on the same bytes.
 
 use super::*;
 
-use ed25519_dalek::Signer;
-use ed25519_dalek::SigningKey;
-use image_verify::RootKey;
+use image_verify::HEADER_LEN;
+use image_verify::SIG_LEN;
 use image_verify::VerifyError;
-use std::vec::Vec;
+use p256::ecdsa::SigningKey;
 
-// The signing seed whose public key equals DEV_ROOT_KEY (the all-0x01 scalar).
-const DEV_SEED: [u8; 32] = [1u8; 32];
+use crate::test_fixtures::DEV_SCALAR;
+use crate::test_fixtures::build_image;
+use crate::test_fixtures::dev_root;
 
-// A seed that does NOT match DEV_ROOT_KEY, used to mint a tampered image.
-const WRONG_SEED: [u8; 32] = [2u8; 32];
+// Asserts the machine de-interleaved the signed file onto the two stores exactly:
+// the header at the front of the descriptor, the signature just after it, and the
+// payload page-aligned from offset 0 in the payload store. Also proves the four
+// logical segments the verifier reads back concatenate to the original file, and
+// that the payload store starts with the firmware bytes, not the header magic.
+fn assert_deinterleaved(flash: &MockFlash, image: &[u8])
+{
+    let payload_len = image.len() - HEADER_LEN - SIG_LEN;
+    let header = &image[..HEADER_LEN];
+    let payload = &image[HEADER_LEN..HEADER_LEN + payload_len];
+    let sig = &image[image.len() - SIG_LEN..];
 
-// Pinned header layout (image-verify format, HEADER_LEN = 24, SIG_LEN = 64).
-const HEADER_LEN: usize = 24;
-const OFF_MAGIC: usize = 0;
-const OFF_FORMAT_VERSION: usize = 4;
-const OFF_ALGORITHM: usize = 5;
-const OFF_VERSION_MAJOR: usize = 6;
-const OFF_VERSION_MINOR: usize = 7;
-const OFF_VERSION_REVISION: usize = 8;
-const OFF_VERSION_BUILD: usize = 10;
-const OFF_SECURITY_COUNTER: usize = 14;
-const OFF_PAYLOAD_LEN: usize = 18;
-const MAGIC: [u8; 4] = *b"PKIM";
-const FORMAT_VERSION: u8 = 1;
-const ALG_ED25519: u8 = 0x01;
+    assert_eq!(&flash.descriptor()[..HEADER_LEN], header, "header in descriptor");
+    assert_eq!(
+        &flash.descriptor()[HEADER_LEN..HEADER_LEN + SIG_LEN],
+        sig,
+        "signature in descriptor"
+    );
+    assert_eq!(&flash.bank()[..payload_len], payload, "payload in payload store");
+
+    // The four-segment concatenation the verifier reads is the original file.
+    let mut rebuilt = std::vec::Vec::new();
+    rebuilt.extend_from_slice(&flash.descriptor()[..HEADER_LEN]);
+    rebuilt.extend_from_slice(&flash.bank()[..payload_len]);
+    rebuilt.extend_from_slice(&flash.descriptor()[HEADER_LEN..HEADER_LEN + SIG_LEN]);
+    assert_eq!(rebuilt, image, "reassembled four segments equal the file");
+}
+
+// A scalar that does not match DEV_ROOT_KEY_TEST_ONLY, used to mint an image the
+// pinned key must reject.
+const WRONG_SCALAR: [u8; 32] = [2u8; 32];
 
 // An SE counter value whose derived anti-rollback floor is zero, so Gate 2 does
 // not interfere with a test that only exercises Gate 1 or the signature.
 const SE_FLOOR_ZERO: u32 = SE_COUNTER_ORIGIN;
-
-// Builds a HEADER || payload || signature image signed with `seed`, carrying the
-// given security counter and payload.
-fn build_image
-(
-    seed: [u8; 32],
-    security_counter: u32,
-    payload: &[u8],
-)
-    -> Vec<u8>
-{
-    let mut header = [0u8; HEADER_LEN];
-    header[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC);
-    header[OFF_FORMAT_VERSION] = FORMAT_VERSION;
-    header[OFF_ALGORITHM] = ALG_ED25519;
-    header[OFF_VERSION_MAJOR] = 1;
-    header[OFF_VERSION_MINOR] = 0;
-    header[OFF_VERSION_REVISION..OFF_VERSION_REVISION + 2]
-        .copy_from_slice(&0u16.to_le_bytes());
-    header[OFF_VERSION_BUILD..OFF_VERSION_BUILD + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
-    header[OFF_SECURITY_COUNTER..OFF_SECURITY_COUNTER + 4]
-        .copy_from_slice(&security_counter.to_le_bytes());
-    header[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
-        .copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-    let mut signed = Vec::new();
-    signed.extend_from_slice(&header);
-    signed.extend_from_slice(payload);
-
-    let sk = SigningKey::from_bytes(&seed);
-    let sig = sk.sign(&signed);
-
-    let mut image = signed;
-    image.extend_from_slice(&sig.to_bytes());
-    image
-}
-
-fn dev_root() -> RootKey
-{
-    RootKey::from_bytes(DEV_ROOT_KEY).expect("dev root key is on-curve")
-}
 
 // Feeds a whole image into the updater in one chunk at offset 0, declaring the
 // exact length so the completeness gate is satisfied.
@@ -95,10 +67,11 @@ fn feed
 }
 
 #[test]
-fn dev_seed_public_key_matches_dev_root_key()
+fn dev_scalar_public_key_matches_dev_root_key()
 {
-    let sk = SigningKey::from_bytes(&DEV_SEED);
-    assert_eq!(sk.verifying_key().to_bytes(), DEV_ROOT_KEY);
+    let sk = SigningKey::from_slice(&DEV_SCALAR).expect("dev scalar in [1, n-1]");
+    let point = sk.verifying_key().to_sec1_point(false);
+    assert_eq!(point.as_ref(), &DEV_ROOT_KEY_TEST_ONLY[..]);
 }
 
 #[test]
@@ -109,15 +82,15 @@ fn happy_path_receive_verify_commit_boot_confirm()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 5, b"new firmware payload");
+    let image = build_image(DEV_SCALAR, 5, b"new firmware payload");
     feed(&mut up, &image).expect("feed");
     assert_eq!(up.state(), UpdateState::ReceivingChunks);
 
     up.verify_and_accept().expect("verify");
     assert_eq!(up.state(), UpdateState::PendingCommit);
-    // After accept the whole image, including the trailing partial page, has
-    // landed in the mock inactive bank through the seam.
-    assert_eq!(&up.flash().bank()[..image.len()], &image[..]);
+    // After accept the whole image has de-interleaved onto the descriptor and the
+    // payload store through the seam.
+    assert_deinterleaved(up.flash(), &image);
 
     up.commit().expect("commit");
     assert_eq!(up.state(), UpdateState::Committed);
@@ -138,19 +111,19 @@ fn happy_path_receive_verify_commit_boot_confirm()
 #[test]
 fn verify_reads_the_bank_the_commit_will_boot()
 {
-    // Prove verify and commit act on the SAME bytes: the bank holds the image,
+    // Prove verify and commit act on the same bytes: the bank holds the image,
     // and verify reads it straight back from the seam.
     let root = dev_root();
     let flash = MockFlash::new(0);
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 1, b"payload across one page boundary plus");
+    let image = build_image(DEV_SCALAR, 1, b"payload across one page boundary plus");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify reads the bank");
     assert_eq!(up.state(), UpdateState::PendingCommit);
-    // Verify ran off the bank, which now holds the exact image bytes.
-    assert_eq!(&up.flash().bank()[..image.len()], &image[..]);
+    // Verify ran off the stores, which now hold the de-interleaved image bytes.
+    assert_deinterleaved(up.flash(), &image);
 }
 
 #[test]
@@ -164,14 +137,15 @@ fn multi_page_image_streams_through_seam()
     let mut up = Updater::new(&root, flash, se);
 
     let big = vec![0xABu8; 600];
-    let image = build_image(DEV_SEED, 2, &big);
+    let image = build_image(DEV_SCALAR, 2, &big);
     assert!(image.len() > PAGE_LEN);
     feed(&mut up, &image).expect("feed multi-page");
-    // Full pages flushed during receive. The trailing partial page flushes at
-    // accept, after which the bank holds the exact image bytes.
+    // Full payload pages flushed during receive. The trailing partial payload
+    // page and the descriptor flush at accept, after which the stores hold the
+    // de-interleaved image.
     up.verify_and_accept().expect("verify multi-page");
     assert_eq!(up.state(), UpdateState::PendingCommit);
-    assert_eq!(&up.flash().bank()[..image.len()], &image[..]);
+    assert_deinterleaved(up.flash(), &image);
 }
 
 #[test]
@@ -184,7 +158,7 @@ fn incomplete_transfer_is_rejected_no_commit()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 1, b"a complete enough payload here ok");
+    let image = build_image(DEV_SCALAR, 1, b"a complete enough payload here ok");
     up.begin(image.len()).expect("begin");
     let half = image.len() / 2;
     up.receive_chunk(0, &image[..half]).expect("prefix");
@@ -203,8 +177,8 @@ fn tampered_image_is_rejected_as_bad_signature_no_commit()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    // Signed by the WRONG key, so the signature fails under DEV_ROOT_KEY.
-    let image = build_image(WRONG_SEED, 5, b"evil payload");
+    // Signed by the wrong key, so the signature fails under DEV_ROOT_KEY.
+    let image = build_image(WRONG_SCALAR, 5, b"evil payload");
     feed(&mut up, &image).expect("feed");
 
     let err = up.verify_and_accept().expect_err("must reject");
@@ -224,7 +198,7 @@ fn a_chunk_that_lands_wrong_fails_closed_no_commit()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 1, b"payload");
+    let image = build_image(DEV_SCALAR, 1, b"payload");
     up.begin(image.len()).expect("begin");
     up.receive_chunk(0, &image[..10]).expect("chunk 0");
     // Skip ahead, leaving a gap: rejected fail-closed.
@@ -247,7 +221,7 @@ fn downgrade_below_nvcnt_is_rejected_no_commit()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 5, b"old firmware payload");
+    let image = build_image(DEV_SCALAR, 5, b"old firmware payload");
     feed(&mut up, &image).expect("feed");
 
     let err = up.verify_and_accept().expect_err("must reject downgrade");
@@ -265,7 +239,7 @@ fn se_counter_regression_is_rejected_no_commit()
     let se = MockSeCounter::new(SE_COUNTER_ORIGIN - 8);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 5, b"rolled-back payload");
+    let image = build_image(DEV_SCALAR, 5, b"rolled-back payload");
     feed(&mut up, &image).expect("feed");
 
     let err = up.verify_and_accept().expect_err("se floor rejects");
@@ -283,7 +257,7 @@ fn se_at_floor_accepts_equal_counter()
     let se = MockSeCounter::new(SE_COUNTER_ORIGIN - 5);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 5, b"at-the-floor payload");
+    let image = build_image(DEV_SCALAR, 5, b"at-the-floor payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("equal to floor accepted");
     assert_eq!(up.state(), UpdateState::PendingCommit);
@@ -299,7 +273,7 @@ fn se_unavailable_on_accept_fails_closed()
     se.set_unavailable();
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 5, b"payload");
+    let image = build_image(DEV_SCALAR, 5, b"payload");
     feed(&mut up, &image).expect("feed");
 
     let err = up.verify_and_accept().expect_err("se unavailable");
@@ -317,7 +291,7 @@ fn equal_counter_is_accepted()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 7, b"same version payload");
+    let image = build_image(DEV_SCALAR, 7, b"same version payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("equal counter accepted");
     assert_eq!(up.state(), UpdateState::PendingCommit);
@@ -333,7 +307,7 @@ fn reconfirm_same_counter_does_not_waste_burn_budget()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 9, b"same counter payload");
+    let image = build_image(DEV_SCALAR, 9, b"same counter payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
     up.commit().expect("commit");
@@ -350,7 +324,7 @@ fn confirmation_timeout_reverts_to_old_bank()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 1, b"payload");
+    let image = build_image(DEV_SCALAR, 1, b"payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
     up.commit().expect("commit");
@@ -361,7 +335,7 @@ fn confirmation_timeout_reverts_to_old_bank()
     up.revert().expect("revert");
     assert_eq!(up.state(), UpdateState::Reverted);
     assert!(up.flash().reverted());
-    // The forward swap bumped no NVCNT, so the OLD bank is not poisoned.
+    // The forward swap bumped no NVCNT, so the old bank is not poisoned.
     assert_eq!(up.flash().nvcnt(), 0);
 }
 
@@ -389,7 +363,7 @@ fn commit_swap_fault_clears_pending_no_old_bank_loss()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 1, b"payload");
+    let image = build_image(DEV_SCALAR, 1, b"payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
 
@@ -405,8 +379,8 @@ fn commit_swap_fault_clears_pending_no_old_bank_loss()
 fn swap_not_effective_on_boot_does_not_revert_into_unverified_bank()
 {
     // Model a power loss after the pending record was armed but before the swap
-    // committed: the running bank still matches the OLD bank, not the armed
-    // target. on_boot must clear the record and stay on the OLD bank, NOT enter
+    // committed: the running bank still matches the old bank, not the armed
+    // target. on_boot must clear the record and stay on the old bank, not enter
     // AwaitingConfirm where a revert could flip into the unverified bank.
     let root = dev_root();
     let mut flash = MockFlash::new(0);
@@ -431,7 +405,7 @@ fn nvcnt_bump_fault_on_confirm_leaves_swap_committed()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 2, b"payload");
+    let image = build_image(DEV_SCALAR, 2, b"payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
     up.commit().expect("commit");
@@ -458,7 +432,7 @@ fn revert_after_confirm_step_is_rejected()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 2, b"payload");
+    let image = build_image(DEV_SCALAR, 2, b"payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
     up.commit().expect("commit");
@@ -480,7 +454,7 @@ fn se_counter_unavailable_on_confirm_fails_closed()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 2, b"payload");
+    let image = build_image(DEV_SCALAR, 2, b"payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
     up.commit().expect("commit");
@@ -558,16 +532,52 @@ fn chunk_past_declared_length_is_rejected()
 }
 
 #[test]
-fn begin_with_total_len_over_bank_is_rejected()
+fn begin_with_payload_over_bank_is_rejected()
 {
     let root = dev_root();
     let flash = MockFlash::new(0);
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let err = up.begin(BANK_LEN + 1).expect_err("over bank");
+    // The payload band is BANK_LEN bytes. A file whose payload exceeds it by one
+    // byte (header + signature + payload band + 1) is rejected at begin.
+    let over = HEADER_LEN + SIG_LEN + BANK_LEN + 1;
+    let err = up.begin(over).expect_err("over bank");
     assert_eq!(err, UpdateError::ChunkOutOfRange);
     assert_eq!(up.state(), UpdateState::Idle);
+    // The payload band's exact capacity (header + signature + BANK_LEN) is
+    // accepted, proving the boundary is the payload size, not the file size.
+    up.begin(HEADER_LEN + SIG_LEN + BANK_LEN).expect("at capacity");
+    assert_eq!(up.state(), UpdateState::ReceivingChunks);
+}
+
+#[test]
+fn committed_bank_is_bootable_shaped_and_round_trips()
+{
+    let root = dev_root();
+    let flash = MockFlash::new(0);
+    let se = MockSeCounter::new(SE_FLOOR_ZERO);
+    let mut up = Updater::new(&root, flash, se);
+
+    // A payload whose first 8 bytes are a plausible Cortex-M vector table (an
+    // initial stack pointer then a reset vector), distinct from the "PKIM" magic.
+    let mut payload = std::vec::Vec::new();
+    payload.extend_from_slice(&0x2003_0000u32.to_le_bytes());
+    payload.extend_from_slice(&0x0C01_4101u32.to_le_bytes());
+    payload.extend_from_slice(b"the rest of the firmware image body");
+    let image = build_image(DEV_SCALAR, 3, &payload);
+
+    feed(&mut up, &image).expect("feed");
+    up.verify_and_accept().expect("verify accepts the de-interleaved image");
+    assert_eq!(up.state(), UpdateState::PendingCommit);
+
+    // The payload store at offset 0 is the firmware vector table, not the magic.
+    assert_eq!(&up.flash().bank()[..4], &0x2003_0000u32.to_le_bytes());
+    assert_ne!(&up.flash().bank()[..4], b"PKIM");
+    // The magic lives at the front of the descriptor.
+    assert_eq!(&up.flash().descriptor()[..4], b"PKIM");
+    // Full de-interleave round-trip: the four segments reassemble the file.
+    assert_deinterleaved(up.flash(), &image);
 }
 
 #[test]
@@ -591,7 +601,7 @@ fn confirm_before_boot_floor_is_bad_state()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 1, b"payload");
+    let image = build_image(DEV_SCALAR, 1, b"payload");
     feed(&mut up, &image).expect("feed");
     up.verify_and_accept().expect("verify");
     up.commit().expect("commit");
@@ -608,7 +618,7 @@ fn multi_chunk_accumulation_tracks_written_len()
     let se = MockSeCounter::new(SE_FLOOR_ZERO);
     let mut up = Updater::new(&root, flash, se);
 
-    let image = build_image(DEV_SEED, 3, b"chunked firmware payload here");
+    let image = build_image(DEV_SCALAR, 3, b"chunked firmware payload here");
     up.begin(image.len()).expect("begin");
     // Split the image into two in-order chunks.
     let mid = image.len() / 2;

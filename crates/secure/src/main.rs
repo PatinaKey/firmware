@@ -40,12 +40,6 @@ mod se_fw_update;
 #[cfg(all(target_os = "none", feature = "se-session"))]
 mod se_session;
 
-// The crypto + attestation bring-up path (secure side of the crypto veneer).
-// Feature-gated under the se-session feature: OFF by default, so the
-// product firmware is byte-unchanged and never references it.
-#[cfg(all(target_os = "none", feature = "se-session"))]
-mod se_crypto;
-
 // The persistent-but-reversible state bring-up path.
 // Feature-gated under the se-session feature: OFF by default, so the
 // product firmware is byte-unchanged and never references it.
@@ -68,9 +62,19 @@ mod firmware
     use platform::apply_secure_mpu;
     use platform::MmioBus;
 
-    /// Non-secure vector table base: NS flash Bank 2 (NS alias). RM0456 memory
-    /// map. word[0] = NS initial MSP, word[1] = NS reset entry.
-    const NS_VECTOR_TABLE: u32 = 0x0804_0000;
+    /// Non-secure vector table base: the non-secure app band (pages 20-31) at the
+    /// LOW non-secure alias. Layout L1 places the NS app at 0x0802_8000 (matching
+    /// crates/nonsecure/memory.x FLASH ORIGIN), not the old whole-bank NS base.
+    /// RM0456 memory map. word[0] = NS initial MSP, word[1] = NS reset entry.
+    const NS_VECTOR_TABLE: u32 = 0x0802_8000;
+
+    /// `FLASH_OPTR` (option register, secure alias) holding SWAP_BANK. RM0456 sec
+    /// 7.9.35 Table 79 (FLASH secure base 0x5002_2000, OPTR offset 0x40).
+    const FLASH_OPTR: u32 = 0x5002_2040;
+
+    /// `OPTR.SWAP_BANK` bit 20. RM0456 sec 7.9.13. Set when physical Bank 2 boots
+    /// low, which moves physical Bank 1 (the metadata) to the high alias.
+    const OPTR_SWAP_BANK: u32 = 1 << 20;
 
     /// `SCB_NS->VTOR`: the non-secure alias of the SCB VTOR register. The NS SCB
     /// is the standard SCB block at the non-secure-alias base, VTOR at +0xD08
@@ -164,10 +168,25 @@ mod firmware
             (ns_msp, ns_reset)
         };
 
+        // Read the live OPTR.SWAP_BANK so the boot-metadata MPU region (R1) tracks
+        // physical Bank 1's CURRENT alias: low when clear, high when set (RM0456
+        // sec 7.5.8 / 7.9.13). After an A/B swap the newly-booted firmware re-runs
+        // this with the flipped bit, so a post-swap metadata write stays inside its
+        // region instead of HardFaulting.
+        //
+        // SAFETY: FLASH_OPTR is a valid 32-bit-aligned MMIO register on the
+        // STM32U545, read volatile so the read is not elided or reordered. The MPU
+        // is still OFF here, so the secure-peripheral access does not fault. No
+        // value crosses as a pointer to secure memory.
+        let swap_bank = unsafe
+        {
+            ptr::read_volatile(FLASH_OPTR as *const u32) & OPTR_SWAP_BANK != 0
+        };
+
         // Enable the secure MPU as the LAST isolation step. On error FAIL-CLOSED:
         // wedge and never hand off, so the NS world cannot start with the secure
         // world unprotected.
-        if apply_secure_mpu(bus).is_err()
+        if apply_secure_mpu(bus, swap_bank).is_err()
         {
             loop
             {

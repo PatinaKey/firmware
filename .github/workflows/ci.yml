@@ -12,10 +12,11 @@
 #   An asm gate disassembles the built images and asserts the hand-rolled
 #   inline asm compiled to the right instructions, since no host lint sees it.
 # - The host signing tool is a detached workspace, so it has its own job.
-# - Live model integration: the coverage job clones the official TROPIC01 model
-#   (libtropic, pinned to a tag + commit) and drives tropic01-driver against it
-#   end-to-end (real handshake + AES-GCM). These run under coverage so the
-#   library paths they exercise count. The test-harness files are excluded.
+# - Live model integration: the coverage job clones libtropic (pinned to a tag +
+#   commit) for the model config, installs the ts-tvl wheel pinned by
+#   crates/tropic01-driver/scripts/install-model.sh, and drives tropic01-driver
+#   against it end-to-end (real handshake + AES-GCM). These run under coverage so
+#   the library paths they exercise count. The test-harness files are excluded.
 # - cargo-deny BLOCKS on findings (it now also covers the RustSec advisory DB
 #   that cargo-audit used to check, making a separate audit job redundant): a
 #   known vulnerability, a banned or yanked crate, a disallowed license, or an
@@ -43,9 +44,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Official TROPIC01 model (libtropic), pinned to a release tag and its commit. 
-  # Shared by the coverage job (the model) and the embedded job 
-  # (the se-fw-update vendor blobs).
+  # Official libtropic, pinned to a release tag and its commit. Shared by the
+  # coverage job (the TROPIC01 model config and venv layout) and the embedded
+  # job (the se-fw-update vendor blobs).
   LIBTROPIC_REF: v4.0.0
   LIBTROPIC_SHA: 756c8ee898ed61b12272ecb22b213edf97aab751
 
@@ -139,7 +140,7 @@ jobs:
         if: matrix.feature == 'default'
         run: |
           set -euo pipefail
-          for c in platform mcu-spi mcu-flash image-verify fw-update tropic01-driver
+          for c in mcu-layout platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
           do
             cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings
           done
@@ -269,7 +270,7 @@ jobs:
       - name: Configure model location
         run: echo "LIBTROPIC=$RUNNER_TEMP/libtropic" >> "$GITHUB_ENV"
 
-      - name: Clone the TROPIC01 model (libtropic, pinned)
+      - name: Clone the model config (libtropic, pinned)
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$LIBTROPIC_REF" \
@@ -280,8 +281,8 @@ jobs:
             exit 1
           fi
 
-      - name: Install the TROPIC01 model (ts-tvl)
-        run: "$LIBTROPIC/scripts/tropic01_model/install_linux.sh"
+      - name: Install the TROPIC01 model (ts-tvl, pinned)
+        run: crates/tropic01-driver/scripts/install-model.sh
 
       # Coverage over the hermetic suite PLUS the live model integration tests
       # (tests/model_itest.rs, behind `model-itest`): the driver runs its real

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 authors = ["PatinaKey <contact@patinakey.fr>"]
 license = "GPL-3.0-or-later"
-description = "Host-only tool that signs patina_key firmware images with an Ed25519 key."
+description = "Host-only tool that signs patina_key firmware images with an ECDSA P-256 key."
 publish = false
 
 # Detach from the firmware workspace: this is a HOST tool, never built for the
@@ -26,26 +26,29 @@ path = "src/main.rs"
 # truth for the header bytes, and verify_image gives the round-trip self-check.
 image-verify = { path = "../../crates/image-verify", features = ["encode"] }
 
-# Ed25519 signing from a raw 32-byte seed. The zeroize feature wipes the
-# SigningKey on drop, so no plaintext key scalar lingers in memory.
-ed25519-dalek = { version = "3.0", default-features = false, features = ["zeroize"] }
+# ECDSA P-256 signing from a raw 32-byte private scalar.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 
-# Wipes the intermediate plaintext seed buffer on drop. 
+# Enable DER support for `ecdsa::Signature::from_der`.
+ecdsa = { version = "0.17", default-features = false, features = ["der"] }
+
+# Wipes the intermediate plaintext seed buffer on drop.
 # The alloc feature lets a Vec<u8> seed buffer be wiped too.
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+# SHA-256 for deriving the bring-up root key.
+sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 # The integration tests verify the signed output through the real verify path,
 # so they read it back exactly as the device would.
 image-verify = { path = "../../crates/image-verify", features = ["encode"] }
 
-# End-to-end test only: drive the tool's signed output through the real
-# dual-bank update machine, which pins the dev root key. This edge runs ONLY in
-# the signer's host tests. The update machine never depends on this tool, so the
-# MCU target build is untouched.
-#
-# The `_fuzz` feature is what exposes the host MockFlash / MockSeCounter seams to
-# an external test consumer (they are otherwise gated to fw-update's own tests).
+# Derive the bring-up root key from the fixed test phrase instead of embedding
+# the expected key bytes.
+sha2 = { version = "0.11", default-features = false }
+
+# Expose the host test interfaces used by the end-to-end signer tests.
 fw-update = { path = "../../crates/fw-update", features = ["_fuzz"] }
 
 [lints.rust]

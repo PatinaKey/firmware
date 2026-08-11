@@ -48,7 +48,8 @@ const MCOUNTER_IDX: u8 = 15;
 const MAC_DESTROY_SLOT: u8 = 127;
 /// ECC slot the imported Ed25519 test key lives in (bring-up scratch slot).
 ///
-/// 29 avoids slots 30 and 31, which the crypto bring-up (se_crypto.rs) uses.
+/// 29 keeps this key off slot 28 (se_readonly.rs), so the feature-gated bring-up
+/// paths never share an ECC slot.
 const ECC_SLOT: u8 = 29;
 
 /// The counter value the first init sets (step 2).
@@ -532,8 +533,8 @@ pub extern "C" fn patinakey_se_persist() -> u32
     let mut dev = build_device();
 
     // Step 1: read STPUB from the chip certificate, then open the Noise KK1
-    // session on slot 0 via the shared helper (identical prod0 SH0 keys and fixed
-    // ephemeral as the session and crypto paths). On a read error the chip is
+    // session on slot 0 via the shared helper (the same prod0 SH0 keys and fixed
+    // ephemeral every bring-up path uses). On a read error the chip is
     // untouched, so no teardown is owed. On an open error the helper returns the
     // NoSession handle plus the error, both dropped here.
     let mut scratch = [0u8; CERT_SCRATCH_LEN];

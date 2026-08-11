@@ -1,20 +1,30 @@
 //! Signed firmware-image verifier for patina_key.
 //!
-//! A `no_std`, heap-free library that parses the patina_key
-//! signed-image format and verifies its Ed25519 signature against an
-//! out-of-band PINNED root public key supplied by the caller. 
-//! This crate decides one thing, is this image authentic under the pinned root.
+//! Parses the patina_key signed-image format and verifies its ECDSA P-256
+//! signature against a pinned root public key supplied by the caller. `no_std`
+//! and heap-free.
+//!
+//! # Segmented images
+//!
+//! [`verify_image`] takes `&[&[u8]]`, a list of slices whose concatenation is the
+//! image. On the device an image spans two flash bands with different security
+//! attributes, read through different address aliases, so no contiguous view
+//! exists and there is no RAM to assemble one. A one-element list is a contiguous
+//! image.
+//!
+//! The digest is streamed across the segments, so the image is never copied. The
+//! header, the signature, or any field may straddle a segment boundary, and a
+//! segment may be empty. ECDSA verifies over a prehash, so the segmented path
+//! needs no reassembly.
 //!
 //! # Trust model
 //!
-//! The entire image is attacker-controlled until the signature verifies. The
-//! root public key is the ONLY trust input and it is a caller argument, so the
-//! library stays testable and the real secure binary pins the genuine key
-//! out-of-band as a const. No header field inside the signed region is exposed
-//! before the Ed25519 check passes. `verify_strict` (not `verify`) is used so a
-//! low-order or non-canonical key is rejected.
+//! The whole image is attacker-controlled until the signature verifies. The root
+//! public key is the only trust input and is a caller argument, so the boot stage
+//! pins the genuine key out-of-band. No field inside the signed region is exposed
+//! before the signature check passes.
 //!
-//! See [`format`] for the exact byte layout and the little-endian choice.
+//! See [`format`] for the byte layout.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -26,23 +36,37 @@ extern crate std;
 mod encode;
 mod error;
 mod format;
+mod segments;
 
 #[cfg(feature = "encode")]
 pub use crate::encode::encode_header;
 pub use crate::error::VerifyError;
-pub use crate::format::ImageVersion;
 pub use crate::format::HEADER_LEN;
+pub use crate::format::ImageVersion;
+pub use crate::format::ROOT_KEY_LEN;
 pub use crate::format::SIG_LEN;
+pub use crate::segments::PayloadSegments;
 
-use ed25519_dalek::Signature;
-use ed25519_dalek::VerifyingKey;
+use p256::ecdsa::Signature;
+use p256::ecdsa::VerifyingKey;
+use p256::ecdsa::signature::hazmat::PrehashVerifier;
+use p256::elliptic_curve::scalar::IsHigh;
+use sha2::Digest;
+use sha2::Sha256;
 
-/// A pinned Ed25519 root public key.
+/// A pinned ECDSA P-256 root public key.
 ///
-/// Constructed only through [`RootKey::from_bytes`], which rejects any encoding
-/// Ed25519 refuses (a malformed or non-canonical point). Holding a `RootKey`
-/// therefore means dalek already accepted the key.
-// Debug is intentionally NOT derived so the key bytes can never reach logs.
+/// Pinned as the 65-byte uncompressed SEC1 point (`0x04 || X || Y`). The
+/// uncompressed form carries both coordinates in the clear, so the pinned constant
+/// can be diffed byte for byte against the signing ceremony output, and it avoids a
+/// point decompression on every construction. Fixing the length at 65 also pins the
+/// encoding: a compressed key cannot be passed to [`RootKey::from_bytes`], so there
+/// is no encoding ambiguity.
+///
+/// Constructed only through [`RootKey::from_bytes`], which rejects anything that is
+/// not a point on the P-256 curve. Holding a `RootKey` means the point is
+/// validated.
+// Debug is not derived so the key bytes cannot reach logs.
 #[derive(Clone)]
 pub struct RootKey
 {
@@ -51,15 +75,16 @@ pub struct RootKey
 
 impl RootKey
 {
-    /// Builds a pinned root key from its 32-byte Ed25519 encoding.
+    /// Builds a pinned root key from its 65-byte uncompressed SEC1 encoding.
     ///
     /// # Errors
     ///
-    /// Returns [`VerifyError::BadRootKey`] if the bytes are not a valid
-    /// compressed Edwards point that dalek accepts.
-    pub fn from_bytes(bytes: [u8; 32]) -> Result<RootKey, VerifyError>
+    /// Returns [`VerifyError::BadRootKey`] if the bytes are not an uncompressed
+    /// SEC1 point on the P-256 curve: a wrong tag byte, an off-curve point, or
+    /// the identity are all rejected.
+    pub fn from_bytes(bytes: [u8; ROOT_KEY_LEN]) -> Result<RootKey, VerifyError>
     {
-        match VerifyingKey::from_bytes(&bytes)
+        match VerifyingKey::from_sec1_bytes(&bytes)
         {
             Ok(key) => Ok(RootKey { key }),
             Err(_) => Err(VerifyError::BadRootKey),
@@ -69,15 +94,17 @@ impl RootKey
 
 /// A verified image view.
 ///
-/// Returned ONLY after the Ed25519 signature passed. Every field here lives
-/// inside the signed region, so reading it is safe: an attacker cannot forge it
-/// without the root private key. The payload slice borrows the original image.
+/// Returned only after the signature verifies. Every field lives inside the signed
+/// region, so an attacker cannot forge it without the root private key. The payload
+/// is exposed as borrowed segments, never copied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedImage<'a>
 {
     image_version: ImageVersion,
     security_counter: u32,
-    payload: &'a [u8],
+    segments: &'a [&'a [u8]],
+    payload_start: usize,
+    payload_len: usize,
 }
 
 impl<'a> VerifiedImage<'a>
@@ -95,19 +122,27 @@ impl<'a> VerifiedImage<'a>
         self.security_counter
     }
 
-    /// The verified payload bytes (the region between the header and the
-    /// signature).
-    pub fn payload(&self) -> &'a [u8]
+    /// The payload length in bytes, as declared by the signed header.
+    pub fn payload_len(&self) -> usize
     {
-        self.payload
+        self.payload_len
+    }
+
+    /// The verified payload, as borrowed pieces in logical order.
+    ///
+    /// Concatenating the yielded slices reproduces the payload. The pieces borrow
+    /// the caller's segments, so nothing is copied. A contiguous image yields one
+    /// piece, or none for an empty payload.
+    pub fn payload_segments(&self) -> PayloadSegments<'a>
+    {
+        PayloadSegments::new(self.segments, self.payload_start, self.payload_len)
     }
 }
 
-// Reads a little-endian u16 at `off` from an already-bounds-checked header
-// region. The caller guarantees `slice.len() >= off + 2`.
-fn read_u16_le(slice: &[u8], off: usize) -> Result<u16, VerifyError>
+// Reads a little-endian u16 at `off` from the fixed-size header buffer.
+fn read_u16_le(header: &[u8], off: usize) -> Result<u16, VerifyError>
 {
-    let bytes = slice
+    let bytes = header
         .get(off..off + 2)
         .ok_or(VerifyError::TooShort)?;
     let arr: [u8; 2] = bytes
@@ -117,9 +152,9 @@ fn read_u16_le(slice: &[u8], off: usize) -> Result<u16, VerifyError>
 }
 
 // Reads a little-endian u32 at `off`. Same contract as `read_u16_le`.
-fn read_u32_le(slice: &[u8], off: usize) -> Result<u32, VerifyError>
+fn read_u32_le(header: &[u8], off: usize) -> Result<u32, VerifyError>
 {
-    let bytes = slice
+    let bytes = header
         .get(off..off + 4)
         .ok_or(VerifyError::TooShort)?;
     let arr: [u8; 4] = bytes
@@ -128,62 +163,88 @@ fn read_u32_le(slice: &[u8], off: usize) -> Result<u32, VerifyError>
     Ok(u32::from_le_bytes(arr))
 }
 
-/// Verifies a signed firmware image against a pinned root key.
+/// Verifies a segmented signed firmware image against a pinned root key.
 ///
 /// # Arguments
 ///
-/// - `image`: the full `HEADER || PAYLOAD || SIGNATURE` byte slice. Entirely
+/// - `image`: the segments whose concatenation is
+///   `HEADER || PAYLOAD || SIGNATURE`. Any segmentation is legal: an empty list,
+///   empty segments, a header or signature straddling a boundary. The bytes are
 ///   attacker-controlled until the signature check passes.
-/// - `root_key`: the out-of-band pinned Ed25519 root public key.
+/// - `root_key`: the pinned P-256 root public key.
 ///
 /// # Returns
 ///
 /// On success, a [`VerifiedImage`] exposing the signed `image_version`,
-/// `security_counter`, and payload slice.
+/// `security_counter`, and the payload as borrowed segments.
+///
+/// # Only the low-s signature encoding is accepted
+///
+/// ECDSA admits two encodings of every signature, `(r, s)` and `(r, n - s)`, both
+/// of which verify and either of which can be produced from the other without the
+/// private key. This verifier rejects the high-s encoding with
+/// [`VerifyError::NonCanonicalSignature`].
+///
+/// The digest covers `HEADER || PAYLOAD`, not the trailing signature, so flipping
+/// `s` to `n - s` yields a different byte string in flash that still verifies. This
+/// forges nothing, both encodings authenticate the same payload, so no authenticity
+/// property depends on the check. What it buys is canonicality: each payload has
+/// exactly one accepted byte string per signing key, so an image hash or a
+/// byte-for-byte diff of two banks means one thing.
+///
+/// The signing tool normalizes to low-s, so a legitimate signer never trips this. A
+/// hardware backend returning a high-s signature is normalized on the host.
 ///
 /// # Errors
 ///
-/// Fails closed at the FIRST anomaly, in this fixed order:
+/// Fails closed at the first anomaly, in this fixed order:
 /// [`VerifyError::TooShort`] (below the `HEADER_LEN + SIG_LEN` floor),
 /// [`VerifyError::BadMagic`], [`VerifyError::UnsupportedFormatVersion`],
-/// [`VerifyError::UnsupportedAlgorithm`], [`VerifyError::ReservedNotZero`] (a
-/// reserved header byte was not zero), [`VerifyError::LengthMismatch`] (the
-/// total length is not `HEADER_LEN + payload_len + SIG_LEN` exactly, including
-/// an overflowing `payload_len`), then [`VerifyError::BadSignature`] if Ed25519
-/// rejects the signature over `HEADER || PAYLOAD`. No field inside the signed
-/// region is read into the result before that final check passes.
+/// [`VerifyError::UnsupportedAlgorithm`], [`VerifyError::ReservedNotZero`],
+/// [`VerifyError::LengthMismatch`] (the total is not
+/// `HEADER_LEN + payload_len + SIG_LEN` exactly, including an overflowing
+/// `payload_len`), [`VerifyError::BadSignature`] for a signature that is not a
+/// well-formed `(r, s)` scalar pair, [`VerifyError::NonCanonicalSignature`] for a
+/// high-s encoding, then [`VerifyError::BadSignature`] if ECDSA rejects the
+/// signature over the SHA-256 digest of `HEADER || PAYLOAD`. No field inside the
+/// signed region is exposed in the result before that final check passes.
 pub fn verify_image<'a>
 (
-    image: &'a [u8],
+    image: &'a [&'a [u8]],
     root_key: &RootKey,
 )
     -> Result<VerifiedImage<'a>, VerifyError>
 {
     use crate::format::
     {
-        ALG_ED25519, FORMAT_VERSION, HEADER_LEN, MAGIC, OFF_ALGORITHM,
+        ALG_ECDSA_P256_SHA256, FORMAT_VERSION, HEADER_LEN, MAGIC, OFF_ALGORITHM,
         OFF_FORMAT_VERSION, OFF_MAGIC, OFF_PAYLOAD_LEN, OFF_RESERVED,
         OFF_SECURITY_COUNTER, OFF_VERSION_BUILD, OFF_VERSION_MAJOR,
         OFF_VERSION_MINOR, OFF_VERSION_REVISION, SIG_LEN,
     };
 
-    // a. Length floor: must hold a header plus a signature.
+    // Length floor: the segments must hold at least a header plus a signature. This
+    // establishes the total, which every later bound is checked against.
+    let total = segments::total_len(image)?;
     let floor = HEADER_LEN
         .checked_add(SIG_LEN)
         .ok_or(VerifyError::TooShort)?;
-    if image.len() < floor
+    if total < floor
     {
         return Err(VerifyError::TooShort);
     }
 
-    // The full header is parsed UP FRONT into typed locals, using the bounded
-    // combinators with their reachable error variants. Nothing parsed here is
-    // returned or otherwise exposed before verify_strict returns Ok: only the
-    // local bindings exist, and the VerifiedImage is built solely on the Ok
-    // path. This keeps the verifier fail-closed by construction.
+    // Parse the full header into typed locals. Nothing here is exposed before the
+    // signature verifies: the VerifiedImage is built only on the Ok path, which
+    // keeps the verifier fail-closed by construction.
+    //
+    // The header is copied into a fixed 24-byte stack array because it may straddle
+    // a segment boundary. Only the header is copied, not the image.
+    let mut header = [0u8; HEADER_LEN];
+    segments::copy_out(image, 0, &mut header)?;
 
-    // b. Magic.
-    let magic = image
+    // Magic tag.
+    let magic = header
         .get(OFF_MAGIC..OFF_MAGIC + 4)
         .ok_or(VerifyError::TooShort)?;
     if magic != MAGIC
@@ -191,8 +252,8 @@ pub fn verify_image<'a>
         return Err(VerifyError::BadMagic);
     }
 
-    // c. Format version (parser schema, not firmware version).
-    let format_version = *image
+    // Header schema version, not the firmware version.
+    let format_version = *header
         .get(OFF_FORMAT_VERSION)
         .ok_or(VerifyError::TooShort)?;
     if format_version != FORMAT_VERSION
@@ -200,38 +261,38 @@ pub fn verify_image<'a>
         return Err(VerifyError::UnsupportedFormatVersion);
     }
 
-    // d. Algorithm id.
-    let algorithm = *image
+    // Algorithm id. One verifier ships, so every other id is rejected, the retired
+    // Ed25519 id included. This is the anti-downgrade guard.
+    let algorithm = *header
         .get(OFF_ALGORITHM)
         .ok_or(VerifyError::TooShort)?;
-    if algorithm != ALG_ED25519
+    if algorithm != ALG_ECDSA_P256_SHA256
     {
         return Err(VerifyError::UnsupportedAlgorithm);
     }
 
-    // e. Firmware version (major.minor.revision.build), inside the signed
-    //    region. Read into a local now, returned only after verification.
+    // Firmware version, inside the signed region. Returned only after verification.
     let image_version = ImageVersion
     {
-        major: *image
+        major: *header
             .get(OFF_VERSION_MAJOR)
             .ok_or(VerifyError::TooShort)?,
-        minor: *image
+        minor: *header
             .get(OFF_VERSION_MINOR)
             .ok_or(VerifyError::TooShort)?,
-        revision: read_u16_le(image, OFF_VERSION_REVISION)?,
-        build: read_u32_le(image, OFF_VERSION_BUILD)?,
+        revision: read_u16_le(&header, OFF_VERSION_REVISION)?,
+        build: read_u32_le(&header, OFF_VERSION_BUILD)?,
     };
 
-    // f. Monotonic anti-rollback counter, inside the signed region.
-    let security_counter = read_u32_le(image, OFF_SECURITY_COUNTER)?;
+    // Monotonic anti-rollback counter, inside the signed region.
+    let security_counter = read_u32_le(&header, OFF_SECURITY_COUNTER)?;
 
-    // g. Declared payload length.
-    let payload_len = read_u32_le(image, OFF_PAYLOAD_LEN)? as usize;
+    // Declared payload length.
+    let payload_len = read_u32_le(&header, OFF_PAYLOAD_LEN)? as usize;
 
-    // h. Reserved bytes MUST be zero. They sit inside the signed region, so
-    //    this is a structural rejection caught before the signature check.
-    let reserved = image
+    // Reserved bytes must be zero. They sit inside the signed region, so a non-zero
+    // value is a structural rejection caught before the signature check.
+    let reserved = header
         .get(OFF_RESERVED..OFF_RESERVED + 2)
         .ok_or(VerifyError::TooShort)?;
     if reserved != [0u8, 0u8]
@@ -239,404 +300,151 @@ pub fn verify_image<'a>
         return Err(VerifyError::ReservedNotZero);
     }
 
-    // i. Exact total length: HEADER_LEN + payload_len + SIG_LEN, no overflow,
-    //    no trailing byte, no short read.
+    // Exact total length: HEADER_LEN + payload_len + SIG_LEN, with no overflow and
+    // no trailing byte. This pins the signature boundary, which may fall inside a
+    // segment.
     let signed_len = HEADER_LEN
         .checked_add(payload_len)
         .ok_or(VerifyError::LengthMismatch)?;
     let total_len = signed_len
         .checked_add(SIG_LEN)
         .ok_or(VerifyError::LengthMismatch)?;
-    if image.len() != total_len
+    if total != total_len
     {
         return Err(VerifyError::LengthMismatch);
     }
 
-    // j. Split the signed region from the trailing signature, both via bounded
-    //    slicing.
-    let signed = image
-        .get(..signed_len)
-        .ok_or(VerifyError::LengthMismatch)?;
-    let sig_bytes = image
-        .get(signed_len..total_len)
-        .ok_or(VerifyError::LengthMismatch)?;
-    let sig_arr: [u8; SIG_LEN] = sig_bytes
-        .try_into()
-        .map_err(|_| VerifyError::LengthMismatch)?;
-    let signature = Signature::from_bytes(&sig_arr);
+    // Copy the trailing signature into a fixed 64-byte stack array. It may straddle
+    // a boundary or start inside the segment the payload ends in, so it cannot be
+    // sliced out of a single segment.
+    let mut sig_bytes = [0u8; SIG_LEN];
+    segments::copy_out(image, signed_len, &mut sig_bytes)?;
 
-    // k. The load-bearing trust step. verify_strict rejects low-order keys.
-    //    Any failure collapses to BadSignature: nothing leaks about why.
-    root_key
-        .key
-        .verify_strict(signed, &signature)
+    // Parse (r, s). Rejects a zero scalar or one at or above the curve order, so the
+    // pair is well-formed before any curve arithmetic.
+    let signature = Signature::from_slice(&sig_bytes)
         .map_err(|_| VerifyError::BadSignature)?;
 
-    // Authenticated. Only now bind the payload slice and build the result from
-    // the already-parsed locals.
-    let payload = signed
-        .get(HEADER_LEN..signed_len)
-        .ok_or(VerifyError::LengthMismatch)?;
+    // Malleability policy: accept only the low-s encoding. See the doc comment
+    // above.
+    if bool::from(signature.s().is_high())
+    {
+        return Err(VerifyError::NonCanonicalSignature);
+    }
 
+    // Stream the digest over HEADER || PAYLOAD. Each segment is fed to SHA-256 as
+    // is, and the last piece is cut at the signature boundary, so the image is never
+    // assembled in RAM.
+    let mut hasher = Sha256::new();
+    segments::for_each_prefix_piece(image, signed_len, |piece| hasher.update(piece))?;
+    let digest = hasher.finalize();
+
+    // The trust step. Any failure collapses to BadSignature, so nothing leaks about
+    // why.
+    root_key
+        .key
+        .verify_prehash(&digest, &signature)
+        .map_err(|_| VerifyError::BadSignature)?;
+
+    // Authenticated. Build the result from the already-parsed locals.
     Ok(VerifiedImage
     {
         image_version,
         security_counter,
-        payload,
+        segments: image,
+        payload_start: HEADER_LEN,
+        payload_len,
     })
 }
 
 /// Fuzzing seam. Exposes the attacker-facing verify path to libFuzzer harnesses.
 ///
-/// Gated behind the `_fuzz` feature so the normal public API stays minimal. The
-/// entry point must never panic on any input. Not part of the supported API.
+/// Gated behind the `_fuzz` feature so the fixed dev key it carries cannot reach a
+/// product build. The entry point must never panic on any input. Not part of the
+/// supported API.
 #[cfg(feature = "_fuzz")]
 pub mod fuzz
 {
+    use crate::ROOT_KEY_LEN;
     use crate::RootKey;
 
-    // A FIXED, valid Ed25519 public key for the fuzz target. Its exact value is
-    // irrelevant: the target exercises the bounded parsing in front of the
-    // crypto, which fails closed on essentially every mutated input. The bytes
-    // below are the public key of the all-0x01 Ed25519 secret scalar, a
-    // genuinely on-curve point that from_bytes accepts.
-    const FUZZ_ROOT_KEY: [u8; 32] = [
-        0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95,
-        0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba, 0x5d, 0x72,
-        0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b,
-        0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f, 0x6f, 0x5c,
+    /// A fixed, valid P-256 public key for the fuzz target. Test only.
+    ///
+    /// The uncompressed SEC1 public key of the all-`0x01` private scalar, a publicly
+    /// known value. A guard test pins that an image signed with the matching private
+    /// scalar is accepted, so the fuzzer reaches the verify path instead of bouncing
+    /// off a rejected key.
+    pub(crate) const FUZZ_ROOT_KEY_TEST_ONLY: [u8; ROOT_KEY_LEN] = [
+        0x04, 0x6f, 0xf0, 0x3b, 0x94, 0x92, 0x41, 0xce,
+        0x1d, 0xad, 0xd4, 0x35, 0x19, 0xe6, 0x96, 0x0e,
+        0x0a, 0x85, 0xb4, 0x1a, 0x69, 0xa0, 0x5c, 0x32,
+        0x81, 0x03, 0xaa, 0x2b, 0xce, 0x15, 0x94, 0xca,
+        0x16, 0x3c, 0x4f, 0x75, 0x3a, 0x55, 0xbf, 0x01,
+        0xdc, 0x53, 0xf6, 0xc0, 0xb0, 0xc7, 0xee, 0xe7,
+        0x8b, 0x40, 0xc6, 0xff, 0x7d, 0x25, 0xa9, 0x6e,
+        0x22, 0x82, 0xb9, 0x89, 0xce, 0xf7, 0x1c, 0x14,
+        0x4a,
     ];
 
-    /// Drives the image verifier over arbitrary bytes under a fixed pinned root
-    /// key. Must never panic. Returns either `Ok` (only for a genuinely valid
-    /// image under that key, which fuzzing will essentially never produce) or a
-    /// typed error. Any panic/abort is a finding.
+    /// Drives the segmented image verifier over arbitrary bytes under a fixed pinned
+    /// root key. Must never panic.
+    ///
+    /// The first two bytes choose two cut points, so the header and the signature
+    /// are driven across segment boundaries and zero-length segments are reached.
+    /// The same bytes also go through the contiguous one-segment path, so every
+    /// input attacks both shapes. Any panic or abort is a finding.
     pub fn verify_image(data: &[u8])
     {
-        if let Ok(root) = RootKey::from_bytes(FUZZ_ROOT_KEY)
+        let root = match RootKey::from_bytes(FUZZ_ROOT_KEY_TEST_ONLY)
         {
-            let _ = crate::verify_image(data, &root);
-        }
+            Ok(key) => key,
+            Err(_) => return,
+        };
+
+        // With fewer than two control bytes there is no image to cut. Drive the two
+        // edge shapes the parser must survive: an empty segment list, and a single
+        // segment holding whatever bytes there are.
+        let (control, body) = match data.split_at_checked(2)
+        {
+            Some(pair) => pair,
+            None =>
+            {
+                let _ = crate::verify_image(&[], &root);
+                let _ = crate::verify_image(&[data], &root);
+                return;
+            }
+        };
+
+        // The contiguous shape.
+        let _ = crate::verify_image(&[body], &root);
+
+        let cuts: [u8; 2] = match control.try_into()
+        {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+
+        // The segmented shape. `span` is body.len() + 1, so `first` lands anywhere
+        // in [0, len] and `second` anywhere in [first, len]. Either cut can coincide
+        // with a boundary or an end, reaching the empty-segment and
+        // boundary-straddling cases.
+        let span = body.len().saturating_add(1);
+        let first = (cuts[0] as usize) % span;
+        let second = first + ((cuts[1] as usize) % (span - first));
+
+        let (head, rest) = match body.split_at_checked(first)
+        {
+            Some(pair) => pair,
+            None => return,
+        };
+        let (middle, tail) = match rest.split_at_checked(second - first)
+        {
+            Some(pair) => pair,
+            None => return,
+        };
+        let _ = crate::verify_image(&[head, middle, tail], &root);
     }
 }
 
 #[cfg(test)]
-mod tests
-{
-    use super::*;
-    use crate::format::{
-        ALG_ED25519, FORMAT_VERSION, MAGIC, OFF_ALGORITHM, OFF_FORMAT_VERSION,
-        OFF_MAGIC, OFF_PAYLOAD_LEN, OFF_RESERVED, OFF_SECURITY_COUNTER,
-        OFF_VERSION_BUILD, OFF_VERSION_MAJOR, OFF_VERSION_MINOR,
-        OFF_VERSION_REVISION,
-    };
-    use ed25519_dalek::ed25519::signature::Signer;
-    use ed25519_dalek::SigningKey;
-    use std::vec::Vec;
-
-    // Deterministic fixtures: a fixed 32-byte seed yields a stable key pair, no
-    // RNG needed.
-    const TEST_SEED: [u8; 32] = [7u8; 32];
-    const OTHER_SEED: [u8; 32] = [9u8; 32];
-
-    const TEST_MAJOR: u8 = 3;
-    const TEST_MINOR: u8 = 7;
-    const TEST_REVISION: u16 = 0x0102;
-    const TEST_BUILD: u32 = 0xAABB_CCDD;
-    const TEST_COUNTER: u32 = 0x0000_1234;
-
-    fn signing_key(seed: [u8; 32]) -> SigningKey
-    {
-        SigningKey::from_bytes(&seed)
-    }
-
-    fn root_key_for(seed: [u8; 32]) -> RootKey
-    {
-        let sk = signing_key(seed);
-        let pk = sk.verifying_key().to_bytes();
-        RootKey::from_bytes(pk).expect("test key is valid")
-    }
-
-    // Builds a header with the given payload length. Returns a HEADER_LEN buffer.
-    fn build_header(payload_len: u32) -> [u8; HEADER_LEN]
-    {
-        let mut h = [0u8; HEADER_LEN];
-        h[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC);
-        h[OFF_FORMAT_VERSION] = FORMAT_VERSION;
-        h[OFF_ALGORITHM] = ALG_ED25519;
-        h[OFF_VERSION_MAJOR] = TEST_MAJOR;
-        h[OFF_VERSION_MINOR] = TEST_MINOR;
-        h[OFF_VERSION_REVISION..OFF_VERSION_REVISION + 2]
-            .copy_from_slice(&TEST_REVISION.to_le_bytes());
-        h[OFF_VERSION_BUILD..OFF_VERSION_BUILD + 4]
-            .copy_from_slice(&TEST_BUILD.to_le_bytes());
-        h[OFF_SECURITY_COUNTER..OFF_SECURITY_COUNTER + 4]
-            .copy_from_slice(&TEST_COUNTER.to_le_bytes());
-        h[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
-            .copy_from_slice(&payload_len.to_le_bytes());
-        h
-    }
-
-    // Builds a fully signed image: HEADER || payload || signature, signed with
-    // `seed`'s key over HEADER || payload.
-    fn build_signed_image(seed: [u8; 32], payload: &[u8]) -> Vec<u8>
-    {
-        let payload_len = payload.len() as u32;
-        let header = build_header(payload_len);
-        let mut signed = Vec::new();
-        signed.extend_from_slice(&header);
-        signed.extend_from_slice(payload);
-        let sk = signing_key(seed);
-        let sig = sk.sign(&signed);
-        let mut image = signed;
-        image.extend_from_slice(&sig.to_bytes());
-        image
-    }
-
-    #[test]
-    fn header_offsets_and_consts_are_pinned()
-    {
-        assert_eq!(HEADER_LEN, 24);
-        assert_eq!(SIG_LEN, 64);
-        assert_eq!(MAGIC, *b"PKIM");
-        assert_eq!(FORMAT_VERSION, 1);
-        assert_eq!(ALG_ED25519, 0x01);
-        assert_eq!(OFF_MAGIC, 0);
-        assert_eq!(OFF_FORMAT_VERSION, 4);
-        assert_eq!(OFF_ALGORITHM, 5);
-        assert_eq!(OFF_VERSION_MAJOR, 6);
-        assert_eq!(OFF_VERSION_MINOR, 7);
-        assert_eq!(OFF_VERSION_REVISION, 8);
-        assert_eq!(OFF_VERSION_BUILD, 10);
-        assert_eq!(OFF_SECURITY_COUNTER, 14);
-        assert_eq!(OFF_PAYLOAD_LEN, 18);
-        assert_eq!(OFF_RESERVED, 22);
-    }
-
-    #[test]
-    fn valid_image_round_trips()
-    {
-        let payload = b"hello patina firmware payload";
-        let image = build_signed_image(TEST_SEED, payload);
-        let root = root_key_for(TEST_SEED);
-        let v = verify_image(&image, &root).expect("valid image must verify");
-        assert_eq!(v.payload(), payload);
-        assert_eq!(v.security_counter(), TEST_COUNTER);
-        let ver = v.image_version();
-        assert_eq!(ver.major, TEST_MAJOR);
-        assert_eq!(ver.minor, TEST_MINOR);
-        assert_eq!(ver.revision, TEST_REVISION);
-        assert_eq!(ver.build, TEST_BUILD);
-    }
-
-    #[test]
-    fn empty_payload_round_trips()
-    {
-        let image = build_signed_image(TEST_SEED, b"");
-        let root = root_key_for(TEST_SEED);
-        let v = verify_image(&image, &root).expect("empty payload must verify");
-        assert_eq!(v.payload(), b"");
-    }
-
-    #[test]
-    fn flipped_payload_byte_is_bad_signature()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"some payload here");
-        // A payload byte sits just past the header.
-        image[HEADER_LEN] ^= 0xFF;
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::BadSignature));
-    }
-
-    #[test]
-    fn wrong_magic_is_bad_magic()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"x");
-        image[OFF_MAGIC] ^= 0xFF;
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::BadMagic));
-    }
-
-    #[test]
-    fn bad_format_version_is_unsupported_format_version()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"x");
-        image[OFF_FORMAT_VERSION] = 0xEE;
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(
-            verify_image(&image, &root),
-            Err(VerifyError::UnsupportedFormatVersion)
-        );
-    }
-
-    #[test]
-    fn wrong_algorithm_is_unsupported_algorithm()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"x");
-        image[OFF_ALGORITHM] = 0x02;
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(
-            verify_image(&image, &root),
-            Err(VerifyError::UnsupportedAlgorithm)
-        );
-    }
-
-    #[test]
-    fn truncated_below_floor_is_too_short()
-    {
-        let image = build_signed_image(TEST_SEED, b"x");
-        let root = root_key_for(TEST_SEED);
-        let short = &image[..HEADER_LEN + SIG_LEN - 1];
-        assert_eq!(verify_image(short, &root), Err(VerifyError::TooShort));
-    }
-
-    #[test]
-    fn declared_payload_len_too_big_is_length_mismatch()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"abc");
-        // Inflate the declared payload_len by one.
-        let inflated = (3u32 + 1).to_le_bytes();
-        image[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&inflated);
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::LengthMismatch));
-    }
-
-    #[test]
-    fn declared_payload_len_too_small_is_length_mismatch()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"abc");
-        let deflated = 2u32.to_le_bytes();
-        image[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&deflated);
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::LengthMismatch));
-    }
-
-    #[test]
-    fn trailing_byte_is_length_mismatch()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"abc");
-        image.push(0x00);
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::LengthMismatch));
-    }
-
-    #[test]
-    fn overflowing_payload_len_is_length_mismatch()
-    {
-        let mut image = build_signed_image(TEST_SEED, b"abc");
-        let huge = u32::MAX.to_le_bytes();
-        image[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&huge);
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::LengthMismatch));
-    }
-
-    #[test]
-    fn wrong_signing_key_is_bad_signature()
-    {
-        // Signed with TEST_SEED, verified under OTHER_SEED's public key.
-        let image = build_signed_image(TEST_SEED, b"payload");
-        let root = root_key_for(OTHER_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::BadSignature));
-    }
-
-    #[test]
-    fn bad_signature_image_exposes_nothing()
-    {
-        // The function returns Err, so no VerifiedImage exists and the signed
-        // fields are never readable on a tampered image.
-        let mut image = build_signed_image(TEST_SEED, b"payload");
-        image[HEADER_LEN] ^= 0x01;
-        let root = root_key_for(TEST_SEED);
-        let result = verify_image(&image, &root);
-        assert!(result.is_err());
-        assert_eq!(result, Err(VerifyError::BadSignature));
-    }
-
-    #[test]
-    fn security_counter_tamper_is_bad_signature()
-    {
-        // Flipping a byte of the signed security_counter must break the
-        // signature, proving the anti-rollback counter is bound by it.
-        let mut image = build_signed_image(TEST_SEED, b"payload");
-        image[OFF_SECURITY_COUNTER] ^= 0xFF;
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::BadSignature));
-    }
-
-    #[test]
-    fn image_version_tamper_is_bad_signature()
-    {
-        // Flipping a byte inside the signed image_version range must break the
-        // signature, proving the firmware version is bound by it.
-        let mut image = build_signed_image(TEST_SEED, b"payload");
-        image[OFF_VERSION_BUILD] ^= 0xFF;
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(verify_image(&image, &root), Err(VerifyError::BadSignature));
-    }
-
-    #[test]
-    fn nonzero_reserved_is_reserved_not_zero()
-    {
-        // Set a reserved byte BEFORE signing so the signature is genuinely
-        // valid. The rejection then proves the reserved check is structural,
-        // not a side effect of a broken signature.
-        let payload = b"payload";
-        let payload_len = payload.len() as u32;
-        let mut header = build_header(payload_len);
-        header[OFF_RESERVED] = 0x01;
-        let mut signed = Vec::new();
-        signed.extend_from_slice(&header);
-        signed.extend_from_slice(payload);
-        let sk = signing_key(TEST_SEED);
-        let sig = sk.sign(&signed);
-        let mut image = signed;
-        image.extend_from_slice(&sig.to_bytes());
-        let root = root_key_for(TEST_SEED);
-        assert_eq!(
-            verify_image(&image, &root),
-            Err(VerifyError::ReservedNotZero)
-        );
-    }
-
-    #[test]
-    fn from_bytes_rejects_non_canonical_key()
-    {
-        // The encoding y = 2 (little-endian [0x02, 0x00, ...]) is not a
-        // decompressible Edwards point: 1 - y^2 over 1 - d*y^2 is a non-square,
-        // so dalek's from_bytes rejects it at construction.
-        let mut bad = [0u8; 32];
-        bad[0] = 2;
-        match RootKey::from_bytes(bad)
-        {
-            Err(e) => assert_eq!(e, VerifyError::BadRootKey),
-            Ok(_) => panic!("a non-canonical key must be rejected"),
-        }
-    }
-
-    #[test]
-    fn from_bytes_accepts_valid_key()
-    {
-        let sk = signing_key(TEST_SEED);
-        let pk = sk.verifying_key().to_bytes();
-        assert!(RootKey::from_bytes(pk).is_ok());
-    }
-
-    // Pins that the fuzz seam's fixed root key is a key dalek actually accepts,
-    // so the fuzz target truly drives verify_image rather than silently skipping
-    // on a rejected key. The constant is the public key of the all-0x01 secret
-    // scalar.
-    #[test]
-    fn fuzz_root_key_is_accepted()
-    {
-        let sk = signing_key([0x01u8; 32]);
-        let expected = sk.verifying_key().to_bytes();
-        const FUZZ_ROOT_KEY: [u8; 32] = [
-            0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95,
-            0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba, 0x5d, 0x72,
-            0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b,
-            0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f, 0x6f, 0x5c,
-        ];
-        assert_eq!(FUZZ_ROOT_KEY, expected);
-        assert!(RootKey::from_bytes(FUZZ_ROOT_KEY).is_ok());
-    }
-}
+mod tests;

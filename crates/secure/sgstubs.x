@@ -10,7 +10,9 @@
  * .gnu.sgstubs output section. A competing section definition would leave lld's
  * synthesized veneers without an assigned address).
  *
- * Add one EXTERN line per NSC entry exported by csrc/secure_nsc.c.
+ * Add one EXTERN line per NSC entry exported by csrc/secure_nsc.c. build.rs
+ * appends the feature-gated EXTERNs, then the ASSERTs that bound .gnu.sgstubs to
+ * the NSC window (base, size, and the secure FLASH band's end).
  * Armv8-M secure gateway / .gnu.sgstubs convention. cortex-m-rt link.x.
  */
 EXTERN(patinakey_nsc_version);

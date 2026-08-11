@@ -65,6 +65,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-stage"
+version = "0.0.1"
+dependencies = [
+ "cortex-m-rt",
+ "fw-update",
+ "image-verify",
+ "mcu-arch",
+ "mcu-flash",
+ "p256",
+ "panic-halt",
+ "sha2",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,8 +378,8 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 name = "fw-update"
 version = "0.0.1"
 dependencies = [
- "ed25519-dalek",
  "image-verify",
+ "p256",
 ]
 
 [[package]]
@@ -412,7 +426,8 @@ dependencies = [
 name = "image-verify"
 version = "0.0.1"
 dependencies = [
- "ed25519-dalek",
+ "p256",
+ "sha2",
 ]
 
 [[package]]
@@ -438,10 +453,14 @@ version = "0.0.1"
 name = "mcu-flash"
 version = "0.0.1"
 dependencies = [
- "ed25519-dalek",
  "fw-update",
  "image-verify",
+ "p256",
 ]
+
+[[package]]
+name = "mcu-layout"
+version = "0.0.1"
 
 [[package]]
 name = "mcu-spi"
@@ -471,6 +490,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "p256"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primefield",
+ "primeorder",
+ "sha2",
 ]
 
 [[package]]
@@ -510,6 +542,9 @@ checksum = "a513e167849a384b7f9b746e517604398518590a9142f4846a32e3c2a4de7b11"
 [[package]]
 name = "platform"
 version = "0.0.1"
+dependencies = [
+ "mcu-layout",
+]
 
 [[package]]
 name = "polyval"
@@ -612,6 +647,7 @@ dependencies = [
  "cortex-m-rt",
  "ed25519-dalek",
  "mcu-arch",
+ "mcu-layout",
  "mcu-spi",
  "panic-halt",
  "platform",

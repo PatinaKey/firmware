@@ -4,7 +4,7 @@
 // controlled chunk offsets and lengths against the host mock seam. This covers
 // the ordering surface this crate adds: an attacker streams chunks, then drives
 // verify, commit, boot, and confirm. The contract under test: the machine must
-// NEVER panic, must reject any malformed or incomplete image, and must NEVER
+// never panic, must reject any malformed or incomplete image, and must never
 // reach the Committed state for an image the verifier did not accept. libFuzzer
 // feeds mutated byte slices. Any panic/abort is a finding.
 

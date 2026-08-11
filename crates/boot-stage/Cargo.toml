@@ -1,0 +1,50 @@
+[package]
+name = "boot-stage"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "STM32U545 immutable first-stage boot code: verifies the running bank, confirms or reverts a pending A/B swap, then hands off to the secure app."
+
+[dependencies]
+# The signed-image verifier. The boot stage verifies the RUNNING bank's four
+# image segments against the pinned product root key before it hands off.
+image-verify = { path = "../image-verify" }
+# The shared A/B vocabulary: BankId, PendingFlag, UpdateOutcome, FlashError. The
+# real flash driver (mcu-flash) speaks these, so the boot decision and the
+# updater agree on the persistent record encoding.
+fw-update = { path = "../fw-update" }
+
+[dev-dependencies]
+# encode_header mints signed test descriptors so the host tests never hardcode
+# the header layout. Feature unification: the product build (no dev-deps) keeps
+# image-verify without `encode`, the test build turns it on.
+image-verify = { path = "../image-verify", features = ["encode"] }
+# Mints signed fixtures: the tests sign a synthetic image with the known bring-up
+# scalar so the four-segment health check genuinely accepts it.
+p256 = { workspace = true }
+# Derives the bring-up test signing key (SHA-256 of the phrase) for the signed
+# health-check fixtures in mock.rs.
+sha2 = { workspace = true }
+
+# Embedded-only wiring. On the host the bin is an empty main, so these compile
+# only for the target. The real flash driver, the core barriers, the reset
+# vector, and the halting panic handler are all untestable silicon glue.
+[target.'cfg(target_os = "none")'.dependencies]
+mcu-flash = { path = "../mcu-flash" }
+mcu-arch = { path = "../mcu-arch" }
+cortex-m-rt = { workspace = true }
+panic-halt = { workspace = true }
+
+# Lint quarantine: the target glue holds the untestable MMIO wiring (VTOR write,
+# the MSP-load-and-branch hand-off, the real driver port). 
+# The pure boot logic has no unsafe.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

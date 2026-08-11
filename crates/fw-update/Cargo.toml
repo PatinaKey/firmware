@@ -23,10 +23,10 @@ _fuzz = []
 image-verify = { path = "../image-verify" }
 
 [dev-dependencies]
-# Host-only fixture minting: the tests sign a synthetic image with a known
-# secret scalar so verify_image accepts it. Verify-only on the device, the
-# signing path runs solely in tests.
-ed25519-dalek = { workspace = true }
+# Host-only fixture minting: the tests sign a synthetic image with a known ECDSA
+# P-256 scalar so verify_image accepts it. Verify-only on the device, the signing
+# path runs solely in tests.
+p256 = { workspace = true }
 
 [lints]
 workspace = true

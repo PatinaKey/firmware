@@ -110,6 +110,16 @@ coverage_stage()
     if [ -n "${LIBTROPIC:-}" ] && [ -x "${LIBTROPIC}/scripts/tropic01_model/.venv/bin/model_server" ]
     then
         local model="${LIBTROPIC}/scripts/tropic01_model"
+        local installer="crates/tropic01-driver/scripts/install-model.sh"
+        local want have
+        want="$(sed -n 's/^TVL_VERSION="\(.*\)"$/\1/p' "$installer")"
+        have="$("$model/.venv/bin/python" -c 'import importlib.metadata as m; print(m.version("tvl"))')"
+        if [ "$want" != "$have" ]
+        then
+            echo "ERROR: model venv has ts-tvl $have, this repository pins $want" >&2
+            echo "Run $installer to update it." >&2
+            return 1
+        fi
         "$model/.venv/bin/model_server" tcp -c "$model/model_cfg.yml" \
             -o /tmp/ci-local-model-save.yml \
             > /tmp/ci-local-model.log 2>&1 &
@@ -172,7 +182,7 @@ embedded_stage()
     # stays UNSET here so the target link-args from .cargo/config.toml (-Tlink.x)
     # survive: the warning gate rides on clippy (a check pass, no link) instead.
     local c
-    for c in platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
+    for c in mcu-layout platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
     do
         cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings || return 1
     done

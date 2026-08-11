@@ -17,9 +17,10 @@ fw-update = { path = "../fw-update" }
 [dev-dependencies]
 # Host-only integration fixture: the A/B machine re-cabled onto the real driver
 # over the FLASH-controller model is driven through the public Updater API, and
-# minting a valid signed image needs the verifier crate plus a signing key.
+# minting a valid signed image needs the verifier crate plus an ECDSA P-256
+# signing key.
 image-verify = { path = "../image-verify", features = ["encode"] }
-ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
 
 # This crate owns the volatile FLASH MMIO
 # (word reads / writes of the controller registers and the memory-mapped banks),

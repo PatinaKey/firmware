@@ -7,15 +7,15 @@
 //! readback is a load). This mirrors the `mcu-spi` `SpiBusAccess` pattern.
 //!
 //! Two implementations exist:
-//!   - [`MmioFlash`]: the real one (volatile word MMIO). This is the ONLY
-//!     `unsafe` surface of the crate, each block carrying a `// SAFETY:` note.
-//!     It is gated to the embedded target so the host build never references a
-//!     fixed MMIO address and never compiles a real flash access.
-//!   - the host FLASH-controller model (test-only, in `model`): it models the
-//!     real controller state (the BSY / WDW handshake, the rc_w1 error flags,
-//!     program-clears-bits, the staged SWAP_BANK applied only at a modelled
-//!     reset), so the driver's sequencing and fail-closed paths are host-tested
-//!     against faithful silicon behaviour, not a per-address value queue.
+//!   - [`MmioFlash`]: the real one (volatile word MMIO). This is the crate's sole
+//!     `unsafe` surface, each block carrying a `// SAFETY:` note. It is gated to the
+//!     embedded target so the host build never references a fixed MMIO address and
+//!     never compiles a real flash access.
+//!   - the host FLASH-controller model (test-only, in `model`): it models the real
+//!     controller state (the BSY / WDW handshake, the rc_w1 error flags,
+//!     program-clears-bits, the staged SWAP_BANK applied only at a modelled reset),
+//!     so the driver's sequencing and fail-closed paths are host-tested against
+//!     faithful silicon behaviour, not a per-address value queue.
 
 /// A 32-bit register-access port for the FLASH driver.
 ///
@@ -32,10 +32,10 @@ pub trait FlashAccess
 
     /// Read-modify-writes `addr`: clears the bits in `clear`, then sets `set`.
     ///
-    /// Applied as `(old & !clear) | set`. The default impl composes `read32`
-    /// and `write32`. It is for CONTROL registers only, where a read returns
-    /// the live control value. It must never target a STATUS register whose
-    /// flags change on their own.
+    /// Applied as `(old & !clear) | set`. The default impl composes `read32` and
+    /// `write32`. It is for control registers only, where a read returns the live
+    /// control value. It must never target a status register whose flags change on
+    /// their own.
     fn modify32(&mut self, addr: u32, clear: u32, set: u32)
     {
         let old = self.read32(addr);
@@ -52,21 +52,21 @@ pub trait FlashAccess
 
     /// Borrows `len` bytes of memory-mapped flash at `base` as a slice.
     ///
-    /// On real silicon the inactive bank is memory-mapped, so this is a borrow
-    /// of the mapped region with no copy. The host model returns a borrow of its
-    /// backing bytes. The seam uses this so verify reads the EXACT bytes commit
-    /// boots, the verified image and the committed image being the same bytes by
-    /// construction. The [`fw_update::FlashSeam`] trait this driver implements
-    /// exposes the same borrow as `inactive_bank`.
+    /// On real silicon the inactive bank is memory-mapped, so this is a borrow of the
+    /// mapped region with no copy. The host model returns a borrow of its backing
+    /// bytes. The seam uses this so verify reads the exact bytes commit boots, the
+    /// verified image and the committed image being the same bytes by construction.
+    /// The [`fw_update::FlashSeam`] trait this driver implements exposes these borrows
+    /// as `inactive_descriptor`, `inactive_secure_band`, and `inactive_ns_band`.
     fn bank_view(&self, base: u32, len: usize) -> &[u8];
 }
 
 /// The real memory-mapped-I/O port for the FLASH controller (hardware only).
 ///
 /// Volatile 32-bit accesses to the FLASH registers and the memory-mapped bank.
-/// It is gated to `target_os = "none"` so the host (test) build never compiles 
-/// a fixed-address dereference. 
-/// Host code drives the driver through the FLASH-controller model instead.
+/// Gated to `target_os = "none"` so the host (test) build never compiles a
+/// fixed-address dereference. Host code drives the driver through the
+/// FLASH-controller model instead.
 #[cfg(target_os = "none")]
 pub struct MmioFlash;
 

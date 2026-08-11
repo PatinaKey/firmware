@@ -59,15 +59,6 @@ mod firmware
         fn patinakey_nsc_se_session_ping() -> u32;
     }
 
-    // The crypto + attestation veneer rides the SAME se-session feature: it is
-    // only emitted secure-side under that feature.
-    #[cfg(feature = "se-session")]
-    #[allow(unsafe_code)]
-    unsafe extern "C"
-    {
-        fn patinakey_nsc_se_crypto() -> u32;
-    }
-
     // The persistent-but-reversible state veneer rides the SAME se-session
     // feature: it is only emitted secure-side under that feature.
     #[cfg(feature = "se-session")]
@@ -159,46 +150,6 @@ mod firmware
             2 => "open-session",
             3 => "ping",
             4 => "session-abort",
-            _ => "unknown",
-        }
-    }
-
-    // CROSS-CRATE COUPLING: the crypto status-word bit layout below MUST match
-    // the encoding produced on the secure side (crates/secure/src/se_crypto.rs).
-    // The two crates do not share a type, so it is duplicated by hand and the two
-    // copies must stay in sync.
-
-    /// Crypto word bit set when the secure side reports the bring-up failed. Bits
-    /// 15..8 then carry the step, bits 7..0 the error code. RESERVED non-SeError
-    /// low-byte codes: 0xF1 EdDSA verify reject, 0xF2 random sanity, 0xF3 ECDSA
-    /// shape, 0xF4 pubkey length.
-    #[cfg(feature = "se-session")]
-    const SCR_ERR: u32 = 1 << 31;
-    /// Crypto word bit set when the bring-up succeeded. The low byte carries the
-    /// OK marker.
-    #[cfg(feature = "se-session")]
-    const SCR_OK: u32 = 1 << 8;
-
-    /// Decodes a crypto failing-step code into a static label. Steps mirror
-    /// se_crypto.rs: 1 attestation, 2 open-session, 3 random, 4 pre-clean, 5
-    /// ed25519-generate, 6 ed25519-pubkey, 7 eddsa-sign, 8 eddsa-verify, 9
-    /// ed25519-erase, 10 ecdsa-p256, 11 session-abort.
-    #[cfg(feature = "se-session")]
-    fn crypto_step(step: u32) -> &'static str
-    {
-        match step
-        {
-            1 => "attestation",
-            2 => "open-session",
-            3 => "random",
-            4 => "pre-clean",
-            5 => "ed25519-generate",
-            6 => "ed25519-pubkey",
-            7 => "eddsa-sign",
-            8 => "eddsa-verify",
-            9 => "ed25519-erase",
-            10 => "ecdsa-p256",
-            11 => "session-abort",
             _ => "unknown",
         }
     }
@@ -430,32 +381,6 @@ mod firmware
         }
     }
 
-    /// Logs the decoded crypto + attestation outcome over RTT.
-    #[cfg(feature = "se-session")]
-    fn report_crypto(scr: u32)
-    {
-        if scr & SCR_ERR != 0
-        {
-            // The low byte is the SeError code, or a RESERVED code: 0xF1
-            // EdDSA verify reject, 0xF2 random sanity, 0xF3 ECDSA shape, 0xF4
-            // pubkey length.
-            defmt::error!
-            (
-                "SE crypto FAILED at step {=str}, error code {=u8:#04x}",
-                crypto_step((scr >> 8) & 0xFF),
-                scr as u8
-            );
-        }
-        else if scr & SCR_OK != 0
-        {
-            defmt::info!("SE crypto + attestation OK, marker {=u8:#04x}", scr as u8);
-        }
-        else
-        {
-            defmt::warn!("SE crypto word unrecognized {=u32:#010x}", scr);
-        }
-    }
-
     /// Logs the decoded persistent-state outcome over RTT.
     #[cfg(feature = "se-session")]
     fn report_persist(spr: u32)
@@ -593,20 +518,8 @@ mod firmware
 
             report_session(ses);
 
-            // Crypto + attestation bring-up, run AFTER the session ping. It
-            // verifies the chain to the pinned root, opens a session on the
-            // verified STPUB, and runs the TRNG / Ed25519 / P-256 sequence.
-            //
-            // SAFETY: the crypto veneer is a CMSE secure-gateway entry taking no
-            // argument and returning a scalar. Calling it crosses into the secure
-            // world through the SG veneer. No pointer or caller memory is shared,
-            // so there is nothing to validate on either side.
-            let scr = unsafe { patinakey_nsc_se_crypto() };
-
-            report_crypto(scr);
-
-            // Persistent-but-reversible state bring-up, run after the crypto
-            // veneer. It opens a session and exercises the monotonic counters,
+            // Persistent-but-reversible state bring-up, run after the session
+            // ping. It opens a session and exercises the monotonic counters,
             // MAC-and-Destroy, and ECC_Key_Store, all reversible (no OTP, config,
             // or pairing write).
             //

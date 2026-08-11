@@ -11,37 +11,36 @@
 //!
 //! # The physical-bank-versus-mapped-address contract (RM0456 sec 7.5.8)
 //!
-//! SWAP_BANK remaps the ADDRESS of each bank, but the BKER erase selector and
-//! the SECWM / WRP protections follow the PHYSICAL bank (RM0456 sec 7.5.8 Fig
-//! 23/24). So erase (BKER) and program / read (address) must be derived from the
-//! SAME physical bank or they diverge under SWAP_BANK=1. This driver names a
-//! physical bank with [`regs::PhysBank`] and asks it for both the BKER bit and
-//! the mapped base, reading `OPTR.SWAP_BANK` (RM0456 sec 7.9.13) at runtime on
-//! every address computation. The inactive-bank erase, program, and read all go
-//! through the same physical bank, and the fixed-Bank-1 metadata band re-derives
-//! its mapped address from SWAP_BANK on every access, so the NVCNT, the pending
-//! record, the boot-count, and the update-outcome record survive a swap.
+//! SWAP_BANK remaps the address of each bank, but the BKER erase selector and the
+//! SECWM / WRP protections follow the physical bank (RM0456 sec 7.5.8 Fig 23/24). So
+//! erase (BKER) and program / read (address) must be derived from the same physical
+//! bank or they diverge under SWAP_BANK=1. This driver names a physical bank with
+//! [`regs::PhysBank`] and asks it for both the BKER bit and the mapped base, reading
+//! `OPTR.SWAP_BANK` (RM0456 sec 7.9.13) at runtime on every address computation. The
+//! inactive-bank erase, program, and read all go through the same physical bank, and
+//! the fixed-Bank-1 metadata band re-derives its mapped address from SWAP_BANK on
+//! every access, so the NVCNT, the pending record, the boot-count, and the
+//! update-outcome record survive a swap.
 //!
 //! # Posture assertion before any destructive op
 //!
-//! Erase, program, and the swap arm all assert `OPTR.DUALBANK` and `OPTR.TZEN`
-//! first (RM0456 sec 7.9.13). A mis-provisioned part (single-bank or TZEN clear)
-//! means the geometry the constants pin does not hold, so the driver fails closed
-//! with [`FlashError::Hardware`] rather than erasing or programming blind.
+//! Erase, program, and the swap arm all assert `OPTR.DUALBANK` and `OPTR.TZEN` first
+//! (RM0456 sec 7.9.13). A mis-provisioned part (single-bank or TZEN clear) means the
+//! geometry the constants pin does not hold, so the driver fails closed with
+//! [`FlashError::Hardware`] rather than erasing or programming blind.
 //!
 //! # Brick-safety: the option-byte / SWAP_BANK path is present but inert
 //!
 //! The [`Stm32FlashSeam`] [`commit_swap`](fw_update::FlashSeam::commit_swap) and
-//! [`revert_swap`](fw_update::FlashSeam::revert_swap) impls carry the
-//! FULL real register sequence (OPTR SWAP_BANK plus OPTSTRT plus OBL_LAUNCH,
-//! RM0456 sec 7.4.2). OBL_LAUNCH triggers the reset that applies the option load
-//! on real silicon, so it is the IRREVERSIBLE, brick-class step. The whole real
-//! register surface is the [`FlashAccess`] MMIO port, which is gated to
-//! `target_os = "none"` and does not compile on the host. NO host build and NO
-//! test ever drives a real option-byte write: the tests run a state model that
-//! stages the swap and applies it only at a modelled reset, never a real
-//! OBL_LAUNCH. The capability is complete but inert. Its on-silicon invocation
-//! stays gated on a deliberate operator action.
+//! [`revert_swap`](fw_update::FlashSeam::revert_swap) impls carry the full real
+//! register sequence (OPTR SWAP_BANK plus OPTSTRT plus OBL_LAUNCH, RM0456 sec 7.4.2).
+//! OBL_LAUNCH triggers the reset that applies the option load on real silicon, the
+//! irreversible brick-class step. The whole real register surface is the
+//! [`FlashAccess`] MMIO port, which is gated to `target_os = "none"` and does not
+//! compile on the host. No host build and no test ever drives a real option-byte
+//! write: the tests run a state model that stages the swap and applies it only at a
+//! modelled reset, never a real OBL_LAUNCH. The capability is complete but inert. Its
+//! on-silicon invocation stays gated on a deliberate operator action.
 
 use fw_update::BankId;
 use fw_update::FlashError;
@@ -111,9 +110,9 @@ where
 
     /// The mapped secure-alias base of a physical bank for the live SWAP_BANK.
     ///
-    /// This is the ONE helper the B1 resolution turns on: it pairs the physical
-    /// bank with the current SWAP_BANK state to yield the address erase and
-    /// program must both use (RM0456 sec 7.5.8).
+    /// This is the one helper the B1 resolution turns on: it pairs the physical bank
+    /// with the current SWAP_BANK state to yield the address erase and program must
+    /// both use (RM0456 sec 7.5.8).
     fn phys_base(&mut self, bank: PhysBank) -> u32
     {
         bank.mapped_base(self.swap_bank())
@@ -128,19 +127,20 @@ where
         regs::inactive_phys_bank(self.swap_bank())
     }
 
-    /// Polls `SECSR.BSY` and `SECSR.WDW` down to clear, bounded.
+    /// Polls `BSY` and `WDW` in the given status register down to clear, bounded.
     ///
     /// RM0456 sec 7.3.7 / 7.3.6: a program or erase must wait for BSY to clear,
-    /// and a program must also see WDW clear before the next data write. A
-    /// bounded spin fails closed with [`FlashError::Hardware`] rather than
-    /// hanging.
-    fn wait_ready(&mut self) -> Result<(), FlashError>
+    /// and a program must also see WDW clear before the next data write. `sr` is
+    /// SECSR for the secure controller or NSSR for the non-secure controller
+    /// (the BSY / WDW positions match, RM0456 sec 7.9.7 / 7.9.8). A bounded spin
+    /// fails closed with [`FlashError::Hardware`] rather than hanging.
+    fn wait_ready_on(&mut self, sr: u32) -> Result<(), FlashError>
     {
         let mut spins = 0u32;
         loop
         {
-            let sr = self.access.read32(regs::FLASH_SECSR);
-            if sr & (regs::SR_BSY | regs::SR_WDW) == 0
+            let status = self.access.read32(sr);
+            if status & (regs::SR_BSY | regs::SR_WDW) == 0
             {
                 return Ok(());
             }
@@ -154,65 +154,69 @@ where
         }
     }
 
-    /// Clears every program / erase error flag (rc_w1) in `SECSR`.
+    /// Clears every program / erase error flag (rc_w1) in the given status reg.
     ///
-    /// RM0456 sec 7.9.8: each error flag is rc_w1, write 1 to clear. Clearing
-    /// from a known state before every op is part of failing closed.
-    fn clear_errors(&mut self)
+    /// RM0456 sec 7.9.7 / 7.9.8: each error flag is rc_w1, write 1 to clear.
+    /// Clearing from a known state before every op is part of failing closed.
+    fn clear_errors_on(&mut self, sr: u32)
     {
-        self.access.write32(regs::FLASH_SECSR, regs::SR_ALL_ERRORS);
+        self.access.write32(sr, regs::SR_ALL_ERRORS);
     }
 
-    /// Reads `SECSR` and maps any error flag to a typed [`FlashError`].
+    /// Reads the given status register and maps any error flag to an error.
     ///
-    /// RM0456 sec 7.9.8: PROGERR, WRPERR, PGAERR, SIZERR, PGSERR, OPERR. Any set
-    /// flag means the op did not take effect, so it fails closed.
-    fn check_errors(&mut self) -> Result<(), FlashError>
+    /// RM0456 sec 7.9.7 / 7.9.8: PROGERR, WRPERR, PGAERR, SIZERR, PGSERR, OPERR.
+    /// Any set flag means the op did not take effect, so it fails closed. A
+    /// secure access to a non-secure page raises WRPERR here (Write-Ignored,
+    /// RM0456 Table 68).
+    fn check_errors_on(&mut self, sr: u32) -> Result<(), FlashError>
     {
-        let sr = self.access.read32(regs::FLASH_SECSR);
-        if sr & regs::SR_ALL_ERRORS != 0
+        let status = self.access.read32(sr);
+        if status & regs::SR_ALL_ERRORS != 0
         {
             return Err(FlashError::WriteFailed);
         }
         Ok(())
     }
 
-    /// Unlocks the secure control register with the KEY1 / KEY2 sequence.
+    /// Unlocks the given control register with the KEY1 / KEY2 sequence.
     ///
-    /// RM0456 sec 7.3.5: write KEY1 then KEY2 to SECKEYR. A wrong value or order
-    /// locks the CR until reset, so the driver only writes the canonical pair.
-    /// A no-op if the CR is already unlocked.
-    fn unlock_cr(&mut self)
+    /// RM0456 sec 7.3.5: write KEY1 then KEY2 to the CR's key register. A wrong
+    /// value or order locks the CR until reset, so the driver only writes the
+    /// canonical pair. `cr` is SECCR or NSCR, `keyr` its matching key register.
+    /// The LOCK bit is bit 31 in both CRs. A no-op if already unlocked.
+    fn unlock_cr_on(&mut self, cr: u32, keyr: u32)
     {
-        let cr = self.access.read32(regs::FLASH_SECCR);
-        if cr & regs::SECCR_LOCK == 0
+        if self.access.read32(cr) & regs::SECCR_LOCK == 0
         {
             return;
         }
-        self.access.write32(regs::FLASH_SECKEYR, regs::FLASH_KEY1);
-        self.access.write32(regs::FLASH_SECKEYR, regs::FLASH_KEY2);
+        self.access.write32(keyr, regs::FLASH_KEY1);
+        self.access.write32(keyr, regs::FLASH_KEY2);
     }
 
-    /// Re-locks the secure control register, returning to a known idle state.
+    /// Re-locks the given control register, returning to a known idle state.
     ///
-    /// RM0456 sec 7.9.10: setting `SECCR.LOCK` re-locks the CR. The driver locks
-    /// after every op so a later op must unlock deliberately.
-    fn lock_cr(&mut self)
+    /// RM0456 sec 7.9.9 / 7.9.10: setting the CR LOCK bit re-locks it. The driver
+    /// locks after every op so a later op must unlock deliberately.
+    fn lock_cr_on(&mut self, cr: u32)
     {
-        self.access
-            .modify32(regs::FLASH_SECCR, 0, regs::SECCR_LOCK);
+        self.access.modify32(cr, 0, regs::SECCR_LOCK);
     }
 
-    /// Programs one 16-byte quad-word at `addr` from up to 16 bytes of `data`.
+    /// Programs one 16-byte quad-word at `addr` on the given band's controller.
     ///
     /// RM0456 sec 7.3.7: poll ready, clear errors, set PG, write 4 consecutive
     /// 32-bit words to a quad-word-aligned address, poll BSY, check EOP, clear
     /// PG. A short tail pads with the erased value so a sub-quad-word write never
-    /// raises SIZERR. `addr` MUST be quad-word aligned. The caller has already
-    /// unlocked the CR.
+    /// raises SIZERR. `addr` MUST be quad-word aligned and reachable through the
+    /// band's alias. `band` selects the controller (SEC* or NS*), matching the
+    /// page's SECWM label (RM0456 Table 68). The caller has already unlocked the
+    /// matching CR.
     fn program_quad_word
     (
         &mut self,
+        band: regs::PageBand,
         addr: u32,
         data: &[u8],
     )
@@ -222,14 +226,15 @@ where
         {
             return Err(FlashError::OutOfRange);
         }
-        self.wait_ready()?;
-        self.clear_errors();
+        let sr = band.sr();
+        let cr = band.cr();
+        self.wait_ready_on(sr)?;
+        self.clear_errors_on(sr);
 
         // Set PG, then write the four words. A read of a fully-erased quad-word
         // is all-ones, so padding a short tail with the erased word leaves those
         // bytes untouched (program clears bits only, RM0456 sec 7.3.1).
-        self.access
-            .modify32(regs::FLASH_SECCR, 0, regs::SECCR_PG);
+        self.access.modify32(cr, 0, regs::SECCR_PG);
 
         let mut buf = [regs::ERASED_BYTE; regs::QUAD_WORD_LEN as usize];
         let slot = buf
@@ -253,11 +258,10 @@ where
             self.access.write32(word_addr, word);
         }
 
-        self.wait_ready()?;
-        let result = self.check_eop_then_clear_errors();
+        self.wait_ready_on(sr)?;
+        let result = self.check_eop_then_clear_errors_on(sr);
         // Clear PG whatever happened, so the controller returns to idle.
-        self.access
-            .modify32(regs::FLASH_SECCR, regs::SECCR_PG, 0);
+        self.access.modify32(cr, regs::SECCR_PG, 0);
         result
     }
 
@@ -265,25 +269,29 @@ where
     ///
     /// RM0456 sec 7.3.7 / 7.3.6: a successful op sets EOP. The driver treats a
     /// set error flag as the authority (fail closed) and clears EOP and the
-    /// error flags so the next op starts from a known SR.
-    fn check_eop_then_clear_errors(&mut self) -> Result<(), FlashError>
+    /// error flags so the next op starts from a known SR. `sr` is the band's
+    /// status register.
+    fn check_eop_then_clear_errors_on(&mut self, sr: u32) -> Result<(), FlashError>
     {
-        let errors = self.check_errors();
+        let errors = self.check_errors_on(sr);
         // Clear EOP (rc_w1) regardless, so it does not leak into the next op.
-        self.access.write32(regs::FLASH_SECSR, regs::SR_EOP);
+        self.access.write32(sr, regs::SR_EOP);
         errors
     }
 
-    /// Erases one 8 KB page of the given physical bank.
+    /// Erases one 8 KB page of the given physical bank on the band's controller.
     ///
     /// RM0456 sec 7.3.6: poll ready, clear errors, write PER plus BKER plus PNB,
-    /// set STRT, poll BSY, check EOP, clear PER. The caller has unlocked the CR.
-    /// `page` is bank-relative (0..[`regs::PAGES_PER_BANK`]). BKER comes from the
-    /// physical bank (SWAP_BANK-independent, RM0456 sec 7.5.8).
+    /// set STRT, poll BSY, check EOP, clear PER. The caller has unlocked the
+    /// band's CR. `page` is bank-relative (0..[`regs::PAGES_PER_BANK`]). BKER
+    /// comes from the physical bank (SWAP_BANK-independent, RM0456 sec 7.5.8).
+    /// `band` selects the controller matching the page's SECWM label: a secure
+    /// controller erasing a non-secure page raises WRPERR (RM0456 Table 68).
     fn erase_page
     (
         &mut self,
         bank: PhysBank,
+        band: regs::PageBand,
         page: u32,
     )
         -> Result<(), FlashError>
@@ -292,17 +300,19 @@ where
         {
             return Err(FlashError::OutOfRange);
         }
-        self.wait_ready()?;
-        self.clear_errors();
+        let sr = band.sr();
+        let cr = band.cr();
+        self.wait_ready_on(sr)?;
+        self.clear_errors_on(sr);
 
         let bker = bank.bker();
         let pnb = (page << regs::SECCR_PNB_SHIFT) & regs::SECCR_PNB_MASK;
         // Write PER plus BKER plus PNB in one word, first clearing every stale
         // operation-select bit so no mass-erase, burst-write, or interrupt
-        // request rides along (RM0456 sec 7.9.10), then set STRT in a second
-        // write (RM0456 sec 7.3.6).
+        // request rides along (RM0456 sec 7.9.9 / 7.9.10), then set STRT in a
+        // second write (RM0456 sec 7.3.6).
         self.access.modify32(
-            regs::FLASH_SECCR,
+            cr,
             regs::SECCR_PER
                 | regs::SECCR_PG
                 | regs::SECCR_PNB_MASK
@@ -315,54 +325,122 @@ where
                 | regs::SECCR_STRT,
             regs::SECCR_PER | bker | pnb,
         );
-        self.access
-            .modify32(regs::FLASH_SECCR, 0, regs::SECCR_STRT);
+        self.access.modify32(cr, 0, regs::SECCR_STRT);
 
-        self.wait_ready()?;
-        let result = self.check_eop_then_clear_errors();
-        self.access
-            .modify32(regs::FLASH_SECCR, regs::SECCR_PER, 0);
+        self.wait_ready_on(sr)?;
+        let result = self.check_eop_then_clear_errors_on(sr);
+        self.access.modify32(cr, regs::SECCR_PER, 0);
         result
     }
 
-    /// Maps a logical page index to its absolute address in the inactive bank.
+    /// Erases the bank-relative page range `[first, last)` on one band.
     ///
-    /// The machine writes `fw_update::PAGE_LEN`-byte logical pages. The address
-    /// is the inactive bank's mapped image-band base plus `page * PAGE_LEN`,
-    /// bounds-checked to stay inside the image band. Overflow-safe. The base is
-    /// the SAME physical bank the erase loop targets, so erase and program agree.
+    /// Unlocks the band's control register once, erases each page in the range
+    /// through the band's controller, then re-locks. RM0456 Table 68 rejects a
+    /// secure erase of a non-secure page (WRPERR), so the whole range MUST share
+    /// the `band`'s SECWM label. The image band is split at the SECWM boundary by
+    /// the two callers (secure pages 9-19, non-secure pages 20-31), so each call
+    /// is homogeneous. Fail-closed: a page-erase fault stops the loop, re-locks,
+    /// and returns the typed error, leaving the already-erased pages erased.
+    fn erase_band
+    (
+        &mut self,
+        bank: PhysBank,
+        band: regs::PageBand,
+        first: u32,
+        last: u32,
+    )
+        -> Result<(), FlashError>
+    {
+        self.unlock_cr_on(band.cr(), band.keyr());
+        let mut result = Ok(());
+        let mut page = first;
+        while page < last
+        {
+            if let Err(error) = self.erase_page(bank, band, page)
+            {
+                result = Err(error);
+                break;
+            }
+            page = match page.checked_add(1)
+            {
+                Some(next) => next,
+                None =>
+                {
+                    result = Err(FlashError::OutOfRange);
+                    break;
+                }
+            };
+        }
+        self.lock_cr_on(band.cr());
+        result
+    }
+
+    /// Maps a logical PAYLOAD page index to its band and absolute address in the
+    /// inactive bank.
+    ///
+    /// The machine writes `fw_update::PAGE_LEN`-byte payload pages across the
+    /// payload band (pages 10-31), page-aligned at the secure app link origin.
+    /// Page index 0 maps to physical page 10 (0x0C014000). The byte offset from
+    /// the payload base decides the page's [`regs::PageBand`]: an offset below the
+    /// secure payload size is a secure page (0x0C.. alias, SEC* controller), the
+    /// rest is a non-secure page (0x08.. alias, NS* controller). RM0456 Table 68
+    /// forbids the secure controller from writing a non-secure page, so the band
+    /// routing is load-bearing. The descriptor page (page 9) is programmed separately
+    /// through [`Self::write_descriptor`].
+    ///
+    /// A [`fw_update::PAGE_LEN`]-byte page never straddles the SECWM boundary: the
+    /// boundary is at payload offset [`regs::IMAGE_PAYLOAD_SECURE_SIZE`] (0x14000),
+    /// a multiple of `PAGE_LEN`, so each page lies wholly in one band. The alias
+    /// base is the same physical bank the erase loop targets, so erase and program
+    /// agree. Overflow-safe, bounds-checked to the payload band.
     fn logical_page_addr
     (
         &mut self,
         page: PageIndex,
     )
-        -> Result<u32, FlashError>
+        -> Result<(regs::PageBand, u32), FlashError>
     {
-        let bank = self.inactive_phys();
-        let base = self.phys_base(bank);
-        let image_base = base
-            .checked_add(regs::IMAGE_REGION_OFFSET)
-            .ok_or(FlashError::OutOfRange)?;
         let offset = (page as u32)
             .checked_mul(fw_update::PAGE_LEN as u32)
             .ok_or(FlashError::OutOfRange)?;
         let end = offset
             .checked_add(fw_update::PAGE_LEN as u32)
             .ok_or(FlashError::OutOfRange)?;
-        if end > regs::IMAGE_REGION_SIZE
+        if end > regs::IMAGE_PAYLOAD_SIZE
         {
             return Err(FlashError::OutOfRange);
         }
-        image_base.checked_add(offset).ok_or(FlashError::OutOfRange)
+        // Byte offset from the payload base. Below the secure payload size it is a
+        // secure page, at or above it a non-secure page. `end <= size` and the
+        // boundary is page-aligned, so the whole page shares one band.
+        let band = if offset < regs::IMAGE_PAYLOAD_SECURE_SIZE
+        {
+            regs::PageBand::Secure
+        }
+        else
+        {
+            regs::PageBand::NonSecure
+        };
+        let bank = self.inactive_phys();
+        let secure_base = self.phys_base(bank);
+        let alias_base = band.alias_base(secure_base);
+        let payload_base = alias_base
+            .checked_add(regs::IMAGE_PAYLOAD_OFFSET)
+            .ok_or(FlashError::OutOfRange)?;
+        let addr = payload_base
+            .checked_add(offset)
+            .ok_or(FlashError::OutOfRange)?;
+        Ok((band, addr))
     }
 
     // Metadata helpers, pinned to PHYSICAL Bank 1, swap-aware.
     //
     // The NVCNT, boot-count, pending, and update-outcome records all live in
-    // physical Bank 1 (pages 0-1). The driver re-derives Bank 1's MAPPED base
-    // from the live SWAP_BANK on EVERY access, so the records survive a swap
-    // (RM0456 sec 7.5.8: data lives at a physical location mapped to different
-    // virtual addresses by SWAP_BANK). This is the B1 fix applied to metadata.
+    // physical Bank 1 (pages 0-1). The driver re-derives Bank 1's mapped base from the
+    // live SWAP_BANK on every access, so the records survive a swap (RM0456 sec 7.5.8:
+    // data lives at a physical location mapped to different virtual addresses by
+    // SWAP_BANK). This is the B1 fix applied to metadata.
 
     /// The live mapped base of a metadata record in physical Bank 1.
     fn meta_addr(&mut self, offset: u32) -> Result<u32, FlashError>
@@ -435,8 +513,10 @@ where
 
     /// Programs a single u32 record at `addr` (padded to a quad-word).
     ///
-    /// Unlocks the CR, programs the quad-word, then re-locks. Fail-closed: a
-    /// program fault re-locks and returns the typed error.
+    /// The metadata band is physical Bank 1 pages 0-1, always SECURE, so the
+    /// record is programmed on the secure controller through the secure alias.
+    /// Unlocks the secure CR, programs the quad-word, then re-locks. Fail-closed:
+    /// a program fault re-locks and returns the typed error.
     fn program_record
     (
         &mut self,
@@ -445,9 +525,13 @@ where
     )
         -> Result<(), FlashError>
     {
-        self.unlock_cr();
-        let result = self.program_quad_word(addr, &value.to_le_bytes());
-        self.lock_cr();
+        self.unlock_cr_on(regs::FLASH_SECCR, regs::FLASH_SECKEYR);
+        let result = self.program_quad_word(
+            regs::PageBand::Secure,
+            addr,
+            &value.to_le_bytes(),
+        );
+        self.lock_cr_on(regs::FLASH_SECCR);
         result
     }
 
@@ -458,14 +542,14 @@ where
         Ok(self.access.read32(addr))
     }
 
-    /// Rewrites BOTH page-1 mutable records (pending and outcome) at once.
+    /// Rewrites both page-1 mutable records (pending and outcome) at once.
     ///
     /// The pending and update-outcome records share page 1 of physical Bank 1, so
     /// a rewrite of either erases the one page and reprograms both (RM0456 sec
     /// 7.3.6: erase is per 8 KB page). The caller supplies the desired post-write
     /// value of each record. An erased value programs nothing (an erased page
     /// already reads erased). Fail-closed: an erase or program fault re-locks and
-    /// returns the typed error, leaving the OLD records readable as best effort.
+    /// returns the typed error, leaving the old records readable as best effort.
     fn rewrite_mutable_records
     (
         &mut self,
@@ -475,9 +559,15 @@ where
         -> Result<(), FlashError>
     {
         self.require_dualbank_secure()?;
-        self.unlock_cr();
-        let erased = self.erase_page(PhysBank::One, regs::META_MUTABLE_PAGE);
-        self.lock_cr();
+        // Page 1 of physical Bank 1 is a SECURE metadata page, so the erase runs
+        // on the secure controller through the secure alias.
+        self.unlock_cr_on(regs::FLASH_SECCR, regs::FLASH_SECKEYR);
+        let erased = self.erase_page(
+            PhysBank::One,
+            regs::PageBand::Secure,
+            regs::META_MUTABLE_PAGE,
+        );
+        self.lock_cr_on(regs::FLASH_SECCR);
         erased?;
         if pending_value != regs::PENDING_NONE
         {
@@ -493,48 +583,171 @@ where
     }
 }
 
+/// The running-bank read surface and the SECWM readback the boot stage consumes.
+///
+/// The `fw_update::FlashSeam` impl below reads the inactive bank (the updater's
+/// staging view, through the high alias). The boot stage instead verifies the bank
+/// it is about to boot, so these accessors mirror the inactive-bank banded read but
+/// resolve the running physical bank, which sits at the low alias. Each sub-band is
+/// still read through the alias matching its SECWM label (RM0456 Table 68), so the
+/// same-store property holds: the bytes verified are the bytes the hand-off boots.
+impl<A> Stm32FlashSeam<A>
+where
+    A: FlashAccess,
+{
+    /// Asserts the dual-bank secure posture (DUALBANK and TZEN set).
+    ///
+    /// # Errors
+    ///
+    /// [`FlashError::Hardware`] if the part is not dual-bank secure.
+    pub fn require_partition(&mut self) -> Result<(), FlashError>
+    {
+        self.require_dualbank_secure()
+    }
+
+    /// Reads the two secure-watermark registers back (`FLASH_SECWM1R1` /
+    /// `FLASH_SECWM2R1`).
+    ///
+    /// Returns the raw register words for the caller to decode. Secure-read-only:
+    /// on a TZEN=0 part a non-secure read is RAZ, which the caller treats as a
+    /// mismatch. RM0456 sec 7.9.17 / 7.9.21.
+    ///
+    /// # Errors
+    ///
+    /// This read cannot fail on the real port, but the signature stays fallible so
+    /// a future access seam may report a fault.
+    pub fn read_secwm_raw(&mut self) -> Result<(u32, u32), FlashError>
+    {
+        let bank1 = self.access.read32(regs::FLASH_SECWM1R1);
+        let bank2 = self.access.read32(regs::FLASH_SECWM2R1);
+        Ok((bank1, bank2))
+    }
+
+    /// Borrows the running bank's image descriptor (page 9), read through the secure
+    /// alias. Header at [0:24], signature at [24:88].
+    pub fn active_descriptor(&self) -> &[u8]
+    {
+        let swap = regs::swap_bank_set(self.access.peek32(regs::FLASH_OPTR));
+        let bank = regs::running_phys_bank(swap);
+        let secure_base = bank.mapped_base(swap);
+        let descriptor_base = regs::PageBand::Secure
+            .alias_base(secure_base)
+            .wrapping_add(regs::IMAGE_DESCRIPTOR_OFFSET);
+        self.access
+            .bank_view(descriptor_base, regs::IMAGE_DESCRIPTOR_LEN as usize)
+    }
+
+    /// Borrows the running bank's secure payload sub-band (pages 10-19), read through
+    /// the secure alias.
+    pub fn active_secure_band(&self) -> &[u8]
+    {
+        let swap = regs::swap_bank_set(self.access.peek32(regs::FLASH_OPTR));
+        let bank = regs::running_phys_bank(swap);
+        let secure_base = bank.mapped_base(swap);
+        let band_base = regs::PageBand::Secure
+            .alias_base(secure_base)
+            .wrapping_add(regs::IMAGE_PAYLOAD_OFFSET);
+        self.access
+            .bank_view(band_base, regs::IMAGE_PAYLOAD_SECURE_SIZE as usize)
+    }
+
+    /// Borrows the running bank's non-secure payload sub-band (pages 20-31), read
+    /// through the non-secure alias.
+    ///
+    /// RM0456 Table 68: reading a non-secure page through the secure alias returns
+    /// RAZ, so this band uses the non-secure alias.
+    pub fn active_ns_band(&self) -> &[u8]
+    {
+        let swap = regs::swap_bank_set(self.access.peek32(regs::FLASH_OPTR));
+        let bank = regs::running_phys_bank(swap);
+        let secure_base = bank.mapped_base(swap);
+        let band_base = regs::PageBand::NonSecure
+            .alias_base(secure_base)
+            .wrapping_add(regs::IMAGE_NS_BAND_OFFSET);
+        self.access
+            .bank_view(band_base, regs::IMAGE_NS_BAND_SIZE as usize)
+    }
+}
+
 impl<A> FlashSeam for Stm32FlashSeam<A>
 where
     A: FlashAccess,
 {
-    fn inactive_bank(&self) -> &[u8]
+    fn inactive_descriptor(&self) -> &[u8]
     {
-        // Verify must read the EXACT bytes commit boots. On real silicon the
-        // inactive bank is memory-mapped, so this borrows its image band with no
-        // copy. The inactive physical bank and its mapped base both come from the
-        // live OPTR.SWAP_BANK through a shared `peek32` (RM0456 sec 7.9.13), then
-        // the image band is borrowed through `bank_view`. The host model returns
-        // a borrow of its own backing bytes for the same region, so verify and
-        // commit act on one store.
+        // The image descriptor (page 9) of the inactive bank, read through the secure
+        // alias (0x0C..). It holds the signed image's header at [0:24] and its
+        // signature at [24:88]. Page 9 is a secure page, so the descriptor is read
+        // through the secure alias, the store the commit boots.
         let swap = regs::swap_bank_set(self.access.peek32(regs::FLASH_OPTR));
         let bank = regs::inactive_phys_bank(swap);
-        let base = bank.mapped_base(swap);
-        let image_base = base.wrapping_add(regs::IMAGE_REGION_OFFSET);
+        let secure_base = bank.mapped_base(swap);
+        let descriptor_base = regs::PageBand::Secure
+            .alias_base(secure_base)
+            .wrapping_add(regs::IMAGE_DESCRIPTOR_OFFSET);
         self.access
-            .bank_view(image_base, regs::IMAGE_REGION_SIZE as usize)
+            .bank_view(descriptor_base, regs::IMAGE_DESCRIPTOR_LEN as usize)
+    }
+
+    fn inactive_secure_band(&self) -> &[u8]
+    {
+        // The secure payload sub-band (pages 10-19) of the inactive bank, read
+        // through the secure alias (0x0C..). RM0456 Table 68: a secure page must be
+        // read through the secure alias, so this band is homogeneous secure. On real
+        // silicon the inactive bank is memory-mapped, so this borrows the band with no
+        // copy. The host model returns a borrow of its own backing bytes, so verify
+        // reads the exact bytes commit boots.
+        let swap = regs::swap_bank_set(self.access.peek32(regs::FLASH_OPTR));
+        let bank = regs::inactive_phys_bank(swap);
+        let secure_base = bank.mapped_base(swap);
+        let band_base = regs::PageBand::Secure
+            .alias_base(secure_base)
+            .wrapping_add(regs::IMAGE_PAYLOAD_OFFSET);
+        self.access
+            .bank_view(band_base, regs::IMAGE_PAYLOAD_SECURE_SIZE as usize)
+    }
+
+    fn inactive_ns_band(&self) -> &[u8]
+    {
+        // The non-secure image sub-band (pages 20-31) of the inactive bank, read
+        // through the non-secure alias (0x08..). RM0456 Table 68: reading a non-secure
+        // page through the secure alias returns RAZ (all zeros), so this band must use
+        // the NS alias or verify would see zeros for the whole non-secure half. The
+        // verify / commit same-store property holds: this is still the store the
+        // commit boots, read through the correct alias.
+        let swap = regs::swap_bank_set(self.access.peek32(regs::FLASH_OPTR));
+        let bank = regs::inactive_phys_bank(swap);
+        let secure_base = bank.mapped_base(swap);
+        let band_base = regs::PageBand::NonSecure
+            .alias_base(secure_base)
+            .wrapping_add(regs::IMAGE_NS_BAND_OFFSET);
+        self.access
+            .bank_view(band_base, regs::IMAGE_NS_BAND_SIZE as usize)
     }
 
     fn erase_inactive(&mut self) -> Result<(), FlashError>
     {
         self.require_dualbank_secure()?;
         let bank = self.inactive_phys();
-        self.unlock_cr();
-        let mut result = Ok(());
-        // Erase only the image pages of the inactive bank. The metadata band is
-        // pages 0-1 of physical Bank 1, never an image page, so this loop never
-        // erases NVCNT, the pending record, the boot-count, or the outcome. The
-        // image pages are the SAME physical bank the program path writes, so
-        // erase and program agree.
-        for page in regs::IMAGE_PAGE_FIRST..regs::PAGES_PER_BANK
-        {
-            if let Err(error) = self.erase_page(bank, page)
-            {
-                result = Err(error);
-                break;
-            }
-        }
-        self.lock_cr();
-        result
+        // Erase only the image pages (9-31) of the inactive bank. The metadata band
+        // (pages 0-1) and the immutable boot stage (pages 2-8) are below
+        // IMAGE_PAGE_FIRST, so this loop never erases NVCNT, the boot stage, or any
+        // record. The secure sub-band (pages 9-19) is erased on the secure
+        // controller, the non-secure sub-band (pages 20-31) on the non-secure
+        // controller: RM0456 Table 68 rejects a secure erase of a non-secure page
+        // with WRPERR, so each page uses the controller matching its SECWM band.
+        self.erase_band(
+            bank,
+            regs::PageBand::Secure,
+            regs::IMAGE_PAGE_FIRST,
+            regs::IMAGE_NS_PAGE_FIRST,
+        )?;
+        self.erase_band(
+            bank,
+            regs::PageBand::NonSecure,
+            regs::IMAGE_NS_PAGE_FIRST,
+            regs::PAGES_PER_BANK,
+        )
     }
 
     fn write_inactive_page
@@ -550,8 +763,10 @@ where
             return Err(FlashError::OutOfRange);
         }
         self.require_dualbank_secure()?;
-        let base = self.logical_page_addr(page)?;
-        self.unlock_cr();
+        // The logical page lies wholly in one band (the boundary is page-aligned),
+        // so it is programmed on that band's controller through that band's alias.
+        let (band, base) = self.logical_page_addr(page)?;
+        self.unlock_cr_on(band.cr(), band.keyr());
         let mut result = Ok(());
         // A logical page is many quad-words. Program it quad-word by quad-word
         // at the right absolute address. A short final quad-word is padded with
@@ -582,14 +797,73 @@ where
                     break;
                 }
             };
-            if let Err(error) = self.program_quad_word(addr, chunk)
+            if let Err(error) = self.program_quad_word(band, addr, chunk)
             {
                 result = Err(error);
                 break;
             }
             done += take;
         }
-        self.lock_cr();
+        self.lock_cr_on(band.cr());
+        result
+    }
+
+    fn write_descriptor(&mut self, descriptor: &[u8]) -> Result<(), FlashError>
+    {
+        if descriptor.len() > regs::PAGE_SIZE as usize
+        {
+            return Err(FlashError::OutOfRange);
+        }
+        self.require_dualbank_secure()?;
+        // The descriptor is page 9 of the inactive bank, a SECURE page, so it is
+        // programmed on the secure controller through the secure alias. erase_
+        // inactive already erased page 9, so this single programming pass writes
+        // the header and signature without a reprogram (no PROGERR).
+        let bank = self.inactive_phys();
+        let secure_base = self.phys_base(bank);
+        let base = regs::PageBand::Secure
+            .alias_base(secure_base)
+            .checked_add(regs::IMAGE_DESCRIPTOR_OFFSET)
+            .ok_or(FlashError::OutOfRange)?;
+        self.unlock_cr_on(regs::FLASH_SECCR, regs::FLASH_SECKEYR);
+        let mut result = Ok(());
+        // The descriptor is many quad-words. Program it quad-word by quad-word. A
+        // short final quad-word is padded with the erased value inside
+        // program_quad_word, so the trailing bytes never raise SIZERR.
+        let mut done = 0usize;
+        while done < descriptor.len()
+        {
+            let take = core::cmp::min(
+                regs::QUAD_WORD_LEN as usize,
+                descriptor.len() - done,
+            );
+            let chunk = match descriptor.get(done..done + take)
+            {
+                Some(slice) => slice,
+                None =>
+                {
+                    result = Err(FlashError::OutOfRange);
+                    break;
+                }
+            };
+            let addr = match base.checked_add(done as u32)
+            {
+                Some(value) => value,
+                None =>
+                {
+                    result = Err(FlashError::OutOfRange);
+                    break;
+                }
+            };
+            if let Err(error) =
+                self.program_quad_word(regs::PageBand::Secure, addr, chunk)
+            {
+                result = Err(error);
+                break;
+            }
+            done += take;
+        }
+        self.lock_cr_on(regs::FLASH_SECCR);
         result
     }
 
@@ -615,14 +889,13 @@ where
 
     fn commit_swap(&mut self) -> Result<(), FlashError>
     {
-        // INERT brick-class path. This carries the FULL real option-byte
-        // sequence (RM0456 sec 7.4.2): unlock the CR, unlock the options, flip
-        // OPTR.SWAP_BANK, set OPTSTRT, poll BSY, then set OBL_LAUNCH which
-        // RESETS the part and applies the option load on real silicon. The
-        // option-byte / OBL_LAUNCH writes are emitted ONLY through the
-        // target-gated MMIO port, which does not compile on the host. No host
-        // build and no test drives this on silicon. Its on-silicon invocation
-        // stays gated on a deliberate operator action plus the hardware
+        // Inert brick-class path. This carries the full real option-byte sequence
+        // (RM0456 sec 7.4.2): unlock the CR, unlock the options, flip OPTR.SWAP_BANK,
+        // set OPTSTRT, poll BSY, then set OBL_LAUNCH which resets the part and applies
+        // the option load on real silicon. The option-byte / OBL_LAUNCH writes are
+        // emitted only through the target-gated MMIO port, which does not compile on
+        // the host. No host build and no test drives this on silicon. Its on-silicon
+        // invocation stays gated on a deliberate operator action plus the hardware
         // power-fault proof.
         self.require_dualbank_secure()?;
         let target_is_bank2 =
@@ -632,28 +905,20 @@ where
 
     fn revert_swap(&mut self) -> Result<(), FlashError>
     {
-        // INERT brick-class path, same real sequence as commit_swap but arming
-        // the swap back to the previously-running (now inactive) bank. Same
-        // gating: emitted only through the target-gated MMIO port, never
-        // auto-run on silicon.
+        // Inert brick-class path, same real sequence as commit_swap but arming the
+        // swap back to the previously-running (now inactive) bank. Same gating:
+        // emitted only through the target-gated MMIO port, never auto-run on silicon.
         self.require_dualbank_secure()?;
-        // Revert is reachable only after the forward swap already took effect
-        // and the NEW bank is running, so a correct revert flips SWAP_BANK BACK
-        // toward the previously-running bank, which is now the INACTIVE one
-        // (RM0456 sec 7.5.8). Arm toward the inactive bank, exactly the notion
-        // commit_swap arms toward, so the revert points the boot map back at the
-        // old image.
+        // Revert is reachable only after the forward swap already took effect and the
+        // new bank is running, so a correct revert flips SWAP_BANK back toward the
+        // previously-running bank, which is now the inactive one (RM0456 sec 7.5.8).
+        // Arm toward the inactive bank, exactly the notion commit_swap arms toward, so
+        // the revert points the boot map back at the old image.
         let swap = self.swap_bank();
         let revert_target = regs::inactive_phys_bank(swap);
-        // Local restatement of the caller's contract: a revert points the boot
-        // map at a DIFFERENT bank than the one running, never at the live bank.
-        // The forward swap must already be in effect for revert to be correct,
-        // which means the revert target (the inactive bank) is distinct from the
-        // running bank (RM0456 sec 7.5.8). Compiled out of release builds.
-        debug_assert!(
-            revert_target != regs::running_phys_bank(swap),
-            "revert must arm toward a bank other than the running one",
-        );
+        // The revert target is distinct from the running bank by construction:
+        // inactive_phys_bank and running_phys_bank are pure opposites of the same
+        // swap bool (RM0456 sec 7.5.8), so no runtime guard can add anything here.
         let target_is_bank2 = matches!(revert_target, PhysBank::Two);
         self.arm_swap(target_is_bank2)
     }
@@ -698,7 +963,7 @@ where
             regs::PENDING_ARMED_BANK1 => Ok(PendingFlag::Armed(BankId::Bank1)),
             regs::PENDING_ARMED_BANK2 => Ok(PendingFlag::Armed(BankId::Bank2)),
             // Any other value is a torn or corrupt record. Fail closed: treat it
-            // as no pending confirm, which keeps the OLD bank bootable.
+            // as no pending confirm, which keeps the old bank bootable.
             _ => Ok(PendingFlag::None),
         }
     }
@@ -781,19 +1046,25 @@ impl<A> Stm32FlashSeam<A>
 where
     A: FlashAccess,
 {
-    /// Arms the option-byte SWAP_BANK plus OBL_LAUNCH sequence (INERT).
+    /// Arms the option-byte SWAP_BANK plus OBL_LAUNCH sequence (inert).
     ///
-    /// RM0456 sec 7.4.2: poll BSY, unlock the CR, unlock the options, write
-    /// OPTR (set or clear SWAP_BANK), set OPTSTRT, poll BSY, set OBL_LAUNCH. The
-    /// final OBL_LAUNCH triggers the reset that reloads the option bytes on real
-    /// silicon, which is the brick-class step. Every register write here lands
-    /// on the [`FlashAccess`] port, which is the target-gated MMIO on hardware
-    /// and a state model in tests. The model stages the swap and applies it only
-    /// at a modelled reset, so NO real OBL_LAUNCH ever fires off-target.
+    /// RM0456 sec 7.4.2: poll BSY, unlock the CR, unlock the options, write OPTR (set
+    /// or clear SWAP_BANK), set OPTSTRT, poll BSY, set OBL_LAUNCH. The final
+    /// OBL_LAUNCH triggers the reset that reloads the option bytes on real silicon,
+    /// the brick-class step. Every register write here lands on the [`FlashAccess`]
+    /// port, which is the target-gated MMIO on hardware and a state model in tests.
+    /// The model stages the swap and applies it only at a modelled reset, so no real
+    /// OBL_LAUNCH ever fires off-target.
+    ///
+    /// The whole sequence drives the non-secure controller (OPTSTRT / OBL_LAUNCH live
+    /// in NSCR, RM0456 sec 7.4.2), so it polls FLASH_NSSR: the controller driven is
+    /// the controller polled. BSY is mirrored in both status registers (RM0456 sec
+    /// 7.3.5), so the readiness is the same, this only removes the controller / status
+    /// asymmetry on the brick-class path.
     fn arm_swap(&mut self, want_bank2: bool) -> Result<(), FlashError>
     {
-        self.wait_ready()?;
-        // The option program goes through the NON-SECURE control register
+        self.wait_ready_on(regs::FLASH_NSSR)?;
+        // The option program goes through the non-secure control register
         // (OPTSTRT / OBL_LAUNCH live in NSCR, RM0456 sec 7.4.2), so unlock the
         // NS CR with the same KEY1 / KEY2 pair, then unlock the options.
         self.unlock_ns_cr();
@@ -811,24 +1082,24 @@ where
                 .modify32(regs::FLASH_OPTR, regs::OPTR_SWAP_BANK, 0);
         }
 
-        // Start the option program, then wait for BSY to clear.
+        // Start the option program, then wait for BSY to clear on the NS status.
         self.access
             .modify32(regs::FLASH_NSCR, 0, regs::NSCR_OPTSTRT);
-        self.wait_ready()?;
+        self.wait_ready_on(regs::FLASH_NSSR)?;
 
         // A rejected option program raises OPTWERR in NSSR (RM0456 sec 7.9.7).
         let nssr = self.access.read32(regs::FLASH_NSSR);
         if nssr & regs::SR_OPTWERR != 0
         {
-            // Clear the rc_w1 flag and fail closed, NO OBL_LAUNCH is issued.
+            // Clear the rc_w1 flag and fail closed, no OBL_LAUNCH is issued.
             self.access.write32(regs::FLASH_NSSR, regs::SR_OPTWERR);
             self.lock_options();
             self.lock_ns_cr();
             return Err(FlashError::Hardware);
         }
 
-        // OBL_LAUNCH applies the option load and RESETS the part on silicon.
-        // This is the inert brick-class write: present, never auto-run.
+        // OBL_LAUNCH applies the option load and resets the part on silicon. This is
+        // the inert brick-class write: present, never auto-run.
         self.access
             .modify32(regs::FLASH_NSCR, 0, regs::NSCR_OBL_LAUNCH);
 

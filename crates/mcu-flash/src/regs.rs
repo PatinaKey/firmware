@@ -1,24 +1,22 @@
 //! Hand-rolled, cited register and geometry definitions for the embedded flash.
 //!
-//! ONLY the FLASH controller registers, key values, and bank geometry the
-//! dual-bank update path touches are defined here, each with an RM0456 ch.7
-//! citation.
+//! Only the FLASH controller registers, key values, and bank geometry the dual-bank
+//! update path touches are defined here, each with an RM0456 ch.7 citation.
 //!
-//! Addresses use the SECURE alias because this driver runs in the secure state
-//! and writes the secure bank: a secure-world driver uses the SEC register bank
-//! exclusively (RM0456 sec 7.7 Table 72). Every ADDRESS, BIT POSITION, KEY
-//! VALUE, and GEOMETRY constant here is pinned to a hard-coded primary-source
-//! literal in `regs_pin_tests`.
+//! Addresses use the secure alias because this driver runs in the secure state and
+//! writes the secure bank: a secure-world driver uses the SEC register bank
+//! exclusively (RM0456 sec 7.7 Table 72). Every address, bit position, key value,
+//! and geometry constant here is pinned to a hard-coded primary-source literal in
+//! `regs_pin_tests`.
 //!
 //! # The physical-bank-versus-mapped-address contract (RM0456 sec 7.5.8)
 //!
-//! SWAP_BANK remaps the ADDRESS of each bank. It does NOT move the BKER erase
-//! selector, the SECWM, or the WRP, which all follow the PHYSICAL bank (RM0456
-//! sec 7.5.8 Fig 23/24). A driver that wants to act on physical bank X must
-//! therefore use TWO different facts that diverge under SWAP_BANK=1: the erase
-//! BKER bit is SWAP_BANK-independent, while the program / read address is
-//! SWAP_BANK-derived. [`PhysBank`] folds both into one place so erase and
-//! program always agree on the same physical bank.
+//! SWAP_BANK remaps the address of each bank. It does not move the BKER erase
+//! selector, the SECWM, or the WRP, which all follow the physical bank (RM0456 sec
+//! 7.5.8 Fig 23/24). A driver acting on physical bank X must therefore use two facts
+//! that diverge under SWAP_BANK=1: the erase BKER bit is SWAP_BANK-independent, while
+//! the program / read address is SWAP_BANK-derived. [`PhysBank`] folds both into one
+//! place so erase and program always agree on the same physical bank.
 
 // ===========================================================================
 // FLASH controller register block. Secure alias base 0x5002_2000, non-secure
@@ -68,6 +66,18 @@ pub(crate) const FLASH_SECCR: u32 = FLASH_BASE + FLASH_SECCR_OFF;
 /// `FLASH_OPTR` absolute address.
 pub(crate) const FLASH_OPTR: u32 = FLASH_BASE + FLASH_OPTR_OFF;
 
+/// `FLASH_SECWM1R1` offset 0x50 (physical Bank 1 secure watermark). RM0456 sec
+/// 7.9.17. Secure-read-only: a non-secure read is RAZ.
+pub(crate) const FLASH_SECWM1R1_OFF: u32 = 0x50;
+/// `FLASH_SECWM2R1` offset 0x60 (physical Bank 2 secure watermark). RM0456 sec
+/// 7.9.21. Secure-read-only: a non-secure read is RAZ.
+pub(crate) const FLASH_SECWM2R1_OFF: u32 = 0x60;
+/// `FLASH_SECWM1R1` absolute secure address (0x5002_2050). The boot stage decodes
+/// PSTRT (bits [4:0]) and PEND (bits [20:16]) from the word this reads back.
+pub(crate) const FLASH_SECWM1R1: u32 = FLASH_BASE + FLASH_SECWM1R1_OFF;
+/// `FLASH_SECWM2R1` absolute secure address (0x5002_2060).
+pub(crate) const FLASH_SECWM2R1: u32 = FLASH_BASE + FLASH_SECWM2R1_OFF;
+
 // ===========================================================================
 // CR / OPT unlock keys. A wrong value or order locks the CR until reset.
 // ===========================================================================
@@ -101,7 +111,7 @@ pub(crate) const SECCR_PNB_SHIFT: u32 = 3;
 /// `SECCR.PNB` field mask (bits [10:3]). RM0456 sec 7.9.10.
 pub(crate) const SECCR_PNB_MASK: u32 = 0xFF << SECCR_PNB_SHIFT;
 /// `SECCR.BKER` bit 11: erase bank select (0 Bank1, 1 Bank2). RM0456 sec
-/// 7.9.10. BKER selects the PHYSICAL bank, SWAP_BANK does not move it (RM0456
+/// 7.9.10. BKER selects the physical bank, SWAP_BANK does not move it (RM0456
 /// sec 7.5.8).
 pub(crate) const SECCR_BKER: u32 = 1 << 11;
 /// `SECCR.BWR` bit 14: burst-write request. Defined to fix its position. The
@@ -200,16 +210,34 @@ pub(crate) const PAGES_PER_BANK: u32 = 32;
 /// Bytes per bank under DUALBANK=1 (256 KB). RM0456 sec 7.3.1 Table 51.
 pub(crate) const BANK_SIZE: u32 = PAGE_SIZE * PAGES_PER_BANK;
 
-/// The LOW secure alias base (the boot / active range). RM0456 sec 7.3.1 Table
+/// The low secure alias base (the boot / active range). RM0456 sec 7.3.1 Table
 /// 51, AN5347 Table 2. SECBOOTADD0 points here, so whichever physical bank
 /// SWAP_BANK maps low is the bank that boots (RM0456 sec 7.5.8).
 pub(crate) const LOW_ALIAS_BASE: u32 = 0x0C00_0000;
-/// The HIGH secure alias base (the staging / inactive range). RM0456 sec 7.3.1
+/// The high secure alias base (the staging / inactive range). RM0456 sec 7.3.1
 /// Table 51 (Bank 2 page 0 at 0x0C04_0000 secure for the 512 KB STM32U545),
 /// AN5347 Table 2. The two 256 KB ranges are contiguous (the 512 KB part keeps
 /// DUALBANK=1 contiguous, not the 0x0802_0000 split of the smaller variants in
 /// the Table 51 footnote).
 pub(crate) const HIGH_ALIAS_BASE: u32 = LOW_ALIAS_BASE + BANK_SIZE;
+
+/// The offset from a non-secure flash alias to its secure alias. RM0456 sec 2.3
+/// memory map, AN5347 Table 2: the secure view of flash sits 0x0400_0000 above
+/// the non-secure view, so a secure alias address minus this offset is the
+/// non-secure alias of the same physical byte.
+pub(crate) const SECURE_ALIAS_OFFSET: u32 = 0x0400_0000;
+/// The low non-secure alias base. RM0456 sec 2.3, AN5347 Table 2.
+///
+/// Consumed by the host FLASH-controller model to emulate the non-secure alias
+/// view. The driver derives an NS-band address from a swap-mapped secure base
+/// via [`SECURE_ALIAS_OFFSET`], so this fixed base is test-only today.
+#[cfg(test)]
+pub(crate) const NS_LOW_ALIAS_BASE: u32 = LOW_ALIAS_BASE - SECURE_ALIAS_OFFSET;
+/// The high non-secure alias base. RM0456 sec 2.3, AN5347 Table 2.
+///
+/// Consumed by the host FLASH-controller model (see [`NS_LOW_ALIAS_BASE`]).
+#[cfg(test)]
+pub(crate) const NS_HIGH_ALIAS_BASE: u32 = HIGH_ALIAS_BASE - SECURE_ALIAS_OFFSET;
 
 /// The flash program granularity in bytes: a quad-word is 4 x 32-bit words.
 /// RM0456 sec 7.3.7. A program writes one whole quad-word, a sub-quad-word
@@ -226,18 +254,18 @@ pub(crate) const ERASED_WORD: u32 = 0xFFFF_FFFF;
 // ===========================================================================
 // Physical bank selector: the single B1 helper.
 //
-// RM0456 sec 7.5.8 Fig 23/24: SWAP_BANK remaps the bank ADDRESS but NOT the
-// BKER erase selector, which always names the physical bank. Folding both into
-// one type forces erase (BKER) and program / read (address) to agree on the
-// same physical bank.
+// RM0456 sec 7.5.8 Fig 23/24: SWAP_BANK remaps the bank address but not the BKER
+// erase selector, which always names the physical bank. Folding both into one type
+// forces erase (BKER) and program / read (address) to agree on the same physical
+// bank.
 // ===========================================================================
 
 /// One of the two physical flash banks.
 ///
-/// A PHYSICAL bank is a fixed silicon region. Its erase selector (BKER) never
-/// moves, while its mapped address depends on SWAP_BANK (RM0456 sec 7.5.8). The
-/// driver names the physical bank with this type, then asks for the BKER bit and
-/// the mapped base together so the two can never diverge.
+/// A physical bank is a fixed silicon region. Its erase selector (BKER) never moves,
+/// while its mapped address depends on SWAP_BANK (RM0456 sec 7.5.8). The driver names
+/// the physical bank with this type, then asks for the BKER bit and the mapped base
+/// together so the two can never diverge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysBank
 {
@@ -279,6 +307,99 @@ impl PhysBank
     }
 }
 
+// ===========================================================================
+// Page security band: the controller register bank plus the address alias a
+// page must be driven through.
+//
+// RM0456 Table 68: a secure-controller access to a non-secure page is RAZ on read
+// and Write-Ignored plus WRPERR on program / erase, and the non-secure controller
+// sees a secure page the same way. So each page is driven through the controller
+// (SEC* vs NS*) and the alias (0x0C.. vs 0x08..) matching its SECWM label. FLASH_NSCR
+// is documented RW from both states (RM0456 sec 7.9.9), so secure firmware may drive
+// the non-secure controller for the non-secure image pages. The NSCR program / erase
+// bits (PG, PER, PNB, BKER, STRT, LOCK) share the SECCR bit positions (RM0456 sec
+// 7.9.9 / 7.9.10), so the `SECCR_*` bit constants apply to NSCR, and the SR flags
+// (RM0456 sec 7.9.7 / 7.9.8) share positions across NSSR and SECSR.
+// ===========================================================================
+
+/// The SECWM security band of a flash page, which selects the controller
+/// register bank and the address alias the driver must use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageBand
+{
+    /// A secure page (0..=`SECWM_PEND`): SEC* registers, 0x0C.. alias.
+    Secure,
+    /// A non-secure page (`SECWM_PEND`+1..): NS* registers, 0x08.. alias.
+    NonSecure,
+}
+
+impl PageBand
+{
+    /// The CR-unlock key register for this band (SECKEYR or NSKEYR).
+    pub(crate) const fn keyr(self) -> u32
+    {
+        match self
+        {
+            PageBand::Secure => FLASH_SECKEYR,
+            PageBand::NonSecure => FLASH_NSKEYR,
+        }
+    }
+
+    /// The status register for this band (SECSR or NSSR).
+    pub(crate) const fn sr(self) -> u32
+    {
+        match self
+        {
+            PageBand::Secure => FLASH_SECSR,
+            PageBand::NonSecure => FLASH_NSSR,
+        }
+    }
+
+    /// The control register for this band (SECCR or NSCR).
+    pub(crate) const fn cr(self) -> u32
+    {
+        match self
+        {
+            PageBand::Secure => FLASH_SECCR,
+            PageBand::NonSecure => FLASH_NSCR,
+        }
+    }
+
+    /// The alias base for this band, given the SECURE-alias mapped base of the
+    /// target physical bank.
+    ///
+    /// RM0456 sec 2.3 / AN5347 Table 2: the non-secure alias sits
+    /// [`SECURE_ALIAS_OFFSET`] below the secure one, so a secure-band access
+    /// keeps the secure base and a non-secure-band access drops to the NS alias.
+    pub(crate) const fn alias_base(self, secure_mapped_base: u32) -> u32
+    {
+        match self
+        {
+            PageBand::Secure => secure_mapped_base,
+            PageBand::NonSecure => secure_mapped_base - SECURE_ALIAS_OFFSET,
+        }
+    }
+}
+
+/// The security band of a bank-relative page index, from the SECWM boundary.
+///
+/// RM0456 sec 7.9.17 / 7.9.21: pages 0..=`SECWM_PEND` are secure, the rest are
+/// non-secure. The host FLASH-controller model uses this to decide a page's RAZ
+/// / WRPERR behaviour. The driver routes by byte offset against the sub-band
+/// size, so this page-indexed helper is test-only today.
+#[cfg(test)]
+pub(crate) const fn page_band(page: u32) -> PageBand
+{
+    if page <= SECWM_PEND
+    {
+        PageBand::Secure
+    }
+    else
+    {
+        PageBand::NonSecure
+    }
+}
+
 /// Decodes `OPTR.SWAP_BANK` into a plain bool (true = SWAP_BANK set).
 pub(crate) const fn swap_bank_set(optr: u32) -> bool
 {
@@ -314,18 +435,44 @@ pub(crate) const fn inactive_phys_bank(swap: bool) -> PhysBank
 }
 
 // ===========================================================================
-// Per-bank layout (the M2 reconciliation). docs grounding: each 256 KB bank is
-// split [boot metadata | boot-stage + key | secure app | NSC veneer | NS app].
-// This driver only addresses the boot-metadata band and the A/B image band. The
-// boot-stage, key, and application bands are placed by the linker of a future
-// crate, not here.
+// Per-bank layout.
+// Both 256 KB banks carry the identical internal split, so the address-space view is
+// the same before and after a swap and the SAU / SECWM / MPU never reprogram on a
+// swap:
+//   pages 0-1   (16 KB) secure boot metadata (physical Bank 1 only)
+//   pages 2-8   (56 KB) secure boot stage, immutable, base = SECBOOTADD0
+//   page  9     (8 KB)  secure image descriptor: header [0:24], signature [24:88]
+//   pages 10-19 (80 KB) secure secure app, CMSE veneers (.gnu.sgstubs) pinned
+//                       in the top of page 19. The mcu-layout crate owns that
+//                       window's address, this table deliberately does not
+//                       restate it
+//   pages 20-31 (96 KB) non-secure non-secure app
 //
-// The NVCNT, the pending record, the boot-count, and the update-outcome record
-// live in pages 0-1 of PHYSICAL Bank 1, the FIXED metadata band (RM0456 sec
-// 7.5.8: protections follow the physical bank, so SECWM1 / WRP1 / HDP1 cover it
-// permanently). The driver re-derives the MAPPED address of physical Bank 1 from
+// The signed image file stays contiguous HEADER || PAYLOAD || SIGNATURE. The updater
+// de-interleaves that stream onto flash: the header lands in the descriptor page
+// [0:24], the payload (the raw firmware, secure app then NS app) lands page-aligned
+// at its link origin starting on page 10 (0x0C014000), and the signature lands in
+// the descriptor page [24:88]. So the committed bank is bootable-shaped: the secure
+// app vector table sits at its link origin, not the header magic. RM0456 sec 7.5.8
+// (identical layout per bank).
+//
+// This driver addresses the boot-metadata band and the A/B image band (pages 9-31):
+// the descriptor page 9 and the payload pages 10-31. The boot stage (pages 2-8) and
+// the metadata (pages 0-1) are outside the image band, so the updater never erases
+// or programs them. The boot-stage crate linker owns pages 2-8, not this driver.
+//
+// The NVCNT, the pending record, the boot-count, and the update-outcome record live
+// in pages 0-1 of physical Bank 1, the fixed metadata band (RM0456 sec 7.5.8:
+// protections follow the physical bank, so SECWM1 / WRP1 / HDP1 cover it
+// permanently). The driver re-derives the mapped address of physical Bank 1 from
 // SWAP_BANK on every metadata access, so the record survives a swap. There is a
-// SINGLE copy, no per-bank duplicate.
+// single copy, no per-bank duplicate.
+//
+// The image band spans the SECWM boundary: pages 9-19 are secure, pages 20-31
+// non-secure. RM0456 Table 68 forbids the secure controller from reading or writing a
+// non-secure page (RAZ on read, Write-Ignored plus WRPERR on program / erase), so the
+// driver drives each page through the controller and alias matching its [`PageBand`].
+// SECWM PEND = 19 pins the boundary.
 // ===========================================================================
 
 /// The first metadata page index inside physical Bank 1 (pages 0-1).
@@ -333,27 +480,77 @@ pub(crate) const META_PAGE_FIRST: u32 = 0;
 /// The number of metadata pages reserved at the bottom of physical Bank 1.
 ///
 /// Two 8 KB pages (16 KB) carry the NVCNT log, the pending record, the
-/// boot-count log, and the update-outcome record. The image band starts after
-/// them.
+/// boot-count log, and the update-outcome record. The boot-stage band starts
+/// after them.
 pub(crate) const META_PAGE_COUNT: u32 = 2;
 
-/// The image band start page inside each bank (just past the metadata band).
+/// The first immutable boot-stage page (page 2). RM0456 sec 7.5.8, Table 26
+/// (SECBOOTADD0 = 0x0C004000). Pages 2-8 hold the boot stage, OUTSIDE the image
+/// band, so the updater never touches them.
+pub(crate) const BOOT_STAGE_PAGE_FIRST: u32 = META_PAGE_FIRST + META_PAGE_COUNT;
+/// The number of immutable boot-stage pages (pages 2-8, 56 KB).
+pub(crate) const BOOT_STAGE_PAGE_COUNT: u32 = 7;
+
+/// The last SECURE page index in each bank (inclusive), the SECWM PEND value.
 ///
-/// The A/B image occupies pages [`IMAGE_PAGE_FIRST`]..[`PAGES_PER_BANK`] of the
-/// inactive bank. The metadata band (pages 0-1 of physical Bank 1) is never an
-/// image page, so the image write / erase loop never touches NVCNT.
-pub(crate) const IMAGE_PAGE_FIRST: u32 = META_PAGE_FIRST + META_PAGE_COUNT;
-/// The number of image pages per bank (the pages after the metadata band).
+/// RM0456 sec 7.9.17 / 7.9.21: pages 0..=`SECWM_PEND` are secure, the rest are
+/// non-secure. Pages 20-31 are the non-secure application. This is the one boundary
+/// that decides a page's [`PageBand`].
+pub(crate) const SECWM_PEND: u32 = 19;
+
+/// The image band start page inside each bank (just past the boot-stage band).
+///
+/// The A/B image occupies pages [`IMAGE_PAGE_FIRST`]..[`PAGES_PER_BANK`] (pages
+/// 9-31) of the inactive bank. Page 9 is the descriptor, pages 10-31 the payload.
+/// The metadata band (pages 0-1) and the boot-stage band (pages 2-8) are never
+/// image pages, so the image write / erase loop never touches NVCNT or the
+/// immutable boot stage.
+pub(crate) const IMAGE_PAGE_FIRST: u32 =
+    BOOT_STAGE_PAGE_FIRST + BOOT_STAGE_PAGE_COUNT;
+/// The number of image pages per bank (the pages after the boot-stage band).
 pub(crate) const IMAGE_PAGE_COUNT: u32 = PAGES_PER_BANK - IMAGE_PAGE_FIRST;
-/// The image band size per bank in bytes.
-///
-/// This is the span the A/B update writes. It is the bank minus the 16 KB
-/// metadata band, so the image region no longer silently shrinks under a
-/// top-of-bank carve-out, it is the explicit lower-pages span the layout
-/// reserves.
+/// The image band size per bank in bytes (pages 9-31, 184 KB).
 pub(crate) const IMAGE_REGION_SIZE: u32 = IMAGE_PAGE_COUNT * PAGE_SIZE;
-/// The byte offset of the image band from a bank base.
+/// The byte offset of the image band from a bank base (page 9, 0x12000).
 pub(crate) const IMAGE_REGION_OFFSET: u32 = IMAGE_PAGE_FIRST * PAGE_SIZE;
+
+// The image descriptor occupies page 9 (the first image page). It holds the signed
+// image's header at byte offset [0:24] and its signature at [24:88], the rest of the
+// page erased. The header magic therefore lands here, never on the secure app link
+// origin, so the committed bank boots.
+
+/// The descriptor page byte offset from a bank base (page 9, 0x12000).
+pub(crate) const IMAGE_DESCRIPTOR_OFFSET: u32 = IMAGE_REGION_OFFSET;
+/// The descriptor bytes the verify path reads back: a 24-byte header followed by
+/// a 64-byte signature (`image_verify::HEADER_LEN` + `image_verify::SIG_LEN`).
+/// The rest of page 9 stays erased.
+pub(crate) const IMAGE_DESCRIPTOR_LEN: u32 = 88;
+
+// The payload occupies pages 10-31, page-aligned at the secure app link origin. It
+// splits at the SECWM boundary into a secure sub-band (pages 10-19) and a non-secure
+// sub-band (pages 20-31). The verify path reads each sub-band through the alias
+// matching its band, so a non-secure page is never read through the secure alias
+// (which would return RAZ, Table 68).
+
+/// The first payload page inside each bank (page 10, one past the descriptor).
+pub(crate) const IMAGE_PAYLOAD_PAGE_FIRST: u32 = IMAGE_PAGE_FIRST + 1;
+/// The payload byte offset from a bank base (page 10, 0x14000, the secure app
+/// link origin 0x0C014000).
+pub(crate) const IMAGE_PAYLOAD_OFFSET: u32 = IMAGE_PAYLOAD_PAGE_FIRST * PAGE_SIZE;
+/// The payload size per bank in bytes (pages 10-31, 176 KB): the image band less
+/// the one descriptor page.
+pub(crate) const IMAGE_PAYLOAD_SIZE: u32 = IMAGE_REGION_SIZE - PAGE_SIZE;
+/// The secure payload sub-band size in bytes (pages 10-19, 80 KB, 0x14000).
+pub(crate) const IMAGE_PAYLOAD_SECURE_SIZE: u32 =
+    (IMAGE_NS_PAGE_FIRST - IMAGE_PAYLOAD_PAGE_FIRST) * PAGE_SIZE;
+
+/// The first non-secure image page (page 20, one past SECWM PEND).
+pub(crate) const IMAGE_NS_PAGE_FIRST: u32 = SECWM_PEND + 1;
+/// The non-secure image sub-band byte offset from a bank base (page 20, 0x28000).
+pub(crate) const IMAGE_NS_BAND_OFFSET: u32 = IMAGE_NS_PAGE_FIRST * PAGE_SIZE;
+/// The non-secure image sub-band size in bytes (pages 20-31, 96 KB, 0x18000).
+pub(crate) const IMAGE_NS_BAND_SIZE: u32 =
+    (PAGES_PER_BANK - IMAGE_NS_PAGE_FIRST) * PAGE_SIZE;
 
 // Metadata record offsets inside physical Bank 1.
 //
@@ -402,7 +599,7 @@ pub(crate) const BOOT_TICK: u32 = 0xA5A5_5A5A;
 pub(crate) const OUTCOME_NONE: u32 = 0xFFFF_FFFF;
 /// Update-outcome encoding: an auto-revert happened.
 ///
-/// A future boot-stage SETS this on an auto-revert so the event is NOT silent: a
+/// A future boot-stage sets this on an auto-revert so the event is not silent: a
 /// later host tool reads it back and surfaces it. This driver only reserves the
 /// region and provides the read / write / clear seam. The LED and host-CLI
 /// surfacing is future work.
