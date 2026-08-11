@@ -459,6 +459,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcu-layout"
+version = "0.0.1"
+
+[[package]]
 name = "mcu-spi"
 version = "0.0.1"
 dependencies = [
@@ -538,6 +542,9 @@ checksum = "a513e167849a384b7f9b746e517604398518590a9142f4846a32e3c2a4de7b11"
 [[package]]
 name = "platform"
 version = "0.0.1"
+dependencies = [
+ "mcu-layout",
+]
 
 [[package]]
 name = "polyval"
@@ -640,6 +647,7 @@ dependencies = [
  "cortex-m-rt",
  "ed25519-dalek",
  "mcu-arch",
+ "mcu-layout",
  "mcu-spi",
  "panic-halt",
  "platform",

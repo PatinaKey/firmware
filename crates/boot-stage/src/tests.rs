@@ -312,80 +312,139 @@ fn bad_partition_wedges_before_trusting_isolation()
         BootOutcome::Wedge(WedgeReason::Unreadable));
 }
 
-fn health_cases() -> [ImageHealth; 4]
+// The four axes of the decision input space.
+const RUNNING_CASES: [BankId; 2] = [BankId::Bank1, BankId::Bank2];
+
+const PENDING_CASES: [PendingFlag; 3] =
+[
+    PendingFlag::None,
+    PendingFlag::Armed(BankId::Bank1),
+    PendingFlag::Armed(BankId::Bank2),
+];
+
+const NVCNT_CASES: [u32; 3] = [0, 5, 10];
+
+const HEALTH_CASES: [ImageHealth; 4] =
+[
+    ImageHealth::Rejected,
+    ImageHealth::Verified { security_counter: 0 },
+    ImageHealth::Verified { security_counter: 5 },
+    ImageHealth::Verified { security_counter: 10 },
+];
+
+/// One point of the decision input space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecisionInput
 {
-    [
-        ImageHealth::Rejected,
-        ImageHealth::Verified { security_counter: 0 },
-        ImageHealth::Verified { security_counter: 5 },
-        ImageHealth::Verified { security_counter: 10 },
-    ]
+    running: BankId,
+    pending: PendingFlag,
+    nvcnt: u32,
+    health: ImageHealth,
+}
+
+/// Enumerates the cartesian product of the four axes as one flat iterator.
+fn decision_inputs() -> impl Iterator<Item = DecisionInput>
+{
+    RUNNING_CASES
+        .into_iter()
+        .flat_map(|running|
+        {
+            PENDING_CASES.into_iter().map(move |pending| (running, pending))
+        })
+        .flat_map(|(running, pending)|
+        {
+            NVCNT_CASES
+                .into_iter()
+                .map(move |nvcnt| (running, pending, nvcnt))
+        })
+        .flat_map(|(running, pending, nvcnt)|
+        {
+            HEALTH_CASES.into_iter().map(move |health| DecisionInput
+            {
+                running,
+                pending,
+                nvcnt,
+                health,
+            })
+        })
+}
+
+/// A Revert only ever follows the swap-applied case with an unhealthy or
+/// rolled-back new image.
+fn assert_revert_is_justified(input: DecisionInput)
+{
+    let applied = matches!(input.pending, PendingFlag::Armed(t) if t == input.running);
+    assert!(applied, "revert only when the swap applied");
+    let bad = match input.health
+    {
+        ImageHealth::Rejected => true,
+        ImageHealth::Verified { security_counter } =>
+        {
+            security_counter < input.nvcnt
+        }
+    };
+    assert!(bad, "revert only on a bad or rolled-back image");
+}
+
+/// A bump only ever advances toward a Verified, non-rolled-back counter.
+fn assert_bump_is_justified(input: DecisionInput, plan: BootPlan)
+{
+    let Some(v) = plan.advance_nvcnt
+    else
+    {
+        return;
+    };
+    match input.health
+    {
+        ImageHealth::Verified { security_counter } =>
+        {
+            assert_eq!(v, security_counter);
+            assert!(security_counter >= input.nvcnt);
+        }
+        ImageHealth::Rejected =>
+        {
+            panic!("bumped on a rejected image");
+        }
+    }
+}
+
+/// Asserts the enumerated inputs are pairwise distinct.
+///
+/// A count pin alone still passes when an axis is rewritten to repeat one value,
+/// which holds the total while dropping the cases the property constrains, such
+/// as a Rejected image or a rolled-back counter.
+fn assert_inputs_are_distinct(inputs: &[DecisionInput])
+{
+    for (i, a) in inputs.iter().enumerate()
+    {
+        for b in inputs.iter().skip(i + 1)
+        {
+            assert_ne!(a, b, "the decision axes must enumerate distinct inputs");
+        }
+    }
+}
+
+/// Checks one decision against the never-revert-and-bump property.
+fn assert_decision_is_safe(input: DecisionInput)
+{
+    match decide(input.running, input.pending, input.nvcnt, input.health)
+    {
+        BootDecision::Revert => assert_revert_is_justified(input),
+        BootDecision::Boot(plan) => assert_bump_is_justified(input, plan),
+        BootDecision::Wedge(_) => {}
+    }
 }
 
 #[test]
 fn decision_never_reverts_and_bumps_together()
 {
-    // The load-bearing anti-brick property: over the whole input space, a single
-    // decision is either a Revert (never a bump) or a Boot whose bump, when
-    // present, matches a Verified, non-rolled-back image. A Revert never carries a
-    // plan, so the NVCNT can never rise on the same decision that reverts.
-    for running in [BankId::Bank1, BankId::Bank2]
+    let inputs: std::vec::Vec<DecisionInput> = decision_inputs().collect();
+    for input in &inputs
     {
-        for pending in [
-            PendingFlag::None,
-            PendingFlag::Armed(BankId::Bank1),
-            PendingFlag::Armed(BankId::Bank2),
-        ]
-        {
-            for nvcnt in [0u32, 5, 10]
-            {
-                for health in health_cases()
-                {
-                    let decision = decide(running, pending, nvcnt, health);
-                    match decision
-                    {
-                        BootDecision::Revert =>
-                        {
-                            // A revert only ever follows the swap-applied case with
-                            // an unhealthy or rolled-back new image.
-                            let applied = matches!(pending, PendingFlag::Armed(t) if t == running);
-                            assert!(applied, "revert only when the swap applied");
-                            let bad = match health
-                            {
-                                ImageHealth::Rejected => true,
-                                ImageHealth::Verified { security_counter } =>
-                                {
-                                    security_counter < nvcnt
-                                }
-                            };
-                            assert!(bad, "revert only on a bad or rolled-back image");
-                        }
-                        BootDecision::Boot(plan) =>
-                        {
-                            if let Some(v) = plan.advance_nvcnt
-                            {
-                                // A bump only ever advances toward a Verified,
-                                // non-rolled-back counter.
-                                match health
-                                {
-                                    ImageHealth::Verified { security_counter } =>
-                                    {
-                                        assert_eq!(v, security_counter);
-                                        assert!(security_counter >= nvcnt);
-                                    }
-                                    ImageHealth::Rejected =>
-                                    {
-                                        panic!("bumped on a rejected image");
-                                    }
-                                }
-                            }
-                        }
-                        BootDecision::Wedge(_) => {}
-                    }
-                }
-            }
-        }
+        assert_decision_is_safe(*input);
     }
+    assert_eq!(inputs.len(), 72, "the decision space is 72 decisions");
+    assert_inputs_are_distinct(&inputs);
 }
 
 #[test]

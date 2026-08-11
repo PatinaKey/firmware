@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/tropic01-driver",
+    "crates/mcu-layout",
     "crates/platform",
     "crates/mcu-arch",
     "crates/mcu-spi",

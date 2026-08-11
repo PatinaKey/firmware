@@ -2,9 +2,10 @@
 //!
 //! For the embedded target only this build script does three things:
 //!   1. emits `memory.x` (the secure FLASH / RAM layout) and `sgstubs.x` (roots
-//!      the NSC entry symbols so --gc-sections keeps their veneers) onto the
-//!      linker search path so cortex-m-rt's `link.x` composes with them, and
-//!      pins `.gnu.sgstubs` to the NSC address with a `--section-start`.
+//!      the NSC entry symbols so --gc-sections keeps their veneers, and asserts
+//!      the veneers stay inside the NSC window) onto the linker search path so
+//!      cortex-m-rt's `link.x` composes with them, and pins `.gnu.sgstubs` to
+//!      the NSC address with a `--section-start`.
 //!   2. compiles the C `-mcmse` NSC veneer shim (`csrc/secure_nsc.c`) with clang
 //!      into the crate's object set.
 //!   3. drives rust-lld to emit the CMSE import library (the SG-veneer import
@@ -30,20 +31,19 @@
 
 use std::env;
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+
+use mcu_layout::NSC_VENEER_BASE;
+use mcu_layout::NSC_VENEER_LEN;
+use mcu_layout::NSC_VENEER_LIMIT;
 
 /// The bare-metal triple the secure/non-secure images are built for.
 const TARGET_TRIPLE: &str = "thumbv8m.main-none-eabihf";
 /// The stable file name of the CMSE import object under the target triple dir.
 const IMPLIB_FILE: &str = "patinakey_nsc_implib.o";
-/// The pinned NSC veneer window base: page 19, the top page of the secure app
-/// band (pages 10-19). The CMSE secure-gateway veneers (.gnu.sgstubs) are forced
-/// here so the SAU-marked NSC address is stable across builds. It sits inside
-/// the secure FLASH region [0x0C014000, 0x0C028000). RM0456 memory map matches
-/// platform map.rs.
-const NSC_VENEER_BASE: &str = "0x0C026000";
 
 /// Derives the cargo target-root directory from `OUT_DIR`.
 ///
@@ -59,6 +59,42 @@ fn target_root_from_out_dir(out_dir: &Path) -> Option<PathBuf>
         .ancestors()
         .nth(5)
         .map(Path::to_path_buf)
+}
+
+/// Builds the linker assertions that bind the emitted veneers to the NSC window.
+///
+/// Returns a linker-script fragment appended to `sgstubs.x`. It states three
+/// bounds the linker checks on every build, so a violation is a build error
+/// instead of a silicon fault:
+///   1. `.gnu.sgstubs` landed at the base the SAU marks Non-Secure-Callable, so
+///      a toolchain that stopped honouring the `--section-start` is caught,
+///   2. the veneers fit inside the window, so adding NSC entries past its
+///      capacity fails the link instead of spilling into ordinary code,
+///   3. memory.x ends the secure FLASH band exactly at the window top.
+///
+/// # Errors
+///
+/// `std::fmt::Error` if writing into the returned buffer fails.
+fn nsc_window_assertions() -> Result<String, std::fmt::Error>
+{
+    let mut out = String::new();
+    writeln!(
+        out,
+        "ASSERT(ADDR(.gnu.sgstubs) == {NSC_VENEER_BASE:#010X}, \
+         \"CMSE veneers must land at the SAU Non-Secure-Callable window base\");"
+    )?;
+    writeln!(
+        out,
+        "ASSERT(SIZEOF(.gnu.sgstubs) <= {NSC_VENEER_LEN}, \
+         \"CMSE veneers overflow the SAU Non-Secure-Callable window\");"
+    )?;
+    writeln!(
+        out,
+        "ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == {:#010X}, \
+         \"secure FLASH band must end at the top of the NSC window\");",
+        NSC_VENEER_LIMIT + 1
+    )?;
+    Ok(out)
 }
 
 fn main() -> Result<(), Box<dyn Error>>
@@ -100,10 +136,10 @@ fn main() -> Result<(), Box<dyn Error>>
     if se_session
     {
         sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_session_ping);\n");
-        sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_crypto);\n");
         sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_persist);\n");
         sgstubs.extend_from_slice(b"EXTERN(patinakey_nsc_se_readonly);\n");
     }
+    sgstubs.extend_from_slice(nsc_window_assertions()?.as_bytes());
     fs::write(out_dir.join("sgstubs.x"), sgstubs)?;
     println!("cargo:rustc-link-search={}", out_dir.display());
     // Append the sgstubs fragment after link.x so its EXTERN roots the veneers.
@@ -112,8 +148,7 @@ fn main() -> Result<(), Box<dyn Error>>
     // emits .gnu.sgstubs into FLASH without a fixed address. This forces it to
     // the SAU-marked NSC base so the address is stable and the NS world can call it.
     println!(
-        "cargo:rustc-link-arg=--section-start=.gnu.sgstubs={}",
-        NSC_VENEER_BASE
+        "cargo:rustc-link-arg=--section-start=.gnu.sgstubs={NSC_VENEER_BASE:#010X}"
     );
 
     // 2. Compile the C -mcmse NSC veneer shim with clang. The cc crate is forced

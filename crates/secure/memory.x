@@ -11,15 +11,22 @@
  * inactive bank presents it at the high alias 0x0C05_4000, so SAU, SECWM and the
  * MPU never change on a bank swap.
  *
- * The Non-Secure-Callable veneer window is page 19 at 0x0C02_6000 (the top page
- * of this band). The build pins the CMSE secure-gateway veneers (.gnu.sgstubs)
- * there with a linker --section-start (see build.rs), so they land at the fixed
- * address the SAU marks Non-Secure-Callable. Ordinary secure code/data uses
- * pages 10-18 (72 KB) below the veneer. The single FLASH region (not a separate
- * carve-out) is deliberate: cortex-m-rt's link.x assigns .gnu.sgstubs to FLASH,
- * so a second region would leave that section's region unbound. The
- * --section-start instead pins the address inside the one FLASH region. RM0456
- * memory map (Bank secure alias, sec 7.5.8 identical-per-bank layout).
+ * The Non-Secure-Callable veneer window sits at the top of this band. The build
+ * pins the CMSE secure-gateway veneers (.gnu.sgstubs) there with a linker
+ * --section-start (see build.rs), so they land at the fixed address the SAU marks
+ * Non-Secure-Callable. Ordinary secure code and data get the rest of the band,
+ * from the FLASH ORIGIN below up to the window base. The window is 32-byte
+ * aligned, the SAU granule, and is deliberately NOT page aligned: a page-aligned
+ * window spent 8 KB of code space and handed the non-secure world an 8 KB
+ * callable surface for a few dozen bytes of gateways.
+ *
+ * The single FLASH region (not a separate carve-out) is deliberate: cortex-m-rt's
+ * link.x assigns .gnu.sgstubs to FLASH, so a second region would leave that
+ * section's region unbound. The --section-start instead pins the address inside
+ * the one FLASH region, and build.rs emits linker ASSERTs that the veneers land
+ * at the window base, fit inside it, and that this region ends exactly at the
+ * window top. RM0456 memory map (Bank secure alias, sec 7.5.8
+ * identical-per-bank layout).
  *
  * RAM is the lower 128 KB of SRAM1 at 0x2000_0000 (the secure RAM half),
  * matching the SAU region 2 / MPCBB1 split declared in platform's map.rs.

@@ -140,7 +140,7 @@ jobs:
         if: matrix.feature == 'default'
         run: |
           set -euo pipefail
-          for c in platform mcu-spi mcu-flash image-verify fw-update tropic01-driver
+          for c in mcu-layout platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
           do
             cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings
           done

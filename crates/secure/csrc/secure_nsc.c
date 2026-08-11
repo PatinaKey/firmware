@@ -86,19 +86,6 @@ __attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_session_ping(voi
     return patinakey_se_session_ping();
 }
 
-/* Crypto + attestation bring-up veneer.
- * The Rust secure body (src/se_crypto.rs) verifies the chip cert chain
- * to the pinned production root, opens a session on the verified STPUB, runs the
- * TRNG / Ed25519 / P-256 sequence, aborts, and packs the outcome (which step,
- * success or failure) into a uint32_t.
-*/
-extern uint32_t patinakey_se_crypto(void);
-
-__attribute__((cmse_nonsecure_entry)) uint32_t patinakey_nsc_se_crypto(void)
-{
-    return patinakey_se_crypto();
-}
-
 /* Persistent-but-reversible state bring-up veneer.
  * The Rust secure body (src/se_persist.rs) opens a session, exercises the
  * monotonic counters, MAC-and-Destroy, and ECC_Key_Store, aborts, 

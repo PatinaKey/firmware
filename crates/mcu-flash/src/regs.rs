@@ -442,8 +442,10 @@ pub(crate) const fn inactive_phys_bank(swap: bool) -> PhysBank
 //   pages 0-1   (16 KB) secure boot metadata (physical Bank 1 only)
 //   pages 2-8   (56 KB) secure boot stage, immutable, base = SECBOOTADD0
 //   page  9     (8 KB)  secure image descriptor: header [0:24], signature [24:88]
-//   pages 10-18 (72 KB) secure secure app
-//   page  19    (8 KB)  secure NSC veneer (.gnu.sgstubs), 0x0C026000
+//   pages 10-19 (80 KB) secure secure app, CMSE veneers (.gnu.sgstubs) pinned
+//                       in the top of page 19. The mcu-layout crate owns that
+//                       window's address, this table deliberately does not
+//                       restate it
 //   pages 20-31 (96 KB) non-secure non-secure app
 //
 // The signed image file stays contiguous HEADER || PAYLOAD || SIGNATURE. The updater

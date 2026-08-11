@@ -182,7 +182,7 @@ embedded_stage()
     # stays UNSET here so the target link-args from .cargo/config.toml (-Tlink.x)
     # survive: the warning gate rides on clippy (a check pass, no link) instead.
     local c
-    for c in platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
+    for c in mcu-layout platform mcu-arch mcu-spi mcu-flash image-verify fw-update tropic01-driver
     do
         cargo clippy -p "$c" --locked --target thumbv8m.main-none-eabihf -- -D warnings || return 1
     done

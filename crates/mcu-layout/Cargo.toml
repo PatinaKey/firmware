@@ -1,0 +1,15 @@
+[package]
+name = "mcu-layout"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "STM32U545 memory-layout addresses shared by more than one crate or build script."
+
+[dependencies]
+
+[lints]
+workspace = true

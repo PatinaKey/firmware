@@ -22,13 +22,13 @@ normal = ["platform"]
 # the whole path on.
 default = []
 se-fw-update = []
-# se-session: adds the L3 secure-channel bring-up path (secure body plus its NSC
-# veneer). Reads STPUB, opens a Noise KK1 session against slot 0, runs one L3
-# Ping with an echo compare, then aborts.
-# Also adds a crypto + attestation bring-up path (se_crypto.rs): it turns on the
-# driver attestation feature (chain verify to the pinned root) and links
-# ed25519-dalek to verify an SE-produced EdDSA signature on-host.
-se-session = ["tropic01-driver/attestation", "dep:ed25519-dalek"]
+# se-session: adds the L3 secure-channel bring-up paths (secure bodies plus their
+# NSC veneers). Reads STPUB, opens a Noise KK1 session against slot 0, runs one L3
+# Ping with an echo compare, then aborts. It also adds the persistent-state and
+# read-only sweep paths.
+# ed25519-dalek backs the known-answer test in se_persist.rs, which proves the
+# chip's ECC_Key_Store plus EdDSA_Sign path against a standard RFC 8032 verifier.
+se-session = ["dep:ed25519-dalek"]
 
 [dependencies]
 platform = { path = "../platform" }
@@ -37,6 +37,7 @@ platform = { path = "../platform" }
 # the de-facto, mature, mainstream build-script C compiler driver for Rust.
 [build-dependencies]
 cc = "1.2"
+mcu-layout = { path = "../mcu-layout" }
 
 # Embedded-only deps. On the host the bin
 # is an empty stub (see src/main.rs), so these compile only for the target.

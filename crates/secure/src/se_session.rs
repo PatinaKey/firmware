@@ -41,8 +41,8 @@ use crate::se_smoke::se_error_code;
 /// secrets. They let a bring-up test open a session against a factory-default
 /// slot 0 before any provisioning writes a real pairing key.
 ///
-/// Shared with the crypto path (se_crypto.rs) through [`open_bringup_session`]
-/// so both open the session with identical keys.
+/// Shared with the persistent-state and read-only paths through
+/// [`open_bringup_session`] so every bring-up opens with identical keys.
 pub(crate) const SH0_PRIV: [u8; 32] =
 [
     0x28, 0x3f, 0x5a, 0x0f, 0xfc, 0x41, 0xcf, 0x50,
@@ -71,7 +71,8 @@ pub(crate) const SH0_PUB: [u8; 32] =
 /// PRODUCTION session opening MUST draw the ephemeral from a real TRNG.
 /// This module is bring-up only and never enters the product build.
 ///
-/// Shared with the crypto path (se_crypto.rs) through [`open_bringup_session`].
+/// Shared with the persistent-state and read-only paths through
+/// [`open_bringup_session`].
 pub(crate) const EPHEMERAL_PRIV: [u8; 32] =
 [
     0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a,
@@ -89,8 +90,8 @@ const PING_PAYLOAD: &[u8] = b"patinakey L3 ping";
 /// the full store buffer up front. STPUB is returned by value, so the buffer is
 /// not retained after the read.
 ///
-/// Shared with the crypto path (se_crypto.rs), which reads the VERIFIED STPUB
-/// into a scratch of the same size.
+/// Shared with the persistent-state and read-only paths, which read STPUB into a
+/// scratch of the same size.
 pub(crate) const CERT_SCRATCH_LEN: usize = 3840;
 
 // Status-word encoding.
@@ -166,12 +167,11 @@ pub(crate) type BringupSession =
 
 /// Opens the Noise KK1 bring-up session against slot 0 on a supplied STPUB.
 ///
-/// Shared by the session and crypto paths so both open with byte-identical
-/// parameters: the PUBLIC prod0 SH0 pairing key pair and the fixed bring-up
-/// ephemeral. `stpub` is the chip static public key the caller has read (from
-/// the plain cert store for the session path, or the VERIFIED chain for the
-/// crypto path). The private keys are wrapped in `Zeroizing` as `SessionConfig`
-/// requires and dropped when this returns.
+/// Shared by every bring-up path so they open with identical parameters:
+/// the PUBLIC prod0 SH0 pairing key pair and the fixed bring-up ephemeral.
+/// `stpub` is the chip static public key the caller read from the cert store.
+/// The private keys are wrapped in `Zeroizing` as `SessionConfig` requires and
+/// dropped when this returns.
 ///
 /// On success returns the active-session handle. On failure returns the
 /// `NoSession` handle plus the [`SeError`], both moved back to the caller.
@@ -243,9 +243,9 @@ pub extern "C" fn patinakey_se_session_ping() -> u32
     };
 
     // Step 2: open the Noise KK1 session against slot 0 via the shared helper
-    // (identical prod0 SH0 keys and fixed ephemeral as the crypto path). On error
-    // open_bringup_session returns the NoSession handle plus the error, both
-    // dropped here.
+    // (the same prod0 SH0 keys and fixed ephemeral every bring-up path uses). On
+    // error open_bringup_session returns the NoSession handle plus the error,
+    // both dropped here.
     let mut session = match open_bringup_session(dev, &stpub)
     {
         Ok(session) => session,

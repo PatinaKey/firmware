@@ -7,6 +7,9 @@
 //! Manual (SAU region encoding), and the board pin map (SE SPI1 on PA4-7 + PB1,
 //! USB on PA11/PA12, TSC on PB4/PB6).
 
+use mcu_layout::NSC_VENEER_BASE;
+use mcu_layout::NSC_VENEER_LIMIT;
+
 use crate::error::PartitionError;
 use crate::regs::SAU_ALIGN_MASK;
 use crate::regs::SAU_RLAR_ENABLE;
@@ -59,17 +62,12 @@ pub(crate) const MPCBB2_CFGLOCK_MASK: u32 = (1 << 4) - 1;
 pub(crate) const MPCBB4_CFGLOCK_MASK: u32 = 1;
 
 // ===========================================================================
-// Flash and address-space regions. RM0456 memory map. The NSC veneer window is
-// the top 8 KB of secure Bank 1, where the toolchain places `.gnu.sgstubs`.
+// Flash and address-space regions. RM0456 memory map.
+//
+// The NSC veneer window (`NSC_VENEER_BASE` / `NSC_VENEER_LIMIT`, imported from
+// mcu-layout above) is the top 512 bytes of the secure app band, where the
+// toolchain places `.gnu.sgstubs`.
 // ===========================================================================
-
-/// NSC veneer window base: page 19 of the secure app band (.gnu.sgstubs lands
-/// here). Layout L1 moves the veneer from the top of the bank to page 19, the
-/// top page of the secure image sub-band. RM0456 sec 7.5.8 identical-per-bank
-/// layout. Matches crates/secure/memory.x + build.rs `--section-start`.
-pub(crate) const NSC_VENEER_BASE: u32 = 0x0C02_6000;
-/// NSC veneer window inclusive limit (8 KB, page 19).
-pub(crate) const NSC_VENEER_LIMIT: u32 = 0x0C02_7FFF;
 
 /// Non-secure flash alias base: the whole non-secure flash alias, not just the
 /// high bank.
@@ -482,14 +480,22 @@ mod tests
         assert_eq!(MPU_SRAM_LIMIT, 0x2001_FFFF);
         // Layout L1: the code region is pages 2-19 of the active bank, excluding
         // the metadata band (pages 0-1) so a metadata WRITE never lands in the RX
-        // region. It includes the NSC veneer window (page 19).
+        // region. It includes the NSC veneer window at its top.
         assert_eq!(MPU_CODE_BASE, 0x0C00_4000);
         assert_eq!(MPU_CODE_LIMIT, 0x0C02_7FFF);
         let veneer_in_code = NSC_VENEER_BASE >= MPU_CODE_BASE
             && NSC_VENEER_LIMIT <= MPU_CODE_LIMIT;
         assert!(veneer_in_code, "NSC veneer must lie inside the code region");
-        assert_eq!(NSC_VENEER_BASE, 0x0C02_6000);
-        assert_eq!(NSC_VENEER_LIMIT, 0x0C02_7FFF);
+        // DRIFT GUARD.
+        assert_eq!
+        (
+            NSC_VENEER_LIMIT, MPU_CODE_LIMIT,
+            "the NSC veneer window must end at the top of the secure code region"
+        );
+        // SAU granule: RBAR fixes a base's low 5 bits to zero, RLAR reads a
+        // limit's low 5 bits as one.
+        assert_eq!(NSC_VENEER_BASE & SAU_ALIGN_MASK, 0);
+        assert_eq!(NSC_VENEER_LIMIT & SAU_ALIGN_MASK, SAU_ALIGN_MASK);
         // The swap-derived metadata region is pages 0-1 (16 KB) of physical Bank
         // 1, at the low alias when SWAP_BANK is clear and the high alias when set.
         assert_eq!(MPU_META_LOW_BASE, 0x0C00_0000);

@@ -30,6 +30,10 @@
 # The YubiKey signing step needs a physical touch + PIN. The private key never
 # leaves the card. If you prefer to sign by hand, pass SIG=/path/to/sig.raw to
 # skip the pkcs11-tool call.
+#
+# FEATURES selects which SE bring-up proof the image runs, for example
+# `FEATURES=se-session ab-bench.sh all`. It applies to the secure and non-secure
+# images together.
 
 set -euo pipefail
 
@@ -127,11 +131,20 @@ cmd_preflight()
 cmd_build()
 {
     require_tool cargo
+    local feat=()
+    if [ -n "${FEATURES:-}" ]
+    then
+        local names=(${FEATURES})
+        feat=(--features "$(IFS=,; echo "${names[*]}")")
+        log "features: ${names[*]}"
+    fi
+    touch "${REPO_ROOT}/crates/secure/csrc/secure_nsc.c"
     # Secure links first so the CMSE import object exists for the NS link.
     log "build secure"
-    cargo build -p secure    --release --target "${TARGET}" --locked
+    cargo build -p secure    --release --target "${TARGET}" --locked "${feat[@]}"
     log "build nonsecure"
-    cargo build -p nonsecure --release --target "${TARGET}" --locked
+    cargo build -p nonsecure --release --target "${TARGET}" --locked "${feat[@]}"
+    # The boot stage is the immutable first stage and takes no feature.
     log "build boot-stage"
     cargo build -p boot-stage --release --target "${TARGET}" --locked
     [ -f "${BOOT_ELF}" ] && [ -f "${SECURE_ELF}" ] && [ -f "${NONSECURE_ELF}" ] \

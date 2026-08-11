@@ -10,6 +10,7 @@ publish = false
 description = "STM32U545 MCU platform foundation: TrustZone (SAU/GTZC) runtime partition bring-up."
 
 [dependencies]
+mcu-layout = { path = "../mcu-layout" }
 
 # This crate must touch raw MMIO (the volatile register reads/writes that program SAU/GTZC).
 # Every unsafe block must carry a `// SAFETY:` justification.

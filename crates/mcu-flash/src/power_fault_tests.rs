@@ -708,6 +708,91 @@ const CUT_MODES: [CutMode; 3] =
 const RESET_OUTCOMES: [bool; 2] = [true, false];
 const HEALTHS: [Health; 2] = [Health::Confirm, Health::Revert];
 
+/// One census point: a cut index, the mode it fires in, and the reset and health
+/// branch the flow takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CensusCase
+{
+    index: u32,
+    mode: CutMode,
+    reset_applied: bool,
+    health: Health,
+}
+
+// Enumerates the census input space as one flat iterator: every cut mode, both
+// option-load-at-reset outcomes, both health branches, and every persistent-op
+// index below `n`. The index varies fastest, matching the flow order the census
+// walks.
+fn census_cases(n: u32) -> impl Iterator<Item = CensusCase>
+{
+    CUT_MODES
+        .into_iter()
+        .flat_map(|mode|
+        {
+            RESET_OUTCOMES
+                .into_iter()
+                .map(move |reset_applied| (mode, reset_applied))
+        })
+        .flat_map(|(mode, reset_applied)|
+        {
+            HEALTHS
+                .into_iter()
+                .map(move |health| (mode, reset_applied, health))
+        })
+        .flat_map(move |(mode, reset_applied, health)|
+        {
+            (0..n).map(move |index| CensusCase
+            {
+                index,
+                mode,
+                reset_applied,
+                health,
+            })
+        })
+}
+
+// Marks the index whose cut fired and returns how many cuts to add to the tally.
+fn record_fired(fired_seen: &mut [bool], index: u32, fired: bool) -> u32
+{
+    if !fired
+    {
+        return 0;
+    }
+    if let Some(slot) = fired_seen.get_mut(index as usize)
+    {
+        *slot = true;
+    }
+    1
+}
+
+// Asserts the enumerated census cases are pairwise distinct. A count pin alone
+// still passes when an axis is rewritten to repeat one value, which holds the
+// total while dropping the branch that axis exists to cover.
+fn assert_cases_are_distinct(cases: &[CensusCase])
+{
+    for (i, a) in cases.iter().enumerate()
+    {
+        for b in cases.iter().skip(i + 1)
+        {
+            assert_ne!(a, b, "the census axes must enumerate distinct cases");
+        }
+    }
+}
+
+// Asserts every persistent-op index fired at least once across the census. This
+// is the check that proves the cut spans the whole flow, including the post-reset
+// confirm and revert mutations.
+fn assert_every_index_fired(fired_seen: &[bool])
+{
+    for (idx, seen) in fired_seen.iter().enumerate()
+    {
+        assert!(
+            *seen,
+            "persistent op index {idx} never fired, the cut span has a gap"
+        );
+    }
+}
+
 #[test]
 fn exhaustive_power_fault_interleavings_hold_the_invariant()
 {
@@ -726,52 +811,31 @@ fn exhaustive_power_fault_interleavings_hold_the_invariant()
         run_flow(&root, &old_image, &new_image, None, true, Health::Revert).ops;
     let n = confirm_len.max(revert_len);
     assert!(n > ERASE_OPS, "the flow must reach past the inactive-bank erase");
+    assert_eq!(n, 38, "the flow length changed, re-review the census");
 
+    let cases: Vec<CensusCase> = census_cases(n).collect();
+    let total = cases.len() as u32;
     let mut fired_seen = vec![false; n as usize];
-    let mut total = 0u32;
     let mut fired_count = 0u32;
 
-    for mode in CUT_MODES
+    for case in cases.iter().copied()
     {
-        for reset_applied in RESET_OUTCOMES
-        {
-            for health in HEALTHS
-            {
-                for k in 0..n
-                {
-                    let out = run_flow(
-                        &root,
-                        &old_image,
-                        &new_image,
-                        Some((k, mode)),
-                        reset_applied,
-                        health,
-                    );
-                    assert_invariants(&out.shared, old_pl, new_pl, &root, health);
-                    total += 1;
-                    if out.fired
-                    {
-                        fired_count += 1;
-                        if let Some(slot) = fired_seen.get_mut(k as usize)
-                        {
-                            *slot = true;
-                        }
-                    }
-                }
-            }
-        }
+        let out = run_flow(
+            &root,
+            &old_image,
+            &new_image,
+            Some((case.index, case.mode)),
+            case.reset_applied,
+            case.health,
+        );
+        assert_invariants(&out.shared, old_pl, new_pl, &root, case.health);
+        fired_count += record_fired(&mut fired_seen, case.index, out.fired);
     }
 
-    // Every persistent-op index must have fired at least once across the census.
-    // This is the assertion that proves the cut spans the whole flow, including
-    // the post-reset confirm and revert mutations.
-    for (idx, seen) in fired_seen.iter().enumerate()
-    {
-        assert!(
-            *seen,
-            "persistent op index {idx} never fired, the cut span has a gap"
-        );
-    }
+    assert_eq!(total, 12 * n, "every axis combination must be exercised");
+    assert_cases_are_distinct(&cases);
+
+    assert_every_index_fired(&fired_seen);
 
     std::eprintln!(
         "register-level power-fault harness: {total} interleavings exercised, \

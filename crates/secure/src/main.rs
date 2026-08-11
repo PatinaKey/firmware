@@ -40,12 +40,6 @@ mod se_fw_update;
 #[cfg(all(target_os = "none", feature = "se-session"))]
 mod se_session;
 
-// The crypto + attestation bring-up path (secure side of the crypto veneer).
-// Feature-gated under the se-session feature: OFF by default, so the
-// product firmware is byte-unchanged and never references it.
-#[cfg(all(target_os = "none", feature = "se-session"))]
-mod se_crypto;
-
 // The persistent-but-reversible state bring-up path.
 // Feature-gated under the se-session feature: OFF by default, so the
 // product firmware is byte-unchanged and never references it.

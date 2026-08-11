@@ -65,14 +65,23 @@ logs the failing step number and an error code instead.
 | `FEATURES` | What builds | Live RTT markers |
 |------------|-------------|------------------|
 | (none) | the product smoke | first-light SE identity: chip mode, RISC-V and SPECT firmware versions. No `0x5x` marker |
-| `se-session` | the full SE proof suite | `0x51` L3 session + encrypted Ping, `0x52` crypto + attestation to the pinned root, `0x53` reversible persistent state, `0x54` safe reads + P-256 export. All four in one flash |
+| `se-session` | the SE proof suite | `0x51` L3 session + encrypted Ping, `0x53` reversible persistent state (counters, MAC-and-Destroy, imported-Ed25519 known-answer test), `0x54` safe reads + P-256 export. All three in one flash |
 | `se-fw-update` | the SE firmware-update path | `0x20` SE firmware update 1.0.0 to 2.0.0 |
 
 Notes:
 
-- `se-session` pulls in the attestation feature and the Ed25519 verifier, so the
-  secure image is larger. The four proofs share one session helper and run back to
-  back on a single flash.
+- `se-session` adds the three secure-side proof bodies, their NSC veneers, and the
+  host-side Ed25519 verifier (`ed25519-dalek`) that checks the signature the chip
+  produces from the imported RFC 8032 seed. The secure image is larger as a
+  result. The three proofs share one session helper and run back to back on a
+  single flash.
+- There is no on-MCU attestation proof. Verifying the
+  TROPIC01 X.509 chain up to the Tropic Square root is a PROVISIONING-time host
+  operation, run once on the assembly line to prove the chip genuine. The shipped
+  firmware pins no Tropic root and verifies no chain: it delegates trust to the
+  pairing key written into a chip slot at provisioning. The driver keeps the
+  `attestation` feature for that host tool, and the firmware takes the driver with
+  `default-features = false`, so none of it links into either image.
 - `se-fw-update` needs the two vendor firmware blobs present at
   `crates/secure/fw_blobs/`. They are gitignored (Tropic Square signed artifacts
   from the libtropic SDK), so an empty checkout cannot build this feature until
