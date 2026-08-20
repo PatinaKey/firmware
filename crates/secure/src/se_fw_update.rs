@@ -1,7 +1,7 @@
 //! Secure-world TROPIC01 firmware-update routine, exported to the NSC veneer.
 //!
-//! One-shot update of the secure element from factory FW to CPU 2.0.0 / SPECT
-//! 1.0.0, driven from the secure world over SPI1. It is the secure side of the
+//! One-shot update of the secure element to CPU 2.1.0 / SPECT 1.3.0, driven from
+//! the secure world over SPI1. It is the secure side of the
 //! `patinakey_nsc_se_fw_update` non-secure-callable veneer: the non-secure world
 //! calls the veneer, the veneer forwards here, this code drives the update, packs
 //! the outcome into a `u32`, and returns.
@@ -30,19 +30,19 @@ use tropic01_driver::SeError;
 use crate::se_smoke::build_device;
 use crate::se_smoke::se_error_code;
 
-/// The signed CPU (RISC-V) firmware image, version 2.0.0.
+/// The signed CPU (RISC-V) firmware image, version 2.1.0.
 ///
 /// A gitignored vendor blob (crates/secure/fw_blobs/). `include_bytes!` fails the
 /// build if it is absent, which is acceptable: a feature-on build requires the
 /// blob present. The bytes are the exact `cpu_image` stream `update_firmware`
 /// expects, relayed verbatim.
-const CPU_FW_2_0_0: &[u8] = include_bytes!("../fw_blobs/cpu_fw_2_0_0.bin");
+const CPU_FW_2_1_0: &[u8] = include_bytes!("../fw_blobs/cpu_fw_2_1_0.bin");
 
-/// The signed SPECT firmware image, version 1.0.0.
+/// The signed SPECT firmware image, version 1.3.0.
 ///
 /// A gitignored vendor blob (crates/secure/fw_blobs/). `include_bytes!` fails the
 /// build if absent. The bytes are the exact `spect_image` stream verbatim.
-const SPECT_FW_1_0_0: &[u8] = include_bytes!("../fw_blobs/spect_fw_1_0_0.bin");
+const SPECT_FW_1_3_0: &[u8] = include_bytes!("../fw_blobs/spect_fw_1_3_0.bin");
 
 // Status-word encoding (value-out, no pointer crosses the boundary).
 //
@@ -57,7 +57,7 @@ const SPECT_FW_1_0_0: &[u8] = include_bytes!("../fw_blobs/spect_fw_1_0_0.bin");
 //   bits 15..8 (on ERR) STEP code: which step failed.
 //   bits 7..0  (on ERR) the SeError code (se_error_code, shared with se_smoke).
 //   bits 7..0  (on OK)  FWU_UPDATED_MARKER: a fixed pattern the NS logs as
-//                       "updated to 2.0.0".
+//                       "updated to 2.1.0".
 // An error word can also set bit 8 incidentally (an odd STEP shifts a 1 into
 // bit 8 via STEP << 8). FWU_ERR (bit 31) is the discriminator: the NS tests
 // FWU_ERR FIRST, so an error word with bit 8 set is read as an error.
@@ -69,7 +69,7 @@ const FWU_OK: u32 = 1 << 8;
 const FWU_ERR: u32 = 1 << 31;
 
 /// Low-byte marker returned on success. The non-secure side logs it as "updated
-/// to 2.0.0". The running versions are read back via the existing version
+/// to 2.1.0". The running versions are read back via the existing version
 /// veneers.
 const FWU_UPDATED_MARKER: u32 = 0x20;
 
@@ -137,7 +137,7 @@ pub extern "C" fn patinakey_se_fw_update() -> u32
 
     // Step 2: write both bank pairs from the two blobs verbatim. On success the
     // driver returns the two decoded image versions, reused by the verify below.
-    let (cpu_version, spect_version) = match bl.update_firmware(CPU_FW_2_0_0, SPECT_FW_1_0_0)
+    let (cpu_version, spect_version) = match bl.update_firmware(CPU_FW_2_1_0, SPECT_FW_1_3_0)
     {
         Ok(versions) => versions,
         Err(e) => return err_word(STEP_BANK_WRITE, e),

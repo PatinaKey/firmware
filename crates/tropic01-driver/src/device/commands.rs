@@ -21,8 +21,7 @@ use crate::ids::CmdId;
 use crate::ids::L2ReqId;
 use crate::ids::L2Status;
 use crate::ids::L3Status;
-use crate::l1;
-use crate::l2::frame;
+use crate::l2::retry;
 use crate::l3;
 use crate::parse::take;
 use crate::parse::take_array;
@@ -1370,12 +1369,9 @@ where
     W: SeWait,
 {
     // Encrypted_Session_Abt_Req body is empty. REQ_LEN = 0, RSP carries no data.
-    let n = frame::build_request(L2ReqId::EncryptedSessionAbt as u8, &[], l2)?;
-    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
-    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
-    let resp = frame::parse_response(&l2[..frame_len])?;
+    let resp = retry::exchange(spi, wait, l2, L2ReqId::EncryptedSessionAbt as u8, &[])?;
     // A successful abort is acknowledged with an empty RequestOk frame.
-    if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+    if !matches!(resp.status, L2Status::RequestOk) || resp.data_len != 0
     {
         return Err(SeError::L2(L2Error::BadFrame));
     }

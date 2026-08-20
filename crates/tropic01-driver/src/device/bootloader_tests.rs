@@ -225,6 +225,57 @@ fn mutable_fw_update_data_surfaces_gen_err_recoverably()
     );
 }
 
+// CRC recovery across the firmware-update path (0xB0 / 0xB1)
+#[test]
+fn mutable_fw_update_recovers_from_a_crc_fault_with_a_resend()
+{
+    let mut spi = FwUpdateSpi::new();
+    spi.set_crc_fault_on(L2ReqId::MutableFwUpdate as u8);
+    let dev = Tropic01::new(spi, MockWait::new());
+    let mut bl = dev.enter_bootloader().map_err(|(_, e)| e).unwrap();
+    bl.mutable_fw_update(&golden_b0_reqdata()).unwrap();
+    assert_eq!(bl.spi_ref().resend_request_count(), 1);
+    assert_eq!
+    (
+        bl.spi_ref().req_ids(),
+        std::vec![
+            L2ReqId::Startup as u8,
+            L2ReqId::MutableFwUpdate as u8,
+            L2ReqId::Resend as u8
+        ]
+    );
+}
+
+#[test]
+fn mutable_fw_update_data_recovers_from_a_crc_fault_with_a_resend()
+{
+    let mut spi = FwUpdateSpi::new();
+    spi.set_crc_fault_on(L2ReqId::MutableFwUpdateData as u8);
+    let dev = Tropic01::new(spi, MockWait::new());
+    let mut bl = dev.enter_bootloader().map_err(|(_, e)| e).unwrap();
+    bl.mutable_fw_update_data(&golden_b1_reqdata()).unwrap();
+    assert_eq!(bl.spi_ref().resend_request_count(), 1);
+    assert_eq!
+    (
+        bl.spi_ref().req_ids(),
+        std::vec![
+            L2ReqId::Startup as u8,
+            L2ReqId::MutableFwUpdateData as u8,
+            L2ReqId::Resend as u8
+        ]
+    );
+}
+
+#[test]
+fn a_clean_update_path_asks_for_no_resend()
+{
+    let dev = Tropic01::new(FwUpdateSpi::new(), MockWait::new());
+    let mut bl = dev.enter_bootloader().map_err(|(_, e)| e).unwrap();
+    bl.mutable_fw_update(&golden_b0_reqdata()).unwrap();
+    bl.mutable_fw_update_data(&golden_b1_reqdata()).unwrap();
+    assert_eq!(bl.spi_ref().resend_request_count(), 0);
+}
+
 // fw_bank_into (Get_Info FW_BANK, Start-up only)
 
 #[test]
@@ -559,7 +610,7 @@ fn nosession_update_firmware_demotes_when_recovery_exit_also_fails()
     // too. The handle is still relabeled NoSession, carrying the original error.
     let mut spi = FwUpdateSpi::new();
     spi.fail_nth_b0(1);
-    spi.fail_nth_b3(2); // enter is B3 #1 (ok); the recovery exit is B3 #2.
+    spi.fail_nth_b3(2); // enter is B3 #1 (ok), the recovery exit is B3 #2.
     let dev = Tropic01::new(spi, MockWait::new());
     let cpu = small_image();
     let spect = small_image();

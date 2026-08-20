@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "tropic01-driver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "ecdsa",

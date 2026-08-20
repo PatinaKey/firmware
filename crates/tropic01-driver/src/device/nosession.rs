@@ -22,6 +22,7 @@ use crate::ids::L2Status;
 use crate::ids::ObjectId;
 use crate::l1;
 use crate::l2::frame;
+use crate::l2::retry;
 use crate::session::SessionKeys;
 use crate::wait::SeWait;
 
@@ -95,7 +96,7 @@ where
     /// exactly as reading the device certificate to obtain STPUB does.
     ///
     /// A non-OK chip status surfaces as `SeError::L2(L2Error::Status(_))` via
-    /// `parse_response` and is recoverable by nature (no session state). A
+    /// the response parser and is recoverable by nature (no session state). A
     /// continuation status (`*Cont`) is anomalous for a single-frame `Get_Info`
     /// reply and is rejected as `L2Error::BadFrame`. `out` too small for the
     /// RSP_DATA returns `SeError::BufferTooSmall`.
@@ -336,13 +337,16 @@ where
     {
         // Sleep_Req body = SLEEP_KIND(1). REQ_LEN = 1, RSP carries no data.
         let body = [SLEEP_KIND_SLEEP_MODE];
-        let n = frame::build_request(L2ReqId::Sleep as u8, &body, &mut self.l2)?;
-        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
-        let frame_len =
-            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
-        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        let ack = retry::exchange
+        (
+            &mut self.spi,
+            &mut self.wait,
+            &mut self.l2,
+            L2ReqId::Sleep as u8,
+            &body,
+        )?;
         // A successful Sleep_Req is acknowledged with an empty RequestOk frame.
-        if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+        if !matches!(ack.status, L2Status::RequestOk) || ack.data_len != 0
         {
             return Err(SeError::L2(L2Error::BadFrame));
         }
@@ -406,25 +410,30 @@ where
     pub fn get_log_into(&mut self, out: &mut [u8]) -> Result<usize, SeError>
     {
         // Get_Log_Req body is empty. REQ_LEN = 0.
-        let n = frame::build_request(L2ReqId::GetLog as u8, &[], &mut self.l2)?;
-        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
-        let frame_len =
-            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
-        let resp = frame::parse_response(&self.l2[..frame_len])?;
-        // parse_response maps a non-OK chip status to L2Error::Status, but it
-        // still returns the data-bearing continuation statuses. A Get_Log reply
-        // is a single RequestOk frame, so a *Cont (or any other accepted status)
-        // is anomalous here and is rejected as BadFrame, like get_info_block.
-        if !matches!(resp.status, L2Status::RequestOk)
+        let info = retry::exchange
+        (
+            &mut self.spi,
+            &mut self.wait,
+            &mut self.l2,
+            L2ReqId::GetLog as u8,
+            &[],
+        )?;
+        // The parser maps a non-OK chip status to L2Error::Status, but it still
+        // returns the data-bearing continuation statuses. A Get_Log reply is a
+        // single RequestOk frame, so a *Cont (or any other accepted status) is
+        // anomalous here and is rejected as BadFrame, like get_info_block.
+        if !matches!(info.status, L2Status::RequestOk)
         {
             return Err(SeError::L2(L2Error::BadFrame));
         }
-        if out.len() < resp.data.len()
+        let data = frame::rsp_data(&self.l2, &info)?;
+        if out.len() < data.len()
         {
             return Err(SeError::BufferTooSmall);
         }
-        out[..resp.data.len()].copy_from_slice(resp.data);
-        Ok(resp.data.len())
+        let dest = out.get_mut(..data.len()).ok_or(SeError::BufferTooSmall)?;
+        dest.copy_from_slice(data);
+        Ok(data.len())
     }
 }
 
@@ -557,17 +566,14 @@ where
     let mut body = [0u8; 33];
     body[..32].copy_from_slice(ehpub);
     body[32] = cfg.pkey_index;
-    let n = frame::build_request(L2ReqId::Handshake as u8, &body, l2)?;
-    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
-    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
-    let resp = frame::parse_response(&l2[..frame_len])?;
+    let info = retry::exchange(spi, wait, l2, L2ReqId::Handshake as u8, &body)?;
     // The handshake response is a single, complete frame. A continuation status
     // (`*Cont`) is anomalous here and must not be accepted.
-    if matches!(resp.status, L2Status::RequestCont | L2Status::ResultCont)
+    if matches!(info.status, L2Status::RequestCont | L2Status::ResultCont)
     {
         return Err(SeError::L2(L2Error::BadFrame));
     }
-    let (etpub, t_tauth) = parse_handshake_resp(resp.data)?;
+    let (etpub, t_tauth) = parse_handshake_resp(frame::rsp_data(l2, &info)?)?;
     let keys = handshake::run
     (
         cfg.ehpriv,
@@ -613,15 +619,13 @@ where
 {
     // Startup_Req body = STARTUP_ID(1). REQ_LEN = 1, RSP carries no data.
     let body = [startup_id.wire_byte()];
-    let n = frame::build_request(L2ReqId::Startup as u8, &body, l2)?;
-    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
-    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
-    // The Startup_Req response uses the errata-tolerant parser (see
-    // parse_startup_response): the reset can corrupt the second RSP_CRC byte, so
-    // only the first is validated here. Every other L2 response stays full-CRC.
-    let resp = frame::parse_startup_response(&l2[..frame_len])?;
+    // The Startup_Req response uses the errata-tolerant CRC rule (see
+    // frame::parse_startup_response): the reset can corrupt the second RSP_CRC
+    // byte, so only the first is validated. Every other L2 response stays
+    // full-CRC.
+    let ack = retry::exchange_startup(spi, wait, l2, L2ReqId::Startup as u8, &body)?;
     // A successful Startup_Req is acknowledged with an empty RequestOk frame.
-    if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+    if !matches!(ack.status, L2Status::RequestOk) || ack.data_len != 0
     {
         return Err(SeError::L2(L2Error::BadFrame));
     }
@@ -652,7 +656,7 @@ where
 /// # Errors
 ///
 /// A non-OK chip status surfaces as `SeError::L2(L2Error::Status(_))` via
-/// `parse_response` and is recoverable by nature (no session state). A
+/// the response parser and is recoverable by nature (no session state). A
 /// continuation status (`*Cont`) is anomalous for a single-frame `Get_Info`
 /// reply and is rejected as `L2Error::BadFrame`. `out` too small for the
 /// RSP_DATA returns `SeError::BufferTooSmall`. Otherwise `SeError` on a bus
@@ -673,21 +677,20 @@ where
 {
     // Get_Info_Req body = OBJECT_ID(1) || BLOCK_INDEX(1). REQ_LEN = 2.
     let body = [object_id as u8, block_index];
-    let n = frame::build_request(L2ReqId::GetInfo as u8, &body, l2)?;
-    l1::send_request(spi, &l2[..n]).map_err(L2Error::from)?;
-    let frame_len = l1::read_response(spi, wait, l2).map_err(L2Error::from)?;
-    let resp = frame::parse_response(&l2[..frame_len])?;
+    let info = retry::exchange(spi, wait, l2, L2ReqId::GetInfo as u8, &body)?;
     // A Get_Info reply fits one L2 chunk (RSP_DATA <= 128), so only a single
     // RequestOk frame is expected. *Cont (or any other accepted status) is a
     // malformed reply for this command.
-    if !matches!(resp.status, L2Status::RequestOk)
+    if !matches!(info.status, L2Status::RequestOk)
     {
         return Err(SeError::L2(L2Error::BadFrame));
     }
-    if out.len() < resp.data.len()
+    let data = frame::rsp_data(l2, &info)?;
+    if out.len() < data.len()
     {
         return Err(SeError::BufferTooSmall);
     }
-    out[..resp.data.len()].copy_from_slice(resp.data);
-    Ok(resp.data.len())
+    let dest = out.get_mut(..data.len()).ok_or(SeError::BufferTooSmall)?;
+    dest.copy_from_slice(data);
+    Ok(data.len())
 }

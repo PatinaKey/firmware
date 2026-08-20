@@ -245,8 +245,14 @@ pub(crate) enum ChipFault
     BadResultTag,
     /// Return an L2 TAG_ERR status instead of the result.
     L2TagErr,
-    /// Corrupt the result frame CRC.
+    /// Corrupt the result frame CRC on every delivery (a permanent fault).
     L2CrcErr,
+    /// Corrupt the result frame CRC on the first delivery only.
+    L2CrcErrOnce,
+    /// Answer the first encrypted-command chunk with STATUS = CRC_ERR.
+    L2ChipCrcErrOnce,
+    /// Answer a `Resend_Req` with the wrong result chunk.
+    ResendWrongChunk,
     /// Raise the CHIP_STATUS ALARM bit on the result read.
     Alarm,
     /// Seal a valid result whose RESULT status is FAIL (recoverable).
@@ -328,6 +334,10 @@ pub(crate) enum GetInfoFault
     /// Queue no response (the read path then sees STATUS = 0xFF, the NO_RESP
     /// sentinel).
     NoResp,
+    /// Reply with STATUS = CRC_ERR once, then serve the object faithfully.
+    CrcErrStatusOnce,
+    /// Corrupt the reply frame CRC once, then serve the object faithfully.
+    BadCrcOnce,
     /// Reply with a valid-CRC frame carrying a RequestCont (more-chunks) status.
     ///
     /// A single-frame Get_Info reply must be RequestOk. A *Cont status is a
@@ -340,6 +350,8 @@ pub(crate) enum GetInfoFault
 enum Pending
 {
     Frame(Vec<u8>),
+    /// A frame whose last RSP_CRC byte is flipped on this delivery only.
+    CorruptOnce(Vec<u8>),
     Alarm,
 }
 
@@ -411,6 +423,10 @@ pub(crate) struct ChipMockSpi
     get_info_objects: BTreeMap<(u8, u8), Vec<u8>>,
     get_info_fault: GetInfoFault,
     last_cmd: Vec<u8>,
+    resend_frame: Option<Vec<u8>>,
+    wrong_resend_frame: Option<Vec<u8>>,
+    once_fault_used: bool,
+    resend_requests: usize,
 }
 
 impl ChipMockSpi
@@ -450,7 +466,17 @@ impl ChipMockSpi
             last_cmd: Vec::new(),
             get_info_objects: BTreeMap::new(),
             get_info_fault: GetInfoFault::None,
+            resend_frame: None,
+            wrong_resend_frame: None,
+            once_fault_used: false,
+            resend_requests: 0,
         }
+    }
+
+    /// How many `Resend_Req` frames the mock has received.
+    pub(crate) fn resend_request_count(&self) -> usize
+    {
+        self.resend_requests
     }
 
     /// Sets the RSP_DATA the mock returns for `Get_Info(object_id, block_index)`.
@@ -581,48 +607,93 @@ impl ChipMockSpi
         }
         else if id == L2ReqId::Handshake as u8
         {
-            let mut body = Vec::with_capacity(48);
-            body.extend_from_slice(&self.etpub);
-            body.extend_from_slice(&self.t_tauth);
-            self.pending
-                .push_back(Pending::Frame(Self::frame(L2Status::ResultOk as u8, &body)));
+            self.handle_handshake();
+        }
+        else if id == L2ReqId::Resend as u8
+        {
+            self.handle_resend();
         }
         else if id == L2ReqId::EncryptedCmd as u8
         {
-            // The real chip caps each request chunk at L2_CHUNK_MAX_DATA. A
-            // driver that sent an over-large chunk would split the wire packet
-            // wrong, so reject it here and fail the round-trip. This makes the
-            // multi-chunk send path prove chunk-cap compliance, not just byte
-            // reassembly.
-            if len > crate::buf::L2_CHUNK_MAX_DATA
-            {
-                self.pending
-                    .push_back(Pending::Frame(Self::frame(L2Status::GenErr as u8, &[])));
-                self.accum.clear();
-                return;
-            }
-            self.accum.extend_from_slice(data);
-            // Need the 2-byte CMD_SIZE before completeness can be judged.
-            if self.accum.len() < 2
-            {
-                self.pending
-                    .push_back(Pending::Frame(Self::frame(L2Status::RequestCont as u8, &[])));
-                return;
-            }
-            let cmd_size = u16::from_le_bytes([self.accum[0], self.accum[1]]) as usize;
-            let total = 2 + cmd_size + 16;
-            if self.accum.len() < total
-            {
-                self.pending
-                    .push_back(Pending::Frame(Self::frame(L2Status::RequestCont as u8, &[])));
-                return;
-            }
-            // Final chunk: ack, then produce the result.
-            self.pending
-                .push_back(Pending::Frame(Self::frame(L2Status::RequestOk as u8, &[])));
-            self.produce_result(cmd_size);
-            self.accum.clear();
+            self.handle_encrypted_cmd(len, data);
         }
+    }
+
+    /// Queues the `Handshake` reply `ETPUB || T_TAUTH` in a single OK frame.
+    fn handle_handshake(&mut self)
+    {
+        let mut body = Vec::with_capacity(48);
+        body.extend_from_slice(&self.etpub);
+        body.extend_from_slice(&self.t_tauth);
+        self.pending
+            .push_back(Pending::Frame(Self::frame(L2Status::ResultOk as u8, &body)));
+    }
+
+    /// Replays the buffered frames for a `Resend_Req` and counts the request.
+    ///
+    /// The wrong-chunk frame is queued last so it reaches the host first, which
+    /// is what the `ResendWrongChunk` fault models.
+    fn handle_resend(&mut self)
+    {
+        self.resend_requests += 1;
+        if let Some(f) = self.resend_frame.clone()
+        {
+            self.pending.push_front(Pending::Frame(f));
+        }
+        if let Some(w) = self.wrong_resend_frame.take()
+        {
+            self.pending.push_front(Pending::Frame(w));
+        }
+    }
+
+    /// Accumulates one `Encrypted_Cmd_Req` chunk and answers it.
+    ///
+    /// `len` is the frame LEN field, `data` its REQ_DATA. Replies RequestCont
+    /// while the command is incomplete, then RequestOk on the final chunk before
+    /// producing the result. Rejects an over-long chunk and the injected chip-side
+    /// CRC error.
+    fn handle_encrypted_cmd(&mut self, len: usize, data: &[u8])
+    {
+        if self.fault == ChipFault::L2ChipCrcErrOnce && !self.once_fault_used
+        {
+            self.once_fault_used = true;
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::CrcErr as u8, &[])));
+            return;
+        }
+        // The real chip caps each request chunk at L2_CHUNK_MAX_DATA. A
+        // driver that sent an over-large chunk would split the wire packet
+        // wrong, so reject it here and fail the round-trip. This makes the
+        // multi-chunk send path prove chunk-cap compliance, not just byte
+        // reassembly.
+        if len > crate::buf::L2_CHUNK_MAX_DATA
+        {
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::GenErr as u8, &[])));
+            self.accum.clear();
+            return;
+        }
+        self.accum.extend_from_slice(data);
+        // Need the 2-byte CMD_SIZE before completeness can be judged.
+        if self.accum.len() < 2
+        {
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::RequestCont as u8, &[])));
+            return;
+        }
+        let cmd_size = u16::from_le_bytes([self.accum[0], self.accum[1]]) as usize;
+        let total = 2 + cmd_size + 16;
+        if self.accum.len() < total
+        {
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::RequestCont as u8, &[])));
+            return;
+        }
+        // Final chunk: ack, then produce the result.
+        self.pending
+            .push_back(Pending::Frame(Self::frame(L2Status::RequestOk as u8, &[])));
+        self.produce_result(cmd_size);
+        self.accum.clear();
     }
 
     /// Queues the `Get_Info` reply for `(object_id, block_index)`.
@@ -640,6 +711,13 @@ impl ChipMockSpi
         {
             self.pending
                 .push_back(Pending::Frame(Self::frame(L2Status::UnknownErr as u8, &[])));
+            return;
+        }
+        if self.get_info_fault == GetInfoFault::CrcErrStatusOnce && !self.once_fault_used
+        {
+            self.once_fault_used = true;
+            self.pending
+                .push_back(Pending::Frame(Self::frame(L2Status::CrcErr as u8, &[])));
             return;
         }
         if self.get_info_fault == GetInfoFault::ContStatus
@@ -669,6 +747,12 @@ impl ChipMockSpi
         {
             let idx = f.len() - 1;
             f[idx] ^= 0xFF;
+        }
+        if self.get_info_fault == GetInfoFault::BadCrcOnce && !self.once_fault_used
+        {
+            self.once_fault_used = true;
+            self.pending.push_back(Pending::CorruptOnce(f));
+            return;
         }
         self.pending.push_back(Pending::Frame(f));
     }
@@ -716,6 +800,9 @@ impl ChipMockSpi
             }
             ChipFault::None
             | ChipFault::L2CrcErr
+            | ChipFault::L2CrcErrOnce
+            | ChipFault::L2ChipCrcErrOnce
+            | ChipFault::ResendWrongChunk
             | ChipFault::ResultFail
             | ChipFault::ShortEcho
             | ChipFault::EmptyResult
@@ -756,26 +843,51 @@ impl ChipMockSpi
             let chunk_len = remaining.min(chunk_max);
             let chunk = &wire[offset..offset + chunk_len];
             offset += chunk_len;
+            // The first chunk ends exactly at its own length, the last one
+            // consumes the rest. A single-chunk result is both.
+            let first = offset == chunk_len;
             let last = offset >= wire.len();
-            let status = if last
-            {
-                L2Status::ResultOk as u8
-            }
-            else
-            {
-                L2Status::ResultCont as u8
-            };
-            let mut f = Self::frame(status, chunk);
-            if last && self.fault == ChipFault::L2CrcErr
-            {
-                let idx = f.len() - 1;
-                f[idx] ^= 0xFF;
-            }
-            self.pending.push_back(Pending::Frame(f));
+            self.push_one_result_frame(chunk, first, last);
             if last
             {
                 break;
             }
+        }
+    }
+
+    /// Queues one result chunk as an L2 frame, applying the CRC faults.
+    ///
+    /// `first` and `last` mark the chunk's position in the result. A non-final
+    /// chunk carries `ResultCont`, the final one `ResultOk`. `ResendWrongChunk`
+    /// keeps the first frame aside as the wrong replay, `L2CrcErr` corrupts the
+    /// final CRC outright, and the once-faults queue it for a single corruption.
+    fn push_one_result_frame(&mut self, chunk: &[u8], first: bool, last: bool)
+    {
+        let status = if last
+        {
+            L2Status::ResultOk as u8
+        }
+        else
+        {
+            L2Status::ResultCont as u8
+        };
+        let mut f = Self::frame(status, chunk);
+        if first && self.fault == ChipFault::ResendWrongChunk
+        {
+            self.wrong_resend_frame = Some(f.clone());
+        }
+        if last && self.fault == ChipFault::L2CrcErr
+        {
+            let idx = f.len() - 1;
+            f[idx] ^= 0xFF;
+        }
+        if last && matches!(self.fault, ChipFault::L2CrcErrOnce | ChipFault::ResendWrongChunk)
+        {
+            self.pending.push_back(Pending::CorruptOnce(f));
+        }
+        else
+        {
+            self.pending.push_back(Pending::Frame(f));
         }
     }
 
@@ -954,6 +1066,16 @@ impl ChipMockSpi
             {
                 status[0] = 0x01; // READY
                 out[..f.len()].copy_from_slice(&f);
+                self.resend_frame = Some(f);
+            }
+            Some(Pending::CorruptOnce(f)) =>
+            {
+                status[0] = 0x01; // READY
+                let mut bad = f.clone();
+                let idx = bad.len() - 1;
+                bad[idx] ^= 0xFF;
+                out[..bad.len()].copy_from_slice(&bad);
+                self.resend_frame = Some(f);
             }
             Some(Pending::Alarm) =>
             {
@@ -1091,6 +1213,131 @@ impl SpiDevice for ScriptedSpi
     }
 }
 
+/// How the CRC-retry double serves one scripted reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrcReply
+{
+    /// Serve the entry's frame verbatim.
+    Good,
+    /// Serve an empty STATUS = CRC_ERR frame: the chip rejected the request CRC.
+    ChipCrcErr,
+    /// Serve the entry's frame with its last RSP_CRC byte flipped.
+    HostCrcErr,
+    /// Serve the entry's frame with its first RSP_CRC byte flipped.
+    HostCrcErrFirstByte,
+    /// Serve an empty frame carrying the given STATUS byte.
+    Status(u8),
+}
+
+/// A `SpiDevice` that scripts one chip reply per read and records requests.
+pub(crate) struct CrcFaultSpi
+{
+    script: VecDeque<(CrcReply, Vec<u8>)>,
+    requests: Vec<Vec<u8>>,
+    reads: usize,
+}
+
+impl CrcFaultSpi
+{
+    /// Builds a double serving `script`, one entry per read, in order.
+    pub(crate) fn new(script: Vec<(CrcReply, Vec<u8>)>) -> Self
+    {
+        CrcFaultSpi
+        {
+            script: script.into_iter().collect(),
+            requests: Vec::new(),
+            reads: 0,
+        }
+    }
+
+    /// The full request frames the host wrote, in send order.
+    pub(crate) fn requests(&self) -> &[Vec<u8>]
+    {
+        &self.requests
+    }
+
+    /// The REQ_ID of every request the host wrote, in send order.
+    pub(crate) fn req_ids(&self) -> Vec<u8>
+    {
+        self.requests
+            .iter()
+            .filter_map(|r| r.first().copied())
+            .collect()
+    }
+
+    /// How many response reads the host performed.
+    pub(crate) fn reads(&self) -> usize
+    {
+        self.reads
+    }
+
+    /// Renders the next scripted entry into the bytes to clock back.
+    fn next_frame(&mut self) -> Vec<u8>
+    {
+        match self.script.pop_front()
+        {
+            Some((CrcReply::Good, frame)) => frame,
+            Some((CrcReply::ChipCrcErr, _)) => l2_frame(L2Status::CrcErr as u8, &[]),
+            Some((CrcReply::Status(s), _)) => l2_frame(s, &[]),
+            Some((CrcReply::HostCrcErr, mut frame)) =>
+            {
+                if let Some(last) = frame.last_mut()
+                {
+                    *last ^= 0xFF;
+                }
+                frame
+            }
+            Some((CrcReply::HostCrcErrFirstByte, mut frame)) =>
+            {
+                // The first CRC byte sits just before the second, at len - 2.
+                let n = frame.len();
+                if let Some(b) = n.checked_sub(2).and_then(|i| frame.get_mut(i))
+                {
+                    *b ^= 0xFF;
+                }
+                frame
+            }
+            // Script exhausted: the NO_RESP sentinel, so the host gives up
+            // rather than silently reusing a stale frame.
+            None => std::vec![0xFFu8],
+        }
+    }
+}
+
+impl ErrorType for CrcFaultSpi
+{
+    type Error = MockSpiError;
+}
+
+impl SpiDevice for CrcFaultSpi
+{
+    fn transaction
+    (
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    )
+    -> Result<(), Self::Error>
+    {
+        match operations
+        {
+            [Operation::Write(frame)] =>
+            {
+                self.requests.push(frame.to_vec());
+            }
+            [Operation::TransferInPlace(status), Operation::Read(out)] =>
+            {
+                self.reads += 1;
+                let f = self.next_frame();
+                status[0] = 0x01; // READY
+                out[..f.len()].copy_from_slice(&f);
+            }
+            _ =>
+            {}
+        }
+        Ok(())
+    }
+}
+
 /// A `SpiDevice` that records every written frame and replays scripted reads.
 ///
 /// Like `ScriptedSpi`, but it captures each MOSI `Write` so a test can assert
@@ -1193,7 +1440,10 @@ pub(crate) const FW_UPDATE_DEFAULT_VERSION: [u8; 4] = [0x00, 0x00, 0x00, 0x02];
 /// orchestration sequence. An optional `gen_err_on_nth_b0` makes the nth
 /// (1-based) 0xB0 reply a `GenErr`, to drive the failure-stop path. The bank
 /// header `ver`, its size, and the running version are configurable so a test
-/// can force a version mismatch or a wrong-size header.
+/// can force a version mismatch or a wrong-size header. It also answers a
+/// `Resend_Req` (0x10) by re-delivering the last frame in its clean form, and
+/// `set_crc_fault_on` corrupts one reply's RSP_CRC, so the L2 CRC-retry seam can
+/// be exercised across the firmware-update path.
 pub(crate) struct FwUpdateSpi
 {
     requests: Vec<(u8, Vec<u8>)>,
@@ -1206,6 +1456,16 @@ pub(crate) struct FwUpdateSpi
     bank_version: [u8; 4],
     bank_header_len: usize,
     last_startup_id: u8,
+    /// REQ_ID whose NEXT reply is delivered with a flipped RSP_CRC byte.
+    crc_fault_on: Option<u8>,
+    /// Whether the next read must corrupt the frame it delivers.
+    corrupt_next_read: bool,
+    /// The last frame actually delivered on a read, in its clean form.
+    ///
+    /// A `Resend_Req` re-queues this, which is what the chip does.
+    resend_frame: Option<Vec<u8>>,
+    /// Number of `Resend_Req` frames the mock has received.
+    resend_requests: usize,
 }
 
 impl FwUpdateSpi
@@ -1229,7 +1489,23 @@ impl FwUpdateSpi
             bank_header_len: 52,
             // Set on each Startup_Req: drives the post-reboot mode poll.
             last_startup_id: 0,
+            crc_fault_on: None,
+            corrupt_next_read: false,
+            resend_frame: None,
+            resend_requests: 0,
         }
+    }
+
+    /// Corrupts the RSP_CRC of the next reply to a request with id `req_id`.
+    pub(crate) fn set_crc_fault_on(&mut self, req_id: u8)
+    {
+        self.crc_fault_on = Some(req_id);
+    }
+
+    /// How many `Resend_Req` frames the mock has received.
+    pub(crate) fn resend_request_count(&self) -> usize
+    {
+        self.resend_requests
     }
 
     /// Makes the nth (1-based) `Mutable_FW_Update` (0xB0) reply a `GenErr`.
@@ -1384,8 +1660,22 @@ impl FwUpdateSpi
             {
                 self.handle_get_info(&data);
             }
+            Ok(L2ReqId::Resend) =>
+            {
+                self.resend_requests += 1;
+                if let Some(f) = self.resend_frame.clone()
+                {
+                    self.pending.push_front(f);
+                }
+            }
             _ =>
             {}
+        }
+        // Arm the one-shot RSP_CRC corruption for the reply just queued.
+        if self.crc_fault_on == Some(id)
+        {
+            self.crc_fault_on = None;
+            self.corrupt_next_read = true;
         }
     }
 
@@ -1397,7 +1687,17 @@ impl FwUpdateSpi
             Some(f) =>
             {
                 status[0] = 0x01; // READY
-                out[..f.len()].copy_from_slice(&f);
+                self.resend_frame = Some(f.clone());
+                let mut delivered = f;
+                if self.corrupt_next_read
+                {
+                    self.corrupt_next_read = false;
+                    if let Some(last) = delivered.last_mut()
+                    {
+                        *last ^= 0xFF;
+                    }
+                }
+                out[..delivered.len()].copy_from_slice(&delivered);
             }
             None =>
             {

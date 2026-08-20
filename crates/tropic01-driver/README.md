@@ -73,6 +73,12 @@ Written as a clean-room rewrite with the official C SDK
 [`libtropic`](https://github.com/tropicsquare/libtropic) used as a differential
 **test oracle** (never linked : no C, no mbedTLS in the trusted computing base).
 
+Protocol behaviour tracks **libtropic v4.1.0** (TROPIC01 Application FW 1.0.0 to
+2.1.0, SPECT FW 1.0.0 to 1.3.0, bootloader 1.0.1 to 2.0.1). One deviation is
+deliberate and stricter than upstream: a single CRC-retry budget covers a whole
+chunked L3 packet, where libtropic refills its budget on every successful chunk
+and so lets the worst case grow with message length.
+
 > **Status: under active development.** The secure channel and the cryptographic
 > hot-path commands are tested host-side three ways: an in-repo chip mock (incl.
 > fault injection), a libtropic-derived handshake KAT, and a **live end-to-end
@@ -110,7 +116,7 @@ pairing-slot index) is **caller-provided** via `SessionConfig`. The driver hardc
 
 | Area | What works |
 |------|------------|
-| Transport | L1 SPI, L2 framing + multi-chunk reassembly |
+| Transport | L1 SPI, L2 framing + multi-chunk reassembly, and CRC-fault recovery: a chip-reported CRC error replays the identical request (the chip ignored the frame, so it never ran), while a locally detected bad CRC on a response asks for a `Resend_Req` and never replays (the request may already have run) |
 | Secure channel | Noise KK1 handshake, `open_session` / `close_session`, `abort_session` (Encrypted_Session_Abt_Req 0x08: notifies the chip to drop the session, wipes host secrets first), session teardown gate |
 | Mode control | `reboot` (Startup_Req 0xB3: Start-up / Maintenance / Application FW), `sleep` (Sleep_Req 0x20), `chip_mode` (decodes CHIP_STATUS to Application / Startup / Alarm) |
 | Chip info (L2) | `Get_Info`: `x509_certificate_into` (raw cert store), `chip_id_into`, `riscv_fw_version`, `spect_fw_version`, `fw_bank_into` - read before a session, no secure channel |

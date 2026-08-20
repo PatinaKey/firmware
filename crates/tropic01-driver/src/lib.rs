@@ -22,6 +22,25 @@
 //! the libFuzzer harnesses. `model-itest` compiles the live integration tests
 //! that run against the official TROPIC01 emulator.
 //!
+//! # Error-path latency
+//!
+//! Every L2 exchange runs through a CRC-retry seam. A CRC fault buys up to 3
+//! extra round-trips, and each round-trip owns a full chip-response poll budget
+//! of 50 polls spaced 25 ms apart. One exchange is therefore bounded by
+//! `(1 + 3) * 50 * 25 = 5000 ms`, against 1250 ms for a single budget. That
+//! 4-budget shape is the chip answering just before each budget expires. A chip
+//! that goes silent after one corrupt frame is cheaper, 2 budgets and 2500 ms,
+//! because the first unanswered budget ends the retry loop. Both shapes are
+//! reachable, so 5000 ms is the number to size against. The success path is
+//! untouched: one request, one read.
+//!
+//! That bound is PER EXCHANGE, not per call. A call built from N L2 exchanges
+//! multiplies it. Reading the X.509 store is 30 `Get_Info` blocks. A firmware
+//! image is relayed as one `Mutable_FW_Update` plus one `Mutable_FW_Update_Data`
+//! per chunk, so its worst case grows linearly with the image size. An
+//! integrator sizing a transport deadline, a USB stack for instance, sizes it on
+//! the number of exchanges the call makes, not on the call.
+//!
 //! # Example
 //!
 //! Open a secure channel and run one L3 command. The chip wiring (the SPI bus

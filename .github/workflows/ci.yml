@@ -47,8 +47,8 @@ env:
   # Official libtropic, pinned to a release tag and its commit. Shared by the
   # coverage job (the TROPIC01 model config and venv layout) and the embedded
   # job (the se-fw-update vendor blobs).
-  LIBTROPIC_REF: v4.0.0
-  LIBTROPIC_SHA: 756c8ee898ed61b12272ecb22b213edf97aab751
+  LIBTROPIC_REF: v4.1.0
+  LIBTROPIC_SHA: 0aa7e8873f08b0727138b7887b942268afca468a
 
 jobs:
   # Job 1: Host check and lint (whole workspace on the host)
@@ -160,15 +160,15 @@ jobs:
             echo "libtropic $LIBTROPIC_REF moved: expected $LIBTROPIC_SHA, got $got" >&2
             exit 1
           fi
-          cpu="$(find "$src" -name 'fw_v2.0.0.hex32_signed_chunks.bin' | head -1)"
-          spect="$(find "$src" -name 'spect_app-v1.0.0_signed_chunks.bin' | head -1)"
+          cpu="$(find "$src" -name 'fw_v2.1.0.hex32_signed_chunks.bin' | head -1)"
+          spect="$(find "$src" -name 'spect_app-v1.3.0_signed_chunks.bin' | head -1)"
           if [ -z "$cpu" ] || [ -z "$spect" ]; then
             echo "vendor firmware blobs not found in libtropic $LIBTROPIC_REF" >&2
             exit 1
           fi
           mkdir -p crates/secure/fw_blobs
-          cp "$cpu" crates/secure/fw_blobs/cpu_fw_2_0_0.bin
-          cp "$spect" crates/secure/fw_blobs/spect_fw_1_0_0.bin
+          cp "$cpu" crates/secure/fw_blobs/cpu_fw_2_1_0.bin
+          cp "$spect" crates/secure/fw_blobs/spect_fw_1_3_0.bin
 
       - name: Two-stage TrustZone build
         run: |

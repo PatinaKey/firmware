@@ -100,7 +100,7 @@ mod firmware
     #[cfg(feature = "se-fw-update")]
     const FWU_ERR: u32 = 1 << 31;
     /// Fw-update word bit set when the update succeeded. The low byte carries the
-    /// updated-to-2.0.0 marker.
+    /// updated-to-2.1.0 marker.
     #[cfg(feature = "se-fw-update")]
     const FWU_OK: u32 = 1 << 8;
 
@@ -343,7 +343,7 @@ mod firmware
             };
             defmt::info!
             (
-                "SE fw-update OK (updated to 2.0.0), marker {=u8:#04x}, \
+                "SE fw-update OK (updated to 2.1.0), marker {=u8:#04x}, \
                  RISC-V now {=u32:#010x}, SPECT now {=u32:#010x}",
                 fwu as u8,
                 new_riscv,
