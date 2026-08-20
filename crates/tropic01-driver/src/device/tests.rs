@@ -112,9 +112,29 @@ fn reboot_still_rejects_corrupt_first_crc_byte()
     let mut ack = l2_frame(L2Status::RequestOk as u8, &[]);
     let first = ack.len() - 2;
     ack[first] ^= 0xFF; // corrupt the first (high) CRC byte
-    let acks = std::vec![ack];
+    let acks = std::vec![ack; 8];
     let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
     assert_eq!(dev.reboot(StartupId::Reboot), Err(SeError::L2(L2Error::Crc)));
+}
+
+#[test]
+fn reboot_on_a_silent_chip_reports_chip_busy()
+{
+    // One corrupt ack, then nothing, because the chip is
+    // in reset and no longer answers.
+    let mut ack = l2_frame(L2Status::RequestOk as u8, &[]);
+    let first = ack.len() - 2;
+    ack[first] ^= 0xFF; // corrupt the first (high) CRC byte
+    let acks = std::vec![ack];
+    let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
+    assert_eq!(
+        dev.reboot(StartupId::Reboot),
+        Err(SeError::L2(L2Error::L1(L1Error::ChipBusy)))
+    );
+    // Exactly one Resend_Req followed the Startup_Req.
+    let writes = dev.spi_ref().writes();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[1].first().copied(), Some(L2ReqId::Resend as u8));
 }
 
 #[test]
@@ -185,7 +205,7 @@ fn sleep_succeeds_on_empty_request_ok_ack()
 fn sleep_disabled_is_recoverable()
 {
     // CFG_SLEEP_MODE off: the chip replies RespDisabled. No session exists, so
-    // this surfaces via parse_response as a recoverable L2 status error.
+    // this surfaces via the response parser as a recoverable L2 status error.
     let acks = std::vec![l2_frame(L2Status::RespDisabled as u8, &[])];
     let mut dev = Tropic01::new(RecordingSpi::new(acks), MockWait::new());
     assert_eq!(dev.sleep(), Err(SeError::L2(L2Error::Status(L2Status::RespDisabled))));
@@ -461,6 +481,95 @@ fn l2_crc_err_poisons_session()
     let mut dev = open(ChipFault::L2CrcErr);
     let mut out = [0u8; 16];
     assert_eq!(dev.ping_into(b"hi", &mut out), Err(SeError::L2(L2Error::Crc)));
+    assert_session_lost_and_quiet(&mut dev);
+}
+
+#[test]
+fn transient_result_crc_error_is_recovered_by_a_resend()
+{
+    let mut dev = open(ChipFault::L2CrcErrOnce);
+    let mut out = [0u8; 16];
+    assert_eq!(dev.ping_into(b"hi", &mut out), Ok(2));
+    assert_eq!(&out[..2], b"hi");
+    assert_eq!(dev.spi_ref().resend_request_count(), 1);
+    assert_eq!(dev.spi_ref().nonces(), (1, 1));
+    assert_eq!(dev.ping_into(b"ok", &mut out), Ok(2));
+    assert_eq!(dev.spi_ref().nonces(), (2, 2));
+}
+
+#[test]
+fn transient_chip_crc_error_replays_the_identical_chunk()
+{
+    let mut dev = open(ChipFault::L2ChipCrcErrOnce);
+    let mut out = [0u8; 16];
+    assert_eq!(dev.ping_into(b"hi", &mut out), Ok(2));
+    assert_eq!(&out[..2], b"hi");
+    assert_eq!(dev.spi_ref().resend_request_count(), 0);
+    assert_eq!(dev.spi_ref().nonces(), (1, 1));
+}
+
+#[test]
+fn transient_chip_crc_error_replays_a_plain_l2_request()
+{
+    let mut dev = Tropic01::new
+    (
+        ChipMockSpi::new
+        (
+            vectors::KCMD,
+            vectors::KRES,
+            vectors::ETPUB,
+            vectors::T_TAUTH,
+            ChipFault::None,
+        ),
+        MockWait::new(),
+    );
+    let payload = [0x5Au8; 128];
+    dev.spi_mut()
+        .set_get_info(ObjectId::ChipId as u8, 0, &payload);
+    dev.spi_mut().set_get_info_fault(GetInfoFault::CrcErrStatusOnce);
+    let mut out = [0u8; 128];
+    assert_eq!(dev.chip_id_into(&mut out), Ok(128));
+    assert_eq!(out, payload);
+    assert_eq!(dev.spi_ref().resend_request_count(), 0);
+}
+
+#[test]
+fn transient_local_crc_error_resends_a_plain_l2_response()
+{
+    let mut dev = Tropic01::new
+    (
+        ChipMockSpi::new
+        (
+            vectors::KCMD,
+            vectors::KRES,
+            vectors::ETPUB,
+            vectors::T_TAUTH,
+            ChipFault::None,
+        ),
+        MockWait::new(),
+    );
+    let payload = [0xA5u8; 128];
+    dev.spi_mut()
+        .set_get_info(ObjectId::ChipId as u8, 0, &payload);
+    dev.spi_mut().set_get_info_fault(GetInfoFault::BadCrcOnce);
+    let mut out = [0u8; 128];
+    assert_eq!(dev.chip_id_into(&mut out), Ok(128));
+    assert_eq!(out, payload);
+    assert_eq!(dev.spi_ref().resend_request_count(), 1);
+}
+
+#[test]
+fn resend_returning_the_wrong_chunk_fails_closed_on_the_length_check()
+{
+    let mut dev = open(ChipFault::ResendWrongChunk);
+    let msg = [0x5Au8; 300];
+    let mut out = [0u8; 300];
+    assert_eq!
+    (
+        dev.ping_into(&msg, &mut out),
+        Err(SeError::L3(L3Error::Oversize))
+    );
+    assert_eq!(dev.spi_ref().resend_request_count(), 1);
     assert_session_lost_and_quiet(&mut dev);
 }
 
@@ -2207,7 +2316,7 @@ fn abort_session_bad_ack_still_wipes_and_returns_no_session()
 #[test]
 fn abort_session_chip_status_error_still_wipes_and_returns_no_session()
 {
-    // The chip replies a non-OK status: parse_response returns Err via `?`, a
+    // The chip replies a non-OK status: the parser returns Err via `?`, a
     // different failure path than the explicit ack check. The teardown still runs
     // (it precedes the notify), so the buffers all read zero.
     let acks = std::vec![l2_frame(L2Status::GenErr as u8, &[])];
@@ -3287,7 +3396,7 @@ fn get_info_error_status_is_recoverable()
     let mut dev = no_session(GetInfoFault::ErrorStatus);
     dev.spi_mut().set_get_info(ObjectId::ChipId as u8, 0, &[0u8; 128]);
     let mut out = [0u8; 128];
-    // An L2 error status surfaces via parse_response, no session state.
+    // An L2 error status surfaces via the response parser, no session state.
     assert_eq!(
         dev.chip_id_into(&mut out),
         Err(SeError::L2(L2Error::Status(L2Status::UnknownErr)))

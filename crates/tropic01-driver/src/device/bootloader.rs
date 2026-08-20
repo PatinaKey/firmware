@@ -31,8 +31,7 @@ use crate::error::SeError;
 use crate::ids::L2ReqId;
 use crate::ids::L2Status;
 use crate::ids::ObjectId;
-use crate::l1;
-use crate::l2::frame;
+use crate::l2::retry;
 use crate::parse::take;
 use crate::parse::take_le_u32;
 use crate::parse::take_u8;
@@ -410,10 +409,6 @@ where
     /// auto-selects and erases the target bank. Available only in Start-up
     /// (Maintenance) Mode.
     ///
-    /// FAITHFUL TRANSPORT: the driver validates only `header.len() == 104`. It
-    /// does not parse any field. The chip's signature check validates the
-    /// payload.
-    ///
     /// # Errors
     ///
     /// `SeError::InvalidArgument` when `header` is not exactly 104 bytes
@@ -428,13 +423,16 @@ where
         {
             return Err(SeError::InvalidArgument);
         }
-        let n = frame::build_request(L2ReqId::MutableFwUpdate as u8, header, &mut self.l2)?;
-        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
-        let frame_len =
-            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
-        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        let resp = retry::exchange
+        (
+            &mut self.spi,
+            &mut self.wait,
+            &mut self.l2,
+            L2ReqId::MutableFwUpdate as u8,
+            header,
+        )?;
         // A successful 0xB0 is acknowledged with an empty RequestOk frame.
-        if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+        if !matches!(resp.status, L2Status::RequestOk) || resp.data_len != 0
         {
             return Err(SeError::L2(L2Error::BadFrame));
         }
@@ -446,12 +444,6 @@ where
     /// `chunk` is the 0xB1 REQ_DATA (`hash[32]` of the next chunk, 32 zero bytes
     /// on the last chunk, || `offset[2]` || data), relayed verbatim. Available
     /// only in Start-up (Maintenance) Mode.
-    ///
-    /// FAITHFUL TRANSPORT: the driver validates only the length bounds. It does
-    /// NOT enforce the data field's documented 4-byte alignment: that is a
-    /// payload-semantics rule the chip's own signature already covers, and
-    /// enforcing it here would parse the image, breaking the pure-transport
-    /// contract.
     ///
     /// # Errors
     ///
@@ -467,13 +459,16 @@ where
         {
             return Err(SeError::InvalidArgument);
         }
-        let n = frame::build_request(L2ReqId::MutableFwUpdateData as u8, chunk, &mut self.l2)?;
-        l1::send_request(&mut self.spi, &self.l2[..n]).map_err(L2Error::from)?;
-        let frame_len =
-            l1::read_response(&mut self.spi, &mut self.wait, &mut self.l2).map_err(L2Error::from)?;
-        let resp = frame::parse_response(&self.l2[..frame_len])?;
+        let resp = retry::exchange
+        (
+            &mut self.spi,
+            &mut self.wait,
+            &mut self.l2,
+            L2ReqId::MutableFwUpdateData as u8,
+            chunk,
+        )?;
         // A successful 0xB1 is acknowledged with an empty RequestOk frame.
-        if !matches!(resp.status, L2Status::RequestOk) || !resp.data.is_empty()
+        if !matches!(resp.status, L2Status::RequestOk) || resp.data_len != 0
         {
             return Err(SeError::L2(L2Error::BadFrame));
         }

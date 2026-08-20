@@ -169,3 +169,58 @@ impl SessionKeys
         self.res_nonce = NonceCounter::from_value(res);
     }
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Plaintext length of the sealed frame the helpers below build.
+    const PLAIN_LEN: usize = 4;
+
+    /// Seals a `PLAIN_LEN`-byte frame and returns the keys, buffer, wire length.
+    fn sealed_frame() -> (SessionKeys, [u8; 64], usize)
+    {
+        let mut keys = SessionKeys::new([0x11u8; 32], [0x11u8; 32]);
+        let mut l3 = [0u8; 64];
+        l3[2..2 + PLAIN_LEN].copy_from_slice(&[0xA1, 0xA2, 0xA3, 0xA4]);
+        let wire = keys.seal_command(&mut l3, PLAIN_LEN).unwrap();
+        (keys, l3, wire)
+    }
+
+    #[test]
+    fn open_result_accepts_the_exact_wire_length()
+    {
+        let (mut keys, mut l3, wire) = sealed_frame();
+        assert_eq!(wire, 2 + PLAIN_LEN + 16);
+        assert_eq!(keys.open_result(&mut l3, wire), Ok(PLAIN_LEN));
+    }
+
+    #[test]
+    fn open_result_rejects_a_wire_length_longer_than_the_declared_size()
+    {
+        let (mut keys, mut l3, wire) = sealed_frame();
+        assert_eq!(
+            keys.open_result(&mut l3, wire + 1),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+    }
+
+    #[test]
+    fn open_result_rejects_a_wire_length_shorter_than_the_declared_size()
+    {
+        let (mut keys, mut l3, wire) = sealed_frame();
+        assert_eq!(
+            keys.open_result(&mut l3, wire - 1),
+            Err(SeError::L3(L3Error::Oversize))
+        );
+    }
+
+    #[test]
+    fn open_result_leaves_the_nonce_untouched_on_a_length_rejection()
+    {
+        let (mut keys, mut l3, wire) = sealed_frame();
+        let _ = keys.open_result(&mut l3, wire + 1);
+        assert_eq!(keys.open_result(&mut l3, wire), Ok(PLAIN_LEN));
+    }
+}

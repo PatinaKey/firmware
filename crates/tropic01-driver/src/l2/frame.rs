@@ -19,19 +19,40 @@ use crate::parse::take;
 use crate::parse::take_array;
 use crate::parse::take_u8;
 
-/// A parsed L2 response frame view.
+/// Byte offset of RSP_DATA inside a response frame: STATUS(1) || RSP_LEN(1).
+pub(crate) const RSP_DATA_OFFSET: usize = 2;
+
+/// A parsed L2 response frame.
 ///
-/// Borrows the data slice out of the caller's frame buffer. The status is one
-/// of the accepted framed-response variants (`RequestOk` / `ResultOk` /
-/// `RequestCont` / `ResultCont`). The `*Cont` variants signal that more chunks
-/// follow. The parser maps any error status to `L2Error::Status`.
+/// The status is one of the accepted framed-response variants (`RequestOk` /
+/// `ResultOk` / `RequestCont` / `ResultCont`). The `*Cont` variants signal that
+/// more chunks follow. The parser maps any error status to `L2Error::Status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct L2Response<'a>
+pub(crate) struct L2ResponseInfo
 {
     /// The accepted status byte.
     pub(crate) status: L2Status,
-    /// The RSP_DATA payload (0..=252 bytes).
-    pub(crate) data: &'a [u8],
+    /// The RSP_DATA length in bytes (0..=252).
+    pub(crate) data_len: usize,
+}
+
+/// Re-slices RSP_DATA out of `frame` for a previously parsed `info`.
+///
+/// CALLER OBLIGATION: `info` must come from the last read performed into this
+/// buffer. Nothing may write to `frame` between the parse and this call.
+///
+/// Errors with `L2Error::ShortFrame` when the frame no longer holds the data.
+pub(crate) fn rsp_data<'a>
+(
+    frame: &'a [u8],
+    info: &L2ResponseInfo,
+)
+-> Result<&'a [u8], L2Error>
+{
+    // data_len <= 252 and the offset is 2, so the sum cannot overflow a usize.
+    frame
+        .get(RSP_DATA_OFFSET..RSP_DATA_OFFSET + info.data_len)
+        .ok_or(L2Error::ShortFrame)
 }
 
 /// Builds an L2 request frame into `out`.
@@ -74,59 +95,57 @@ pub(crate) fn build_request
 }
 
 /// Selects how strictly the trailing RSP_CRC is validated.
-///
-/// `Full` compares both CRC bytes and is the default for every L2 response.
-/// `FirstByteOnly` compares only the first transmitted CRC byte (the high
-/// byte) and is used solely for the `Startup_Req` response. See
-/// `parse_startup_response` for the errata that motivates it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CrcCheck
+#[derive(Debug, Clone, Copy)]
+enum CrcCheck
 {
     /// Compare both RSP_CRC bytes (the strict default).
     Full,
-    /// Compare only the first RSP_CRC byte (Startup_Req errata workaround).
-    FirstByteOnly,
+    /// Allow the `Startup_Req` erratum frame, under libtropic's exact gate.
+    StartupErratum,
 }
 
-/// Parses an L2 response frame out of `frame` with full CRC validation.
+/// Parses an L2 response frame with full RSP_CRC validation.
 ///
 /// `frame` is the bytes AFTER the CHIP_STATUS byte, i.e. starting at STATUS.
-/// Validates the length field, checks both CRC bytes, and maps non-OK statuses
-/// to `L2Error::Status`. This is the strict path used by every response except
-/// `Startup_Req`.
+/// The strict rule every L2 response uses except the `Startup_Req` reply.
 ///
 /// Errors:
 /// - `L2Error::ShortFrame` when the slice is too short for the declared frame.
 /// - `L2Error::BadFrame` when RSP_LEN exceeds 252 or the status byte is unknown.
 /// - `L2Error::Crc` when the trailing CRC does not match.
 /// - `L2Error::Status(s)` for any non-OK chip status.
-pub(crate) fn parse_response(frame: &[u8]) -> Result<L2Response<'_>, L2Error>
+pub(crate) fn parse_response(frame: &[u8]) -> Result<L2ResponseInfo, L2Error>
 {
     parse_response_with(frame, CrcCheck::Full)
 }
 
-/// Parses a `Startup_Req` response, tolerating the RSP_CRC errata.
+/// Parses a `Startup_Req` response, tolerating the RSP_CRC erratum.
 ///
-/// TROPIC01 mutable firmware up to 1.0.1 has an erratum where the chip resets
-/// after the host reads the FIRST RSP_CRC byte of a Startup_Req response, which
-/// can corrupt the SECOND RSP_CRC byte. libtropic v2.0.0 mitigates this by
-/// checking only the first CRC byte of the Startup_Req response. This helper
-/// does the same: it validates only the first transmitted CRC byte (the high
-/// byte) and ignores the second. Every other check (status byte, length,
-/// bounds) is identical to the strict path.
+/// TROPIC01 mutable firmware up to 1.0.1 reboots after the host has read the
+/// first RSP_CRC byte of a `Startup_Req` response, so the second byte can arrive
+/// mangled. libtropic v2.0.0 tolerates that in `lt_l2_receive`, and only for the
+/// exact frame the erratum produces.
 ///
-/// Errors: same as `parse_response`, except `L2Error::Crc` fires only on a
-/// first-CRC-byte mismatch.
-pub(crate) fn parse_startup_response(frame: &[u8]) -> Result<L2Response<'_>, L2Error>
+/// This wrapper reproduces that gate condition for condition: the tolerance
+/// applies only when the status is `RequestOk`, RSP_LEN is 0, and the first
+/// RSP_CRC byte matches the value recomputed over the frame. Anything else falls
+/// back to the strict rule, so a longer reply, an error status, or a wrong first
+/// CRC byte is rejected exactly as on any other response.
+///
+/// Errors: same as `parse_response`, except that `L2Error::Crc` does not fire on
+/// a second-CRC-byte mismatch of that one tolerated frame.
+pub(crate) fn parse_startup_response(frame: &[u8]) -> Result<L2ResponseInfo, L2Error>
 {
-    parse_response_with(frame, CrcCheck::FirstByteOnly)
+    parse_response_with(frame, CrcCheck::StartupErratum)
 }
 
-/// Shared response parser. `crc_check` selects full-vs-first-byte CRC.
-///
-/// All callers reach this through `parse_response` (Full) or
-/// `parse_startup_response` (FirstByteOnly). The relaxation is confined here.
-fn parse_response_with(frame: &[u8], crc_check: CrcCheck) -> Result<L2Response<'_>, L2Error>
+/// Shared response parser. `crc_check` selects strict-vs-erratum RSP_CRC.
+fn parse_response_with
+(
+    frame: &[u8],
+    crc_check: CrcCheck,
+)
+-> Result<L2ResponseInfo, L2Error>
 {
     // STATUS then RSP_LEN.
     let (rest, status_byte) = take_u8(frame).map_err(|_| L2Error::ShortFrame)?;
@@ -157,9 +176,8 @@ fn parse_response_with(frame: &[u8], crc_check: CrcCheck) -> Result<L2Response<'
         | L2Status::RequestCont
         | L2Status::ResultCont =>
         {
-            // CRC covers STATUS + RSP_LEN + RSP_DATA = the first `2 + len` bytes.
-            // `get` keeps the bounds check on attacker-influenced input.
-            let covered = 2 + len;
+            // CRC covers STATUS + RSP_LEN + RSP_DATA.
+            let covered = RSP_DATA_OFFSET + len;
             let covered_bytes = frame.get(..covered).ok_or(L2Error::ShortFrame)?;
             // `crc16` returns the already-swapped value, so `to_be_bytes` yields
             // the on-wire pair [hi, lo] in the same order as `crc_bytes`.
@@ -169,19 +187,31 @@ fn parse_response_with(frame: &[u8], crc_check: CrcCheck) -> Result<L2Response<'
             let crc_ok = match crc_check
             {
                 CrcCheck::Full => crc_bytes == computed,
-                // Startup_Req errata: the premature reset can corrupt the second
-                // CRC byte, so only the first byte is trusted (as libtropic
-                // v2.0.0 does). The second byte is deliberately ignored here.
-                CrcCheck::FirstByteOnly => crc_bytes[0] == computed[0],
+                // libtropic `lt_l2_receive` gates the erratum tolerance on the
+                // whole frame shape, not on the CRC alone: REQUEST_OK status,
+                // RSP_LEN 0, and the expected first CRC byte. Reproduced here.
+                // Any other frame falls back to the strict comparison, so the
+                // relaxation cannot widen to a data-bearing reply.
+                CrcCheck::StartupErratum =>
+                {
+                    if status == L2Status::RequestOk && len == 0
+                    {
+                        crc_bytes[0] == computed[0]
+                    }
+                    else
+                    {
+                        crc_bytes == computed
+                    }
+                }
             };
             if !crc_ok
             {
                 return Err(L2Error::Crc);
             }
-            Ok(L2Response
+            Ok(L2ResponseInfo
             {
                 status,
-                data,
+                data_len: data.len(),
             })
         }
         other => Err(L2Error::Status(other)),
@@ -213,7 +243,7 @@ mod tests
         frame[2 + data.len() + 1] = crc[1];
         let resp = parse_response(&frame[..2 + data.len() + 2]).unwrap();
         assert_eq!(resp.status, L2Status::ResultOk);
-        assert_eq!(resp.data, &data);
+        assert_eq!(rsp_data(&frame[..2 + data.len() + 2], &resp), Ok(&data[..]));
     }
 
     #[test]
@@ -302,51 +332,93 @@ mod tests
         }
     }
 
-    /// Builds a valid framed response, then corrupts one CRC byte.
+    /// Builds a framed response with `status` and `data`, CRC included.
     ///
-    /// `corrupt_index` picks which CRC byte to flip (0 = first/high byte,
+    /// `corrupt_index` optionally flips one CRC byte (0 = first/high byte,
     /// 1 = second/low byte). Returns the frame buffer and its used length.
-    fn framed_response_with_corrupt_crc(corrupt_index: usize) -> ([u8; 16], usize)
+    fn framed_response
+    (
+        status: L2Status,
+        data: &[u8],
+        corrupt_index: Option<usize>,
+    )
+    -> ([u8; 16], usize)
     {
-        let data = [0x11u8, 0x22];
         let mut frame = [0u8; 16];
-        frame[0] = L2Status::RequestOk as u8;
+        frame[0] = status as u8;
         frame[1] = data.len() as u8;
-        frame[2] = data[0];
-        frame[3] = data[1];
-        let crc = crc_of(&frame[..4]);
-        frame[4] = crc[0];
-        frame[5] = crc[1];
-        frame[4 + corrupt_index] ^= 0xFF;
-        (frame, 6)
+        frame[2..2 + data.len()].copy_from_slice(data);
+        let crc = crc_of(&frame[..2 + data.len()]);
+        frame[2 + data.len()] = crc[0];
+        frame[2 + data.len() + 1] = crc[1];
+        if let Some(i) = corrupt_index
+        {
+            frame[2 + data.len() + i] ^= 0xFF;
+        }
+        (frame, 2 + data.len() + 2)
+    }
+
+    /// The exact frame the Startup_Req erratum produces: RequestOk, RSP_LEN 0.
+    fn startup_ack(corrupt_index: Option<usize>) -> ([u8; 16], usize)
+    {
+        framed_response(L2Status::RequestOk, &[], corrupt_index)
     }
 
     #[test]
     fn startup_response_accepts_corrupt_second_crc_byte()
     {
-        // Startup_Req errata: the premature reset corrupts the SECOND CRC byte.
-        // FirstByteOnly must accept this, where the old Full check rejected it.
-        let (frame, n) = framed_response_with_corrupt_crc(1);
+        // Startup_Req erratum: the premature reset corrupts the SECOND CRC byte
+        // of an empty RequestOk ack. That one frame shape is tolerated.
+        let (frame, n) = startup_ack(Some(1));
         // The strict path still rejects it, proving the test is non-vacuous.
         assert_eq!(parse_response(&frame[..n]), Err(L2Error::Crc));
         let resp = parse_startup_response(&frame[..n]).unwrap();
         assert_eq!(resp.status, L2Status::RequestOk);
+        assert_eq!(resp.data_len, 0);
     }
 
     #[test]
     fn startup_response_rejects_corrupt_first_crc_byte()
     {
         // Integrity is not fully abandoned: a corrupt FIRST CRC byte is still
-        // rejected under FirstByteOnly.
-        let (frame, n) = framed_response_with_corrupt_crc(0);
+        // rejected on the tolerated frame shape.
+        let (frame, n) = startup_ack(Some(0));
         assert_eq!(parse_startup_response(&frame[..n]), Err(L2Error::Crc));
+    }
+
+    #[test]
+    fn startup_tolerance_does_not_extend_to_a_data_bearing_reply()
+    {
+        // libtropic gates its tolerance on RSP_LEN == 0. A reply carrying
+        // RSP_DATA is not the erratum frame, so its second CRC byte still counts.
+        let (frame, n) = framed_response(L2Status::RequestOk, &[0x11, 0x22], Some(1));
+        assert_eq!(parse_startup_response(&frame[..n]), Err(L2Error::Crc));
+    }
+
+    #[test]
+    fn startup_tolerance_does_not_extend_to_a_continuation_status()
+    {
+        // libtropic gates on STATUS == REQUEST_OK. Any other accepted status
+        // stays under the strict comparison.
+        let (frame, n) = framed_response(L2Status::RequestCont, &[], Some(1));
+        assert_eq!(parse_startup_response(&frame[..n]), Err(L2Error::Crc));
+    }
+
+    #[test]
+    fn startup_path_still_accepts_an_intact_data_bearing_reply()
+    {
+        // The tightened gate must not reject a clean frame: only the erratum
+        // tolerance narrows, the strict comparison is unchanged.
+        let (frame, n) = framed_response(L2Status::RequestOk, &[0x11, 0x22], None);
+        let resp = parse_startup_response(&frame[..n]).unwrap();
+        assert_eq!(resp.data_len, 2);
     }
 
     #[test]
     fn full_path_still_rejects_corrupt_second_crc_byte()
     {
         // No regression: the relaxation must not leak into the normal path.
-        let (frame, n) = framed_response_with_corrupt_crc(1);
+        let (frame, n) = startup_ack(Some(1));
         assert_eq!(parse_response(&frame[..n]), Err(L2Error::Crc));
     }
 
@@ -362,7 +434,7 @@ mod tests
         frame[2 + L2_CHUNK_MAX_DATA] = crc[0];
         frame[2 + L2_CHUNK_MAX_DATA + 1] = crc[1];
         let resp = parse_response(&frame[..2 + L2_CHUNK_MAX_DATA + 2]).unwrap();
-        assert_eq!(resp.data.len(), L2_CHUNK_MAX_DATA);
+        assert_eq!(resp.data_len, L2_CHUNK_MAX_DATA);
         assert_eq!(resp.status, L2Status::RequestOk);
     }
 }

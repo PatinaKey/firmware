@@ -66,7 +66,7 @@ logs the failing step number and an error code instead.
 |------------|-------------|------------------|
 | (none) | the product smoke | first-light SE identity: chip mode, RISC-V and SPECT firmware versions. No `0x5x` marker |
 | `se-session` | the SE proof suite | `0x51` L3 session + encrypted Ping, `0x53` reversible persistent state (counters, MAC-and-Destroy, imported-Ed25519 known-answer test), `0x54` safe reads + P-256 export. All three in one flash |
-| `se-fw-update` | the SE firmware-update path | `0x20` SE firmware update 1.0.0 to 2.0.0 |
+| `se-fw-update` | the SE firmware-update path | `0x20` SE firmware update to CPU 2.1.0 and SPECT 1.3.0 |
 
 Notes:
 

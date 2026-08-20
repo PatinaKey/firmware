@@ -12,8 +12,9 @@ use crate::buf::L2_CHUNK_MAX_DATA;
 use crate::error::L2Error;
 use crate::ids::L2ReqId;
 use crate::ids::L2Status;
-use crate::l1;
 use crate::l2::frame;
+use crate::l2::retry;
+use crate::l2::retry::RetryBudget;
 use crate::wait::SeWait;
 
 /// Maximum number of result chunks to reassemble.
@@ -29,6 +30,9 @@ const RECV_MAX_CHUNKS: usize = 42;
 /// `RequestCont` while more chunks are expected and `RequestOk` on the last, but
 /// this matches libtropic in not enforcing which one arrives on which chunk).
 /// Any other status aborts the send.
+///
+/// CRC faults are cured by `retry`, under one budget shared by every chunk of
+/// this packet.
 pub(crate) fn send_encrypted<SPI, W>
 (
     spi: &mut SPI,
@@ -45,18 +49,26 @@ where
     {
         return Err(L2Error::BadFrame);
     }
+    let mut budget = RetryBudget::new();
     let mut offset = 0usize;
     while offset < packet.len()
     {
         let remaining = packet.len() - offset;
         let chunk_len = remaining.min(L2_CHUNK_MAX_DATA);
-        let chunk = &packet[offset..offset + chunk_len];
-        let n = frame::build_request(L2ReqId::EncryptedCmd as u8, chunk, l2)?;
-        l1::send_request(spi, &l2[..n])?;
-        let frame_len = l1::read_response(spi, wait, l2)?;
-        let resp = frame::parse_response(&l2[..frame_len])?;
+        let chunk = packet
+            .get(offset..offset + chunk_len)
+            .ok_or(L2Error::BadFrame)?;
+        let ack = retry::exchange_within
+        (
+            spi,
+            wait,
+            l2,
+            L2ReqId::EncryptedCmd as u8,
+            chunk,
+            &mut budget,
+        )?;
         offset += chunk_len;
-        match resp.status
+        match ack.status
         {
             L2Status::RequestCont | L2Status::RequestOk =>
             {}
@@ -71,6 +83,8 @@ where
 /// Reads `RESULT_CONT` frames until a `RESULT_OK` frame ends the result. The
 /// running length is checked against `l3` on every chunk, and the chunk count
 /// is capped at `RECV_MAX_CHUNKS`.
+///
+/// A corrupt chunk is recovered with a `Resend_Req`.
 pub(crate) fn recv_encrypted<SPI, W>
 (
     spi: &mut SPI,
@@ -83,6 +97,7 @@ where
     SPI: SpiDevice,
     W: SeWait,
 {
+    let mut budget = RetryBudget::new();
     let mut total = 0usize;
     let mut chunks = 0usize;
     loop
@@ -91,18 +106,18 @@ where
         {
             return Err(L2Error::BadFrame);
         }
-        let frame_len = l1::read_response(spi, wait, l2)?;
-        let resp = frame::parse_response(&l2[..frame_len])?;
-        let data = resp.data;
+        let info = retry::receive_within(spi, wait, l2, &mut budget)?;
+        let data = frame::rsp_data(l2, &info)?;
         let end = total.checked_add(data.len()).ok_or(L2Error::BadFrame)?;
         if end > l3.len()
         {
             return Err(L2Error::BadFrame);
         }
-        l3[total..end].copy_from_slice(data);
+        let dest = l3.get_mut(total..end).ok_or(L2Error::BadFrame)?;
+        dest.copy_from_slice(data);
         total = end;
         chunks += 1;
-        match resp.status
+        match info.status
         {
             L2Status::ResultCont => continue,
             L2Status::ResultOk => return Ok(total),
@@ -118,6 +133,8 @@ mod tests
     use crate::buf::L2_FRAME_MAX;
     use crate::buf::L3_FRAME_MAX;
     use crate::test_support::l2_frame;
+    use crate::test_support::CrcFaultSpi;
+    use crate::test_support::CrcReply;
     use crate::test_support::MockWait;
     use crate::test_support::RecordingSpi;
     use crate::test_support::ScriptedSpi;
@@ -243,6 +260,201 @@ mod tests
             recv_encrypted(&mut spi, &mut wait, &mut l2, &mut l3),
             Err(L2Error::BadFrame)
         );
+    }
+
+    /// Builds a `packet.len()`-byte L3 packet spanning three chunks.
+    fn three_chunk_packet() -> std::vec::Vec<u8>
+    {
+        (0..2 * L2_CHUNK_MAX_DATA + 100)
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    /// An empty `RequestCont` ack frame.
+    fn cont_ack() -> std::vec::Vec<u8>
+    {
+        l2_frame(L2Status::RequestCont as u8, &[])
+    }
+
+    /// An empty `RequestOk` ack frame.
+    fn ok_ack() -> std::vec::Vec<u8>
+    {
+        l2_frame(L2Status::RequestOk as u8, &[])
+    }
+
+    /// Runs `send_encrypted` for `packet` against a scripted chip.
+    fn run_send
+    (
+        packet: &[u8],
+        script: std::vec::Vec<(CrcReply, std::vec::Vec<u8>)>,
+    )
+    -> (Result<(), L2Error>, CrcFaultSpi)
+    {
+        let mut spi = CrcFaultSpi::new(script);
+        let mut wait = MockWait::new();
+        let mut l2 = [0u8; L2_FRAME_MAX];
+        let r = send_encrypted(&mut spi, &mut wait, &mut l2, packet);
+        (r, spi)
+    }
+
+    #[test]
+    fn send_replays_the_identical_chunk_on_a_chip_crc_error()
+    {
+        let packet = three_chunk_packet();
+        let script = std::vec![
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::Good, ok_ack()),
+        ];
+        let (r, spi) = run_send(&packet, script);
+        assert_eq!(r, Ok(()));
+        assert_eq!(spi.requests().len(), 4);
+        assert_eq!(spi.requests()[0], spi.requests()[1]);
+        assert!(spi.req_ids().iter().all(|&id| id == L2ReqId::EncryptedCmd as u8));
+    }
+
+    #[test]
+    fn send_shares_one_retry_budget_across_every_chunk()
+    {
+        // DELIBERATE DEVIATION from libtropic, which resets its retry counter on
+        // every successful chunk. Here one budget covers the whole packet. Three
+        // faults spread over three chunks land exactly on the budget and still
+        // succeed.
+        let packet = three_chunk_packet();
+        let script = std::vec![
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, ok_ack()),
+        ];
+        let (r, spi) = run_send(&packet, script);
+        assert_eq!(r, Ok(()));
+        assert_eq!(spi.reads(), 6);
+    }
+
+    #[test]
+    fn send_fails_when_the_shared_budget_runs_out_mid_packet()
+    {
+        // One fault more than the budget, spread across chunks. libtropic would
+        // ACCEPT this run because its counter restarts on each good chunk. The
+        // shared budget refuses it, which is the point of the deviation: the
+        // worst-case retry count cannot grow with the message length.
+        let packet = three_chunk_packet();
+        let script = std::vec![
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::ChipCrcErr, std::vec::Vec::new()),
+            (CrcReply::Good, ok_ack()),
+        ];
+        let (r, spi) = run_send(&packet, script);
+        assert_eq!(r, Err(L2Error::Status(L2Status::CrcErr)));
+        // It stopped on the fourth fault and never reached the trailing ack.
+        assert_eq!(spi.reads(), 6);
+    }
+
+    #[test]
+    fn recv_recovers_a_corrupt_chunk_via_resend_and_reassembles_in_order()
+    {
+        let c1 = l2_frame(L2Status::ResultCont as u8, &[0xAAu8; 8]);
+        let c2 = l2_frame(L2Status::ResultOk as u8, &[0xBBu8; 4]);
+        let script = std::vec![
+            (CrcReply::Good, c1.clone()),
+            (CrcReply::HostCrcErr, c2.clone()),
+            (CrcReply::Good, c2.clone()),
+        ];
+        let mut spi = CrcFaultSpi::new(script);
+        let mut wait = MockWait::new();
+        let mut l2 = [0u8; L2_FRAME_MAX];
+        let mut l3 = [0u8; L3_FRAME_MAX];
+        let n = recv_encrypted(&mut spi, &mut wait, &mut l2, &mut l3);
+        assert_eq!(n, Ok(12));
+        assert_eq!(&l3[..8], &[0xAAu8; 8]);
+        assert_eq!(&l3[8..12], &[0xBBu8; 4]);
+        assert_eq!(spi.req_ids(), std::vec![L2ReqId::Resend as u8]);
+    }
+
+    #[test]
+    fn send_cures_a_corrupt_ack_with_a_resend_against_the_shared_budget()
+    {
+        let packet = three_chunk_packet();
+        let script = std::vec![
+            (CrcReply::HostCrcErr, cont_ack()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::Good, cont_ack()),
+            (CrcReply::Good, ok_ack()),
+        ];
+        let (r, spi) = run_send(&packet, script);
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            spi.req_ids(),
+            std::vec![
+                L2ReqId::EncryptedCmd as u8,
+                L2ReqId::Resend as u8,
+                L2ReqId::EncryptedCmd as u8,
+                L2ReqId::EncryptedCmd as u8
+            ]
+        );
+        assert_eq!(spi.reads(), 4);
+    }
+
+    #[test]
+    fn recv_fails_when_the_shared_budget_runs_out_across_chunks()
+    {
+        let c1 = l2_frame(L2Status::ResultCont as u8, &[0x11u8; 4]);
+        let c2 = l2_frame(L2Status::ResultCont as u8, &[0x22u8; 4]);
+        let c3 = l2_frame(L2Status::ResultCont as u8, &[0x33u8; 4]);
+        let c4 = l2_frame(L2Status::ResultOk as u8, &[0x44u8; 4]);
+        let script = std::vec![
+            (CrcReply::HostCrcErr, c1.clone()),
+            (CrcReply::Good, c1.clone()),
+            (CrcReply::HostCrcErr, c2.clone()),
+            (CrcReply::Good, c2.clone()),
+            (CrcReply::HostCrcErr, c3.clone()),
+            (CrcReply::Good, c3.clone()),
+            (CrcReply::HostCrcErr, c4.clone()),
+            (CrcReply::Good, c4.clone()),
+        ];
+        let mut spi = CrcFaultSpi::new(script);
+        let mut wait = MockWait::new();
+        let mut l2 = [0u8; L2_FRAME_MAX];
+        let mut l3 = [0u8; L3_FRAME_MAX];
+        assert_eq!(
+            recv_encrypted(&mut spi, &mut wait, &mut l2, &mut l3),
+            Err(L2Error::Crc)
+        );
+        assert_eq!(spi.reads(), 7);
+        assert_eq!(spi.req_ids(), std::vec![L2ReqId::Resend as u8; 3]);
+    }
+
+    #[test]
+    fn recv_shared_budget_absorbs_exactly_three_faults_across_chunks()
+    {
+        let c1 = l2_frame(L2Status::ResultCont as u8, &[0x11u8; 4]);
+        let c2 = l2_frame(L2Status::ResultCont as u8, &[0x22u8; 4]);
+        let c3 = l2_frame(L2Status::ResultOk as u8, &[0x33u8; 4]);
+        let script = std::vec![
+            (CrcReply::HostCrcErr, c1.clone()),
+            (CrcReply::Good, c1.clone()),
+            (CrcReply::HostCrcErr, c2.clone()),
+            (CrcReply::Good, c2.clone()),
+            (CrcReply::HostCrcErr, c3.clone()),
+            (CrcReply::Good, c3.clone()),
+        ];
+        let mut spi = CrcFaultSpi::new(script);
+        let mut wait = MockWait::new();
+        let mut l2 = [0u8; L2_FRAME_MAX];
+        let mut l3 = [0u8; L3_FRAME_MAX];
+        assert_eq!(recv_encrypted(&mut spi, &mut wait, &mut l2, &mut l3), Ok(12));
+        assert_eq!(&l3[..4], &[0x11u8; 4]);
+        assert_eq!(&l3[4..8], &[0x22u8; 4]);
+        assert_eq!(&l3[8..12], &[0x33u8; 4]);
+        assert_eq!(spi.reads(), 6);
     }
 
     /// Collects a fixed set of frames into the owned vec `ScriptedSpi` expects.
