@@ -421,6 +421,70 @@ fn nvcnt_bump_fault_on_confirm_leaves_swap_committed()
 }
 
 #[test]
+fn pending_write_fault_on_confirm_leaves_nvcnt_at_the_old_floor()
+{
+    // Order oracle, first cut point. confirm spends the SE counter, clears the
+    // pending record, then bumps NVCNT last. Faulting the record clear freezes
+    // the flow there and exposes that the bump has not run. Bumping first bricks
+    // the part: a cut between a raised NVCNT and a record still Armed lets the
+    // immutable boot stage auto-revert to the old bank on the boot budget, and
+    // the old image's counter then sits below the raised NVCNT floor, so it
+    // fails anti-rollback and no image boots.
+    let root = dev_root();
+    let mut flash = MockFlash::new(0);
+    // The state after the swap reset: the record survived and the running bank
+    // matches the armed target, so the boot owes a confirm.
+    flash.force_pending(PendingFlag::Armed(BankId::Bank2));
+    flash.force_running(BankId::Bank2);
+    flash.set_fault(FaultPoint::PendingWrite);
+    let se = MockSeCounter::new(SE_FLOOR_ZERO);
+    let mut up = Updater::new(&root, flash, se);
+
+    assert_eq!(up.on_boot().expect("boot"), UpdateState::AwaitingConfirm);
+
+    let err = up.confirm(4).expect_err("the record clear faults");
+    assert_eq!(err, UpdateError::Flash(FlashError::WriteFailed));
+    // NVCNT still holds the old floor, never raised while the record is armed.
+    assert_eq!(up.flash().nvcnt(), 0);
+    // The SE counter was spent before the record clear was attempted.
+    assert!(up.se_counter().updated());
+    // The record still reads Armed toward the target bank, and on_boot answers
+    // AwaitingConfirm, an answer with that single preimage whose branch writes no
+    // record. This oracle mutates machine state: it returns the machine from
+    // Confirming to AwaitingConfirm, so it stays the last statement and nothing
+    // observing machine state may be appended after it.
+    assert_eq!(up.on_boot().expect("re-boot"), UpdateState::AwaitingConfirm);
+}
+
+#[test]
+fn nvcnt_bump_fault_on_confirm_proves_the_record_was_cleared_first()
+{
+    // Order oracle, second cut point. Faulting the NVCNT bump freezes the flow
+    // there and exposes that the pending clear already ran. The reverse order
+    // raises NVCNT while the record is still Armed, and a cut in that window
+    // lets the immutable boot stage auto-revert to the old bank, whose counter
+    // now sits below the raised NVCNT floor, leaving no bootable image.
+    let root = dev_root();
+    let mut flash = MockFlash::new(0);
+    flash.force_pending(PendingFlag::Armed(BankId::Bank2));
+    flash.force_running(BankId::Bank2);
+    flash.set_fault(FaultPoint::NvcntBump);
+    let se = MockSeCounter::new(SE_FLOOR_ZERO);
+    let mut up = Updater::new(&root, flash, se);
+
+    assert_eq!(up.on_boot().expect("boot"), UpdateState::AwaitingConfirm);
+
+    let err = up.confirm(4).expect_err("the nvcnt bump faults");
+    assert_eq!(err, UpdateError::Flash(FlashError::CounterExhausted));
+    // Idle means the record no longer owes a confirm, so the clear ran before the
+    // bump. on_boot collapses PendingFlag::None and Armed(a bank other than the
+    // running one) onto the same Idle answer, and it rewrites the record to None
+    // itself on that second preimage. So this assertion pins the ORDER, never the
+    // record value.
+    assert_eq!(up.on_boot().expect("re-boot"), UpdateState::Idle);
+}
+
+#[test]
 fn revert_after_confirm_step_is_rejected()
 {
     // Once a confirm step has begun (the state left AwaitingConfirm), revert must
