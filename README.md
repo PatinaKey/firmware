@@ -112,7 +112,7 @@ scripts/ci-local.sh --quick  # skip coverage and fuzz
 | Coverage | `cargo-llvm-cov` | library line coverage floor |
 | Advisories | `cargo deny` | blocks on any RustSec finding, SARIF export |
 | Dependency policy | `cargo deny` / `cargo udeps` | license allow-list, trusted sources, no yanked or unused crates |
-| Fuzz | `cargo fuzz` | the driver's attacker-facing parsers, longer on the weekly schedule |
+| Fuzz | `cargo fuzz` | the driver's wire parsers, the signed-image verifier, the update state machine. `scripts/fuzz-gate.sh` walks the tree for `fuzz/` projects and aborts if what it finds differs from the crate list pinned in that script, so adding a fuzz crate needs an edit there. Longer runs on the weekly schedule |
 | Quality scan | SonarQube | consumes the reports above |
 
 See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full pipeline and [`sonar-project.properties`](sonar-project.properties) for the SonarQube configuration.

@@ -165,14 +165,7 @@ coverage_stage()
 
 fuzz_stage()
 {
-    (
-        cd crates/tropic01-driver || exit 1
-        # Enumerate the targets so a newly added one is fuzzed automatically.
-        for t in $(cargo +nightly fuzz list)
-        do
-            cargo +nightly fuzz run "$t" -- -max_total_time="$FUZZ_SECS" -timeout=10 || exit 1
-        done
-    )
+    bash scripts/fuzz-gate.sh --secs "$FUZZ_SECS"
 }
 
 embedded_stage()
@@ -227,7 +220,8 @@ RUSTFLAGS="-D warnings" run "check (thumbv8m)" \
     cargo check -p tropic01-driver --locked --target thumbv8m.main-none-eabihf
 unset RUSTFLAGS
 
-run "test (host)" cargo test --workspace --locked
+run "test (host)" cargo test --workspace --locked \
+    --features fw-update/_fuzz,image-verify/_fuzz,tropic01-driver/_fuzz
 
 run "clippy (json report + strict)" clippy_reports
 
@@ -274,7 +268,7 @@ then
 
     if have cargo-fuzz && rustup toolchain list | grep -q nightly
     then
-        run "fuzz (${FUZZ_SECS}s per target)" fuzz_stage
+        run "fuzz (every fuzz crate, ${FUZZ_SECS}s per target)" fuzz_stage
     else
         skip "fuzz" "cargo install cargo-fuzz (and a nightly toolchain)"
     fi

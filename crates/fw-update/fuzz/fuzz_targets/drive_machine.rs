@@ -12,5 +12,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]|
 {
-    fw_update::fuzz::drive_machine(data);
+    let _ = fw_update::fuzz::drive_machine(data);
 });

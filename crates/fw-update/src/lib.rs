@@ -85,6 +85,7 @@ pub mod fuzz
 {
     use crate::MockFlash;
     use crate::MockSeCounter;
+    use crate::SE_COUNTER_ORIGIN;
     use crate::UpdateState;
     use crate::Updater;
     use image_verify::RootKey;
@@ -95,17 +96,18 @@ pub mod fuzz
     /// from `data`, feeds them through [`Updater::receive_chunk`], then runs
     /// verify, commit, boot, and confirm. The machine must never panic and must
     /// never reach [`UpdateState::Committed`] for an image the verifier did not
-    /// accept. A genuinely valid image is essentially never produced by mutation,
-    /// so the path under test is the fail-closed rejection across the whole flow.
-    pub fn drive_machine(data: &[u8])
+    /// accept.
+    ///
+    /// Returns true when the machine armed the commit.
+    pub fn drive_machine(data: &[u8]) -> bool
     {
         let root = match RootKey::from_bytes(crate::DEV_ROOT_KEY_TEST_ONLY)
         {
             Ok(key) => key,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let flash = MockFlash::new(0);
-        let se = MockSeCounter::new(0);
+        let se = MockSeCounter::new(SE_COUNTER_ORIGIN);
         let mut up = Updater::new(&root, flash, se);
 
         // The first two bytes pick a declared length inside the modelled bank.
@@ -122,7 +124,7 @@ pub mod fuzz
 
         if up.begin(total_len).is_err()
         {
-            return;
+            return false;
         }
 
         // Each record is a 1-byte length prefix then that many payload bytes,
@@ -140,7 +142,7 @@ pub mod fuzz
             {
                 // A rejected chunk fails closed: the machine must not commit.
                 assert_ne!(up.state(), UpdateState::Committed);
-                return;
+                return false;
             }
             offset = offset.saturating_add(chunk.len());
             rest = tail;
@@ -152,15 +154,19 @@ pub mod fuzz
             // A rejected image must never have armed a swap.
             assert!(!up.flash().committed());
             assert_ne!(up.state(), UpdateState::Committed);
-            return;
+            return false;
         }
 
         // The verifier accepted: the commit/confirm path must also stay sound.
-        if up.commit().is_ok()
+        if up.commit().is_err()
         {
-            let _ = up.on_boot();
-            let _ = up.confirm(0);
+            return false;
         }
+        assert_eq!(up.state(), UpdateState::Committed);
+        assert!(up.flash().committed());
+        let _ = up.on_boot();
+        let _ = up.confirm(0);
+        true
     }
 }
 
