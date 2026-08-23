@@ -260,7 +260,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run tests (host, hermetic, whole workspace)
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --features fw-update/_fuzz,image-verify/_fuzz,tropic01-driver/_fuzz
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -392,7 +392,7 @@ jobs:
         continue-on-error: true
         run: cargo +stable outdated --workspace --root-deps-only
 
-  # Job 6: Fuzzing (libFuzzer + ASan on the driver's attacker-facing parsers)
+  # Job 6: Fuzzing (libFuzzer + ASan on every attacker-facing decoder in the tree)
   fuzz:
     name: Fuzz Parsers
     runs-on: ubuntu-latest
@@ -409,33 +409,27 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      # The corpus accumulates across runs: every discovered input makes
-      # the next run start deeper.
       - name: Restore fuzz corpus
         uses: actions/cache@v4
         with:
-          path: crates/tropic01-driver/fuzz/corpus
+          path: crates/*/fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-
 
       # 60 seconds per target on PR/push, 15 minutes on the weekly run.
-      - name: Fuzz each target
+      - name: Fuzz every target of every fuzz crate
         run: |
           secs=60
           if [ "${{ github.event_name }}" = "schedule" ]; then secs=900; fi
-          cd crates/tropic01-driver
-          # Enumerate the targets so a newly added one is fuzzed automatically.
-          for t in $(cargo +nightly fuzz list); do
-            cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- -max_total_time="$secs" -timeout=10
-          done
+          bash scripts/fuzz-gate.sh --secs "$secs"
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
-          path: crates/tropic01-driver/fuzz/artifacts
+          path: crates/*/fuzz/artifacts
 
   # Job 7: SonarQube Analysis
   sonarqube:

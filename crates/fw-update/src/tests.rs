@@ -636,3 +636,54 @@ fn page_constants_are_consistent()
     assert_eq!(PAGE_LEN, 256);
     assert_eq!(CONFIRM_BOOTS, 1);
 }
+
+#[cfg(feature = "_fuzz")]
+fn frame_for_fuzz_seam(image: &[u8]) -> std::vec::Vec<u8>
+{
+    let mut framed = std::vec::Vec::new();
+    let declared = image.len() as u16;
+    framed.extend_from_slice(&declared.to_le_bytes());
+    for chunk in image.chunks(255)
+    {
+        framed.push(chunk.len() as u8);
+        framed.extend_from_slice(chunk);
+    }
+    framed
+}
+
+#[cfg(feature = "_fuzz")]
+#[test]
+fn the_fuzz_seam_reaches_a_commit_for_a_signed_image()
+{
+    let image = build_image(DEV_SCALAR, 3, b"the fuzz seam must reach a commit");
+    let framed = frame_for_fuzz_seam(&image);
+
+    assert!(
+        crate::fuzz::drive_machine(&framed),
+        "the fuzz seam must ARM A COMMIT for an image signed with the dev scalar"
+    );
+}
+
+#[cfg(feature = "_fuzz")]
+#[test]
+fn the_fuzz_seam_rejects_an_image_signed_by_the_wrong_key()
+{
+    let image = build_image(WRONG_SCALAR, 3, b"the fuzz seam must reject this");
+    let framed = frame_for_fuzz_seam(&image);
+
+    assert!(
+        !crate::fuzz::drive_machine(&framed),
+        "an image signed by the wrong key must never arm a commit"
+    );
+}
+
+#[cfg(feature = "_fuzz")]
+#[test]
+fn the_fuzz_entry_point_survives_degenerate_inputs()
+{
+    assert!(!crate::fuzz::drive_machine(&[]));
+    assert!(!crate::fuzz::drive_machine(&[0x00]));
+    assert!(!crate::fuzz::drive_machine(&[0xFF, 0xFF]));
+    assert!(!crate::fuzz::drive_machine(&[0x00, 0x00, 0xFF, 0x01, 0x02]));
+    assert!(!crate::fuzz::drive_machine(&[0x10, 0x00, 0x02, 0xAA, 0xBB]));
+}
